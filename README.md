@@ -26,6 +26,20 @@
 
 ## 快速部署
 
+### Windows + WSL2 中国大陆一键安装
+
+Windows 10/11 中国大陆网络环境只需一个 `install-wsl-docker-cn.ps1`，它会按顺序完成系统检测、安装 WSL2、安装 Docker 和启动应用。在管理员 PowerShell 中执行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\install-wsl-docker-cn.ps1 -CheckOnly
+.\install-wsl-docker-cn.ps1
+```
+
+完整要求、国内镜像配置、重启续跑和故障排查参见 [Windows + WSL2 + Docker 中国大陆一键安装说明](docs/WSL_DOCKER_CN_INSTALL.md)。
+
+### 已安装 Docker 的环境
+
 前置条件：安装并启动 Docker Desktop（Linux 服务器安装 Docker Engine 与 Compose 插件）。
 
 1. 复制环境文件：
