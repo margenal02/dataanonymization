@@ -14,6 +14,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$utf8NoBom = New-Object Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8NoBom
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
 $MinimumBuild = 19041
 $MinimumMemoryGB = 4
 $RecommendedMemoryGB = 8
@@ -435,22 +440,56 @@ function Write-InstallProgress {
     if ($CompleteLine) { Write-Host }
 }
 
+function ConvertFrom-NativeBytes([byte[]]$Bytes) {
+    if (-not $Bytes -or $Bytes.Length -eq 0) { return '' }
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
+        return [Text.Encoding]::Unicode.GetString($Bytes, 2, $Bytes.Length - 2)
+    }
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFE -and $Bytes[1] -eq 0xFF) {
+        return [Text.Encoding]::BigEndianUnicode.GetString($Bytes, 2, $Bytes.Length - 2)
+    }
+    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
+        return [Text.Encoding]::UTF8.GetString($Bytes, 3, $Bytes.Length - 3)
+    }
+
+    $sampleLength = [math]::Min($Bytes.Length, 4096)
+    $evenNulls = 0
+    $oddNulls = 0
+    for ($index = 0; $index -lt $sampleLength; $index++) {
+        if ($Bytes[$index] -eq 0) {
+            if (($index % 2) -eq 0) { $evenNulls++ } else { $oddNulls++ }
+        }
+    }
+    if ($oddNulls -gt ($sampleLength / 8)) { return [Text.Encoding]::Unicode.GetString($Bytes) }
+    if ($evenNulls -gt ($sampleLength / 8)) { return [Text.Encoding]::BigEndianUnicode.GetString($Bytes) }
+
+    try {
+        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+        return $strictUtf8.GetString($Bytes)
+    } catch {
+        return [Text.Encoding]::Default.GetString($Bytes)
+    }
+}
+
+function Read-NativeOutputFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        $bytes = New-Object byte[] $stream.Length
+        $null = $stream.Read($bytes, 0, $bytes.Length)
+        return ConvertFrom-NativeBytes $bytes
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Get-NativePercent([string[]]$Paths) {
     $latestPercent = $null
     foreach ($path in $Paths) {
         if (-not (Test-Path -LiteralPath $path)) { continue }
         try {
-            $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-            try {
-                $bytes = New-Object byte[] $stream.Length
-                $null = $stream.Read($bytes, 0, $bytes.Length)
-            } finally {
-                $stream.Dispose()
-            }
-            if ($bytes.Length -eq 0) { continue }
-            # WSL 在不同 Windows 版本上可能输出 UTF-8、系统代码页或 UTF-16；
-            # 百分比均为 ASCII 数字，去除 NUL 后即可可靠提取。
-            $text = [Text.Encoding]::UTF8.GetString($bytes) -replace "`0", ''
+            $text = Read-NativeOutputFile $path
+            if ([string]::IsNullOrEmpty($text)) { continue }
             foreach ($match in [regex]::Matches($text, '(?<!\d)(100|[0-9]{1,2})(?:\.[0-9]+)?\s*%')) {
                 $value = [int][math]::Floor([double]$match.Groups[1].Value)
                 if ($value -ge 0 -and $value -le 100) { $latestPercent = $value }
@@ -489,7 +528,8 @@ function Invoke-NativeCommandWithProgress {
         [ValidateRange(0, 3600)]
         [int]$NoProgressTimeoutSeconds = 0,
         [ValidateRange(0, 3600)]
-        [int]$CommandTimeoutSeconds = 0
+        [int]$CommandTimeoutSeconds = 0,
+        [switch]$SuppressFailureOutput
     )
 
     if ($ProgressEnd -lt $ProgressStart) { throw '进度结束值不能小于起始值。' }
@@ -559,13 +599,16 @@ function Invoke-NativeCommandWithProgress {
             $capturedOutput = @()
             foreach ($path in @($stdoutPath, $stderrPath)) {
                 if (Test-Path -LiteralPath $path) {
-                    $capturedOutput += @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
+                    $decoded = Read-NativeOutputFile $path
+                    if (-not [string]::IsNullOrWhiteSpace($decoded)) {
+                        $capturedOutput += @($decoded -split "`r?`n")
+                    }
                 }
             }
             $resultStatus = if ($timedOut) { $timeoutStatus } elseif ($exitCode -eq 0) { '完成' } else { '失败' }
             Write-InstallProgress -Percent $(if ($exitCode -eq 0) { $ProgressEnd } else { $ProgressStart }) `
                 -Activity $Activity -Status $resultStatus -CompleteLine
-            if ($exitCode -ne 0) {
+            if ($exitCode -ne 0 -and -not $SuppressFailureOutput) {
                 $capturedOutput | Select-Object -Last 30 | ForEach-Object { Write-Host ([string]$_) }
             }
             return [pscustomobject]@{
@@ -605,7 +648,8 @@ function Invoke-NativeCommand {
     if ($DisplayOutput) {
         return Invoke-NativeCommandWithProgress -FilePath $FilePath -ArgumentList $ArgumentList `
             -Activity $Activity -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd `
-            -NoProgressTimeoutSeconds $NoProgressTimeoutSeconds -CommandTimeoutSeconds $CommandTimeoutSeconds
+            -NoProgressTimeoutSeconds $NoProgressTimeoutSeconds -CommandTimeoutSeconds $CommandTimeoutSeconds `
+            -SuppressFailureOutput:$IgnoreStandardError
     }
 
     $savedErrorActionPreference = $ErrorActionPreference
@@ -629,11 +673,16 @@ function Invoke-NativeCommand {
     }
 }
 
-function Get-WslRuntimeVersion([switch]$ShowDetectionProgress) {
+function Get-WslRuntimeVersion(
+    [switch]$ShowDetectionProgress,
+    [int]$ProgressStart = 10,
+    [int]$ProgressEnd = 13,
+    [string]$Activity = '检测 WSL 运行时版本'
+) {
     if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $null }
     if ($ShowDetectionProgress) {
         $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--version') -IgnoreStandardError `
-            -DisplayOutput -Activity '检测 WSL 运行时版本' -ProgressStart 10 -ProgressEnd 13 `
+            -DisplayOutput -Activity $Activity -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd `
             -CommandTimeoutSeconds 12
     } else {
         $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--version') -IgnoreStandardError
@@ -648,11 +697,16 @@ function Get-WslRuntimeVersion([switch]$ShowDetectionProgress) {
     return $null
 }
 
-function Get-InstalledWslDistros([switch]$ShowDetectionProgress) {
+function Get-InstalledWslDistros(
+    [switch]$ShowDetectionProgress,
+    [int]$ProgressStart = 13,
+    [int]$ProgressEnd = 16,
+    [string]$Activity = '检测已安装的 WSL 发行版'
+) {
     if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return @() }
     if ($ShowDetectionProgress) {
         $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--list', '--quiet') -IgnoreStandardError `
-            -DisplayOutput -Activity '检测已安装的 WSL 发行版' -ProgressStart 13 -ProgressEnd 16 `
+            -DisplayOutput -Activity $Activity -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd `
             -CommandTimeoutSeconds 12
     } else {
         $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--list', '--quiet') -IgnoreStandardError
@@ -729,25 +783,526 @@ function Test-VersionInRange([string]$Value, [version]$Minimum, [version]$Maximu
     }
 }
 
-function Test-WslWebChannel {
-    try {
-        $null = Invoke-WebRequest -UseBasicParsing -Method Head `
-            -Uri 'https://github.com/microsoft/WSL/releases/latest' -TimeoutSec 8
-        return $true
-    } catch {
-        return $false
+function Format-ByteSize([long]$Bytes) {
+    if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
+    return ('{0:N1} KB' -f ($Bytes / 1KB))
+}
+
+function Select-FastestWslMsiUri([string]$OfficialUri) {
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $curl) {
+        return [pscustomobject]@{ Name = 'GitHub 官方直连'; Uri = $OfficialUri; Mbps = 0 }
     }
+
+    $candidates = @(
+        [pscustomobject]@{ Name = 'GitHub 官方直连'; Uri = $OfficialUri },
+        [pscustomobject]@{ Name = 'gh-proxy.com 大陆加速传输'; Uri = "https://gh-proxy.com/$OfficialUri" },
+        [pscustomobject]@{ Name = 'ghfast.top 大陆加速传输'; Uri = "https://ghfast.top/$OfficialUri" }
+    )
+    $results = @()
+    Write-Host '正在对 WSL MSI 下载通道进行 1 MB 实际测速……' -ForegroundColor Cyan
+    foreach ($candidate in $candidates) {
+        $probePath = [IO.Path]::GetTempFileName()
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $probeProcess = $null
+        try {
+            $probeArguments = @(
+                '--location', '--fail', '--silent', '--show-error',
+                '--connect-timeout', '5', '--max-time', '12', '--range', '0-1048575',
+                '--user-agent', 'DataAnonymization-WSL-Installer/1.0',
+                '--output', $probePath, $candidate.Uri
+            )
+            $probeInfo = New-Object Diagnostics.ProcessStartInfo
+            $probeInfo.FileName = $curl.Source
+            $probeInfo.Arguments = (($probeArguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
+            $probeInfo.UseShellExecute = $false
+            $probeInfo.CreateNoWindow = $true
+            $probeInfo.RedirectStandardError = $true
+            $probeProcess = New-Object Diagnostics.Process
+            $probeProcess.StartInfo = $probeInfo
+            if (-not $probeProcess.Start()) { throw '无法启动测速进程。' }
+            while (-not $probeProcess.WaitForExit(100)) {
+                $currentLength = if (Test-Path -LiteralPath $probePath) {
+                    [long](Get-Item -LiteralPath $probePath).Length
+                } else {
+                    0L
+                }
+                if ($currentLength -ge 1MB) {
+                    Stop-NativeProcessTree $probeProcess
+                    break
+                }
+            }
+            $watch.Stop()
+            $length = if (Test-Path -LiteralPath $probePath) { [long](Get-Item -LiteralPath $probePath).Length } else { 0L }
+            $header = if ($length -ge 8) { [IO.File]::ReadAllBytes($probePath)[0..7] } else { @() }
+            $isMsi = $header.Count -eq 8 -and
+                (($header | ForEach-Object { $_.ToString('X2') }) -join '') -eq 'D0CF11E0A1B11AE1'
+            if ($isMsi -and $length -ge 65536) {
+                $mbps = ($length / 1MB) / [math]::Max($watch.Elapsed.TotalSeconds, 0.001)
+                $results += [pscustomobject]@{ Name = $candidate.Name; Uri = $candidate.Uri; Mbps = $mbps }
+                Write-Host ("  {0}：{1:N2} MB/s" -f $candidate.Name, $mbps) -ForegroundColor Gray
+            } else {
+                Write-Host ("  {0}：不可用或未返回有效 MSI" -f $candidate.Name) -ForegroundColor DarkGray
+            }
+        } catch {
+            $watch.Stop()
+            Write-Host ("  {0}：测速失败" -f $candidate.Name) -ForegroundColor DarkGray
+        } finally {
+            if ($probeProcess) { $probeProcess.Dispose() }
+            Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($results.Count -eq 0) {
+        Write-Warning '测速通道均未完成 1 MB 有效 MSI 取样，回退 GitHub 官方直连。'
+        return [pscustomobject]@{ Name = 'GitHub 官方直连'; Uri = $OfficialUri; Mbps = 0 }
+    }
+    $selected = $results | Sort-Object Mbps -Descending | Select-Object -First 1
+    Write-Host ("选择最快通道：{0}（测速 {1:N2} MB/s）" -f $selected.Name, $selected.Mbps) -ForegroundColor Green
+    return $selected
+}
+
+function Invoke-DotNetFileDownloadWithProgress {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [Parameter(Mandatory = $true)]
+        [string]$Destination,
+        [string]$Activity,
+        [int]$ProgressStart,
+        [int]$ProgressEnd,
+        [long]$ExpectedSize = -1
+    )
+
+    $partialPath = "$Destination.part"
+    $destinationDirectory = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+
+    $totalBytes = $ExpectedSize
+    if ($totalBytes -le 0) {
+        $head = [Net.HttpWebRequest]::Create($Uri)
+        $head.Method = 'HEAD'
+        $head.UserAgent = 'DataAnonymization-WSL-Installer/1.0'
+        $head.AllowAutoRedirect = $true
+        $head.Timeout = 15000
+        $head.ReadWriteTimeout = 15000
+        try {
+            $headResponse = $head.GetResponse()
+            try { $totalBytes = [long]$headResponse.ContentLength } finally { $headResponse.Dispose() }
+        } catch {
+            $totalBytes = -1
+        }
+    }
+
+    if ((Test-Path -LiteralPath $Destination) -and $totalBytes -gt 0 -and
+        (Get-Item -LiteralPath $Destination).Length -eq $totalBytes) {
+        Write-InstallProgress -Percent $ProgressEnd -Activity $Activity `
+            -Status ("已缓存 {0}，跳过下载" -f (Format-ByteSize $totalBytes)) -CompleteLine
+        return $Destination
+    }
+    if ((Test-Path -LiteralPath $partialPath) -and $totalBytes -gt 0 -and
+        (Get-Item -LiteralPath $partialPath).Length -eq $totalBytes) {
+        Move-Item -LiteralPath $partialPath -Destination $Destination -Force
+        Write-InstallProgress -Percent $ProgressEnd -Activity $Activity `
+            -Status ("断点文件已完整，恢复缓存 {0}" -f (Format-ByteSize $totalBytes)) -CompleteLine
+        return $Destination
+    }
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $existingBytes = if (Test-Path -LiteralPath $partialPath) {
+            [long](Get-Item -LiteralPath $partialPath).Length
+        } else {
+            0L
+        }
+        if ($totalBytes -gt 0 -and $existingBytes -gt $totalBytes) {
+            Remove-Item -LiteralPath $partialPath -Force
+            $existingBytes = 0L
+        }
+
+        $request = [Net.HttpWebRequest]::Create($Uri)
+        $request.Method = 'GET'
+        $request.UserAgent = 'DataAnonymization-WSL-Installer/1.0'
+        $request.AllowAutoRedirect = $true
+        $request.Timeout = 30000
+        $request.ReadWriteTimeout = 30000
+        if ($existingBytes -gt 0) { $request.AddRange($existingBytes) }
+
+        $response = $null
+        $networkStream = $null
+        $fileStream = $null
+        try {
+            $response = $request.GetResponse()
+            $isPartial = [int]$response.StatusCode -eq 206
+            if ($existingBytes -gt 0 -and -not $isPartial) {
+                $existingBytes = 0L
+                Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue
+            }
+            if ($totalBytes -le 0) {
+                $totalBytes = if ($isPartial) {
+                    $existingBytes + [long]$response.ContentLength
+                } else {
+                    [long]$response.ContentLength
+                }
+            }
+
+            $fileMode = if ($existingBytes -gt 0 -and $isPartial) {
+                [IO.FileMode]::Append
+            } else {
+                [IO.FileMode]::Create
+            }
+            $fileStream = New-Object IO.FileStream($partialPath, $fileMode, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            $networkStream = $response.GetResponseStream()
+            $buffer = New-Object byte[] (1MB)
+            $downloadedBytes = $existingBytes
+            $startedAt = [DateTime]::UtcNow
+            $sampleAt = $startedAt
+            $sampleBytes = $downloadedBytes
+            $lastDisplayAt = [DateTime]::MinValue
+
+            while ($true) {
+                $asyncRead = $networkStream.BeginRead($buffer, 0, $buffer.Length, $null, $null)
+                while (-not $asyncRead.AsyncWaitHandle.WaitOne(500)) {
+                    $now = [DateTime]::UtcNow
+                    $averageSeconds = [math]::Max(($now - $startedAt).TotalSeconds, 0.001)
+                    $averageMbps = (($downloadedBytes - $existingBytes) / 1MB) / $averageSeconds
+                    if ($totalBytes -gt 0) {
+                        $filePercent = [math]::Min(100, [math]::Floor($downloadedBytes * 100 / $totalBytes))
+                        $overall = $ProgressStart + [math]::Floor(($ProgressEnd - $ProgressStart) * $filePercent / 100)
+                        $sizeText = "$(Format-ByteSize $downloadedBytes) / $(Format-ByteSize $totalBytes)"
+                    } else {
+                        $filePercent = 0
+                        $overall = $ProgressStart
+                        $sizeText = Format-ByteSize $downloadedBytes
+                    }
+                    $status = "$filePercent%｜$sizeText｜实时 0.00 MB/s｜平均 {0:N2} MB/s" -f $averageMbps
+                    Write-InstallProgress -Percent $overall -Activity $Activity -Status $status
+                    $sampleAt = $now
+                    $sampleBytes = $downloadedBytes
+                    $lastDisplayAt = $now
+                }
+                $read = $networkStream.EndRead($asyncRead)
+                $asyncRead.AsyncWaitHandle.Dispose()
+                if ($read -le 0) { break }
+                $fileStream.Write($buffer, 0, $read)
+                $downloadedBytes += $read
+                $now = [DateTime]::UtcNow
+                if (($now - $lastDisplayAt).TotalMilliseconds -ge 500) {
+                    $sampleSeconds = [math]::Max(($now - $sampleAt).TotalSeconds, 0.001)
+                    $instantMbps = (($downloadedBytes - $sampleBytes) / 1MB) / $sampleSeconds
+                    $averageSeconds = [math]::Max(($now - $startedAt).TotalSeconds, 0.001)
+                    $averageMbps = (($downloadedBytes - $existingBytes) / 1MB) / $averageSeconds
+                    if ($totalBytes -gt 0) {
+                        $filePercent = [math]::Min(100, [math]::Floor($downloadedBytes * 100 / $totalBytes))
+                        $overall = $ProgressStart + [math]::Floor(($ProgressEnd - $ProgressStart) * $filePercent / 100)
+                        $sizeText = "$(Format-ByteSize $downloadedBytes) / $(Format-ByteSize $totalBytes)"
+                    } else {
+                        $filePercent = 0
+                        $overall = $ProgressStart
+                        $sizeText = Format-ByteSize $downloadedBytes
+                    }
+                    $status = "$filePercent%｜$sizeText｜实时 {0:N2} MB/s｜平均 {1:N2} MB/s" -f $instantMbps, $averageMbps
+                    Write-InstallProgress -Percent $overall -Activity $Activity -Status $status
+                    $sampleAt = $now
+                    $sampleBytes = $downloadedBytes
+                    $lastDisplayAt = $now
+                }
+            }
+            $fileStream.Flush()
+            $fileStream.Dispose(); $fileStream = $null
+            $networkStream.Dispose(); $networkStream = $null
+            $response.Dispose(); $response = $null
+
+            if ($totalBytes -gt 0 -and $downloadedBytes -ne $totalBytes) {
+                throw "下载大小不完整：$downloadedBytes / $totalBytes 字节"
+            }
+            Move-Item -LiteralPath $partialPath -Destination $Destination -Force
+            Write-InstallProgress -Percent $ProgressEnd -Activity $Activity `
+                -Status ("100%｜{0}｜下载完成" -f (Format-ByteSize $downloadedBytes)) -CompleteLine
+            return $Destination
+        } catch {
+            if ($attempt -ge 3) { throw "下载失败（已重试 3 次，保留断点文件）：$($_.Exception.Message)" }
+            Write-Warning "下载中断，2 秒后从断点重试（$attempt/3）：$($_.Exception.Message)"
+            Start-Sleep -Seconds 2
+        } finally {
+            if ($fileStream) { $fileStream.Dispose() }
+            if ($networkStream) { $networkStream.Dispose() }
+            if ($response) { $response.Dispose() }
+        }
+    }
+}
+
+function Invoke-FileDownloadWithProgress {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [Parameter(Mandatory = $true)]
+        [string]$Destination,
+        [string]$Activity,
+        [int]$ProgressStart,
+        [int]$ProgressEnd,
+        [long]$ExpectedSize = -1
+    )
+
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $curl) {
+        Write-Warning '未找到 Windows curl.exe，改用 .NET 单连接下载器。'
+        return Invoke-DotNetFileDownloadWithProgress @PSBoundParameters
+    }
+
+    $partialPath = "$Destination.part"
+    New-Item -ItemType Directory -Path (Split-Path -Parent $Destination) -Force | Out-Null
+    $totalBytes = $ExpectedSize
+    if ($totalBytes -le 0) {
+        try {
+            $head = [Net.HttpWebRequest]::Create($Uri)
+            $head.Method = 'HEAD'
+            $head.UserAgent = 'DataAnonymization-WSL-Installer/1.0'
+            $head.AllowAutoRedirect = $true
+            $head.Timeout = 15000
+            $head.ReadWriteTimeout = 15000
+            $headResponse = $head.GetResponse()
+            try { $totalBytes = [long]$headResponse.ContentLength } finally { $headResponse.Dispose() }
+        } catch {
+            $totalBytes = -1L
+        }
+    }
+
+    if ((Test-Path -LiteralPath $Destination) -and $totalBytes -gt 0 -and
+        (Get-Item -LiteralPath $Destination).Length -eq $totalBytes) {
+        Write-InstallProgress -Percent $ProgressEnd -Activity $Activity `
+            -Status ("已缓存 {0}，跳过下载" -f (Format-ByteSize $totalBytes)) -CompleteLine
+        return $Destination
+    }
+    if ((Test-Path -LiteralPath $partialPath) -and $totalBytes -gt 0 -and
+        (Get-Item -LiteralPath $partialPath).Length -eq $totalBytes) {
+        Move-Item -LiteralPath $partialPath -Destination $Destination -Force
+        Write-InstallProgress -Percent $ProgressEnd -Activity $Activity `
+            -Status ("断点文件已完整，恢复缓存 {0}" -f (Format-ByteSize $totalBytes)) -CompleteLine
+        return $Destination
+    }
+
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $existingBytes = if (Test-Path -LiteralPath $partialPath) {
+            [long](Get-Item -LiteralPath $partialPath).Length
+        } else {
+            0L
+        }
+        if ($totalBytes -gt 0 -and $existingBytes -gt $totalBytes) {
+            Remove-Item -LiteralPath $partialPath -Force
+            $existingBytes = 0L
+        }
+
+        $arguments = @(
+            '--location', '--fail', '--silent', '--show-error',
+            '--retry', '3', '--retry-delay', '2', '--connect-timeout', '20',
+            '--speed-time', ([string]$WslNoProgressTimeoutSeconds), '--speed-limit', '1024',
+            '--user-agent', 'DataAnonymization-WSL-Installer/1.0',
+            '--continue-at', '-', '--output', $partialPath, $Uri
+        )
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $curl.Source
+        $startInfo.Arguments = (($arguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardError = $true
+        $process = New-Object Diagnostics.Process
+        $process.StartInfo = $startInfo
+        $startedAt = [DateTime]::UtcNow
+        $sampleAt = $startedAt
+        $sampleBytes = $existingBytes
+        try {
+            if (-not $process.Start()) { throw '无法启动 Windows curl.exe。' }
+            while (-not $process.WaitForExit(500)) {
+                $downloadedBytes = if (Test-Path -LiteralPath $partialPath) {
+                    [long](Get-Item -LiteralPath $partialPath).Length
+                } else {
+                    0L
+                }
+                $now = [DateTime]::UtcNow
+                $sampleSeconds = [math]::Max(($now - $sampleAt).TotalSeconds, 0.001)
+                $instantMbps = [math]::Max(0, (($downloadedBytes - $sampleBytes) / 1MB) / $sampleSeconds)
+                $averageSeconds = [math]::Max(($now - $startedAt).TotalSeconds, 0.001)
+                $averageMbps = [math]::Max(0, (($downloadedBytes - $existingBytes) / 1MB) / $averageSeconds)
+                if ($totalBytes -gt 0) {
+                    $filePercent = [math]::Min(100, [math]::Floor($downloadedBytes * 100 / $totalBytes))
+                    $overall = $ProgressStart + [math]::Floor(($ProgressEnd - $ProgressStart) * $filePercent / 100)
+                    $sizeText = "$(Format-ByteSize $downloadedBytes) / $(Format-ByteSize $totalBytes)"
+                } else {
+                    $filePercent = 0
+                    $overall = $ProgressStart
+                    $sizeText = Format-ByteSize $downloadedBytes
+                }
+                $status = "$filePercent%｜$sizeText｜实时 {0:N2} MB/s｜平均 {1:N2} MB/s" -f $instantMbps, $averageMbps
+                Write-InstallProgress -Percent $overall -Activity $Activity -Status $status
+                $sampleAt = $now
+                $sampleBytes = $downloadedBytes
+            }
+            $errorText = $process.StandardError.ReadToEnd().Trim()
+            $process.WaitForExit()
+            $exitCode = $process.ExitCode
+        } catch [System.Management.Automation.PipelineStoppedException] {
+            Stop-NativeProcessTree $process
+            throw
+        } finally {
+            if ($process) { $process.Dispose() }
+        }
+
+        if ($exitCode -eq 0) {
+            $downloadedBytes = [long](Get-Item -LiteralPath $partialPath).Length
+            if ($totalBytes -gt 0 -and $downloadedBytes -ne $totalBytes) {
+                throw "下载大小不完整：$downloadedBytes / $totalBytes 字节"
+            }
+            Move-Item -LiteralPath $partialPath -Destination $Destination -Force
+            Write-InstallProgress -Percent $ProgressEnd -Activity $Activity `
+                -Status ("100%｜{0}｜下载完成" -f (Format-ByteSize $downloadedBytes)) -CompleteLine
+            return $Destination
+        }
+
+        # curl 退出码 33 表示服务端拒绝断点续传；仅此情况清除断点并完整重试一次。
+        if ($exitCode -eq 33 -and $existingBytes -gt 0 -and $attempt -lt 2) {
+            Write-Warning '下载服务器暂不接受该断点，正在从头重试。'
+            Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue
+            continue
+        }
+        throw "下载失败（curl 退出码 $exitCode，断点文件已保留）：$errorText"
+    }
+}
+
+function Get-OfficialWslMsiAsset([string]$Architecture) {
+    try {
+        $release = Invoke-RestMethod -UseBasicParsing `
+            -Uri 'https://api.github.com/repos/microsoft/WSL/releases/latest' `
+            -Headers @{ 'User-Agent' = 'DataAnonymization-WSL-Installer/1.0'; 'Accept' = 'application/vnd.github+json' } `
+            -TimeoutSec 10
+        $suffix = if ($Architecture -eq 'Arm64') { '.arm64.msi' } else { '.x64.msi' }
+        $asset = @($release.assets | Where-Object { $_.name.EndsWith($suffix) }) | Select-Object -First 1
+        if ($asset) { return $asset }
+    } catch {
+        Write-Warning 'GitHub 官方发布接口暂时不可访问，使用脚本内置的已校验微软稳定版元数据。'
+    }
+
+    if ($Architecture -eq 'Arm64') {
+        return [pscustomobject]@{
+            name = 'wsl.2.7.11.0.arm64.msi'
+            size = 257032192
+            digest = 'sha256:e90dd92c730dcf0f3ea8786a3e1c513d9085b2df676ed698006e8079b4e8ba71'
+            browser_download_url = 'https://github.com/microsoft/WSL/releases/download/2.7.11/wsl.2.7.11.0.arm64.msi'
+        }
+    }
+    return [pscustomobject]@{
+        name = 'wsl.2.7.11.0.x64.msi'
+        size = 258990080
+        digest = 'sha256:a611ddacee689d2fb1fb5319e58af7f3998864d86cdce632eadd8e61614a0f9d'
+        browser_download_url = 'https://github.com/microsoft/WSL/releases/download/2.7.11/wsl.2.7.11.0.x64.msi'
+    }
+}
+
+function Install-OfficialWslMsi([string]$Architecture, [int]$ProgressStart, [int]$ProgressEnd) {
+    $asset = Get-OfficialWslMsiAsset $Architecture
+    $downloadEnd = $ProgressEnd - 2
+    $target = Join-Path (Join-Path $runtimeDirectory 'downloads') $asset.name
+    $partialTarget = "$target.part"
+    $hasCompleteCache = ((Test-Path -LiteralPath $target) -and
+        (Get-Item -LiteralPath $target).Length -eq [long]$asset.size) -or
+        ((Test-Path -LiteralPath $partialTarget) -and
+        (Get-Item -LiteralPath $partialTarget).Length -eq [long]$asset.size)
+    $selectedSource = if ($hasCompleteCache) {
+        [pscustomobject]@{ Name = '本地完整缓存'; Uri = $asset.browser_download_url; Mbps = 0 }
+    } else {
+        Select-FastestWslMsiUri $asset.browser_download_url
+    }
+    Invoke-FileDownloadWithProgress -Uri $selectedSource.Uri -Destination $target `
+        -Activity ("下载微软官方 WSL 安装包（{0}）" -f $selectedSource.Name) `
+        -ProgressStart $ProgressStart -ProgressEnd $downloadEnd -ExpectedSize ([long]$asset.size) | Out-Null
+
+    if ($asset.digest -and $asset.digest.StartsWith('sha256:')) {
+        $expectedHash = $asset.digest.Substring(7).ToLowerInvariant()
+        $actualHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $expectedHash) {
+            Remove-Item -LiteralPath $target -Force
+            throw 'WSL MSI 的 SHA-256 校验失败，已删除文件。'
+        }
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $target
+    if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or
+        $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+        Remove-Item -LiteralPath $target -Force
+        throw 'WSL MSI 的微软数字签名无效，已删除文件。'
+    }
+
+    $result = Invoke-NativeCommand -FilePath 'msiexec.exe' `
+        -ArgumentList @('/i', $target, '/qn', '/norestart') -DisplayOutput `
+        -Activity '安装微软签名的 WSL MSI' -ProgressStart $downloadEnd -ProgressEnd $ProgressEnd `
+        -CommandTimeoutSeconds 600
+    if ($result.ExitCode -notin @(0, 3010)) { throw "WSL MSI 安装失败，退出码：$($result.ExitCode)" }
+    return [pscustomobject]@{ Output = $result.Output; ExitCode = 0; TimedOut = $false }
+}
+
+function Get-OfficialDistributionAsset([string]$Distribution, [string]$Architecture) {
+    try {
+        $manifest = Invoke-RestMethod -UseBasicParsing `
+            -Uri 'https://raw.githubusercontent.com/microsoft/WSL/master/distributions/DistributionInfo.json' `
+            -Headers @{ 'User-Agent' = 'DataAnonymization-WSL-Installer/1.0' } -TimeoutSec 10
+        $entry = $null
+        foreach ($group in $manifest.ModernDistributions.PSObject.Properties) {
+            $entry = @($group.Value | Where-Object { $_.Name -eq $Distribution }) | Select-Object -First 1
+            if ($entry) { break }
+        }
+        if ($entry) {
+            $asset = if ($Architecture -eq 'Arm64') { $entry.Arm64Url } else { $entry.Amd64Url }
+            if ($asset -and $asset.Url -and $asset.Sha256) { return $asset }
+        }
+    } catch {
+        Write-Warning '微软 WSL 在线发行版清单暂时不可访问，尝试内置的已校验 Ubuntu 24.04 元数据。'
+    }
+
+    if ($Distribution -eq 'Ubuntu-24.04') {
+        if ($Architecture -eq 'Arm64') {
+            return [pscustomobject]@{
+                Url = 'https://cdimages.ubuntu.com/releases/24.04.4/release/ubuntu-24.04.4-wsl-arm64.wsl'
+                Sha256 = '6b244d89f412a68f51e58f396fab65bed3b5896a25c045a99bef9c78a07df507'
+            }
+        }
+        return [pscustomobject]@{
+            Url = 'https://releases.ubuntu.com/24.04.4/ubuntu-24.04.4-wsl-amd64.wsl'
+            Sha256 = '9b2f7730dc68227dd04a9f3e5eab86ad85caf556b8606ad94f1f29ff5c4fd3f5'
+        }
+    }
+    throw "微软官方发行版清单不可用，且脚本没有 $Distribution / $Architecture 的内置已校验元数据。"
+}
+
+function Install-OfficialDistributionFile(
+    [string]$Distribution,
+    [string]$Architecture,
+    [int]$ProgressStart,
+    [int]$ProgressEnd
+) {
+    $asset = Get-OfficialDistributionAsset $Distribution $Architecture
+    $fileName = [IO.Path]::GetFileName(([Uri]$asset.Url).AbsolutePath)
+    $downloadEnd = $ProgressEnd - 2
+    $target = Join-Path (Join-Path $runtimeDirectory 'downloads') $fileName
+    Invoke-FileDownloadWithProgress -Uri $asset.Url -Destination $target `
+        -Activity "下载微软清单中的 $Distribution" -ProgressStart $ProgressStart -ProgressEnd $downloadEnd | Out-Null
+    $expectedHash = ([string]$asset.Sha256).Trim().ToLowerInvariant()
+    if ($expectedHash.StartsWith('0x')) { $expectedHash = $expectedHash.Substring(2) }
+    $actualHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $expectedHash) {
+        Remove-Item -LiteralPath $target -Force
+        throw "$Distribution 安装包的 SHA-256 校验失败，已删除文件。"
+    }
+    $result = Invoke-NativeCommand -FilePath 'wsl.exe' `
+        -ArgumentList @('--install', '--from-file', $target, '--no-launch') -DisplayOutput `
+        -Activity "从已校验文件安装 $Distribution" -ProgressStart $downloadEnd -ProgressEnd $ProgressEnd `
+        -CommandTimeoutSeconds 600
+    if ($result.ExitCode -ne 0) { throw "$Distribution 本地安装失败。" }
+    return $result
 }
 
 function Get-WslChannelOrder {
     if ($WslDownloadChannel -eq 'Web') { return @('Web') }
     if ($WslDownloadChannel -eq 'Store') { return @('Store') }
-    if (Test-WslWebChannel) {
-        Write-Host 'GitHub 官方 WSL 发布页可访问，Auto 优先使用 Web 通道。' -ForegroundColor Green
-        return @('Web', 'Store')
-    }
-    Write-Host 'GitHub 官方 WSL 发布页当前不可访问，Auto 优先使用 Microsoft Store。' -ForegroundColor Yellow
-    return @('Store', 'Web')
+    Write-Host 'Auto 先尝试官方元数据与实测速下载；失败后再回退 Microsoft Store。' -ForegroundColor Cyan
+    return @('Web', 'Store')
 }
 
 function Invoke-WslOfficialDownload {
@@ -755,6 +1310,8 @@ function Invoke-WslOfficialDownload {
         [ValidateSet('Update', 'Install')]
         [string]$Operation,
         [string]$Distribution = '',
+        [ValidateSet('X64', 'Arm64')]
+        [string]$Architecture = 'X64',
         [int]$ProgressStart,
         [int]$ProgressEnd
     )
@@ -764,6 +1321,26 @@ function Invoke-WslOfficialDownload {
     for ($index = 0; $index -lt $channels.Count; $index++) {
         $channel = $channels[$index]
         $channelName = if ($channel -eq 'Web') { 'GitHub 官方 Web 通道' } else { 'Microsoft Store 官方通道' }
+        if ($channel -eq 'Web') {
+            try {
+                if ($Operation -eq 'Update') {
+                    return Install-OfficialWslMsi -Architecture $Architecture `
+                        -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd
+                }
+                return Install-OfficialDistributionFile -Distribution $Distribution -Architecture $Architecture `
+                    -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd
+            } catch {
+                $lastResult = [pscustomobject]@{
+                    Output = @($_.Exception.Message)
+                    ExitCode = 1
+                    TimedOut = $false
+                    TimeoutStatus = ''
+                }
+                Write-Warning "通过 $channelName 直接下载失败：$($_.Exception.Message)"
+                if ($index -ge $channels.Count - 1) { return $lastResult }
+                continue
+            }
+        }
         if ($Operation -eq 'Update') {
             $arguments = @('--update')
             $activity = "通过 $channelName 更新 WSL"
@@ -771,14 +1348,6 @@ function Invoke-WslOfficialDownload {
             $arguments = @('--install', '--distribution', $Distribution, '--no-launch')
             $activity = "通过 $channelName 安装 $Distribution"
         }
-        if ($channel -eq 'Web') {
-            if ($Operation -eq 'Update') {
-                $arguments += '--web-download'
-            } else {
-                $arguments = @('--install', '--web-download', '--distribution', $Distribution, '--no-launch')
-            }
-        }
-
         # Auto 的首选通道无进展时才超时切换；最后一个或用户固定的通道不被脚本强制中断。
         $timeoutForAttempt = if ($channels.Count -gt 1 -and $index -lt $channels.Count - 1) {
             $WslNoProgressTimeoutSeconds
@@ -1021,11 +1590,13 @@ try {
     Write-Step "安装并初始化 $DistroName（WSL2）"
     if (-not $wslRuntimeVersion -or $wslRuntimeVersion -lt $MinimumWslVersion) {
         Write-Host "WSL 未安装或低于 $MinimumWslVersion，开始安装/更新。" -ForegroundColor Yellow
-        $wslResult = Invoke-WslOfficialDownload -Operation Update -ProgressStart 25 -ProgressEnd 40
+        $wslResult = Invoke-WslOfficialDownload -Operation Update -Architecture $architecture `
+            -ProgressStart 25 -ProgressEnd 40
         if ($wslResult.ExitCode -ne 0) {
             throw 'WSL 运行时安装/更新失败。Auto 已尝试可用的微软官方通道；请检查 Microsoft Store/GitHub 网络后重试。'
         }
-        $wslRuntimeVersion = Get-WslRuntimeVersion
+        $wslRuntimeVersion = Get-WslRuntimeVersion -ShowDetectionProgress `
+            -ProgressStart 40 -ProgressEnd 40 -Activity '验证已安装的 WSL 运行时版本'
         if (-not $wslRuntimeVersion -or $wslRuntimeVersion -lt $MinimumWslVersion) {
             throw "WSL 更新后仍未达到 systemd 所需的最低版本 $MinimumWslVersion。"
         }
@@ -1039,9 +1610,11 @@ try {
 
     if ($DistroName -notin $installedDistros) {
         $wslResult = Invoke-WslOfficialDownload -Operation Install -Distribution $DistroName `
+            -Architecture $architecture `
             -ProgressStart 42 -ProgressEnd 57
         if ($wslResult.ExitCode -ne 0) { throw "$DistroName 安装失败。Auto 已尝试可用的微软官方通道，请检查网络后重试。" }
-        $installedDistros = Get-InstalledWslDistros
+        $installedDistros = Get-InstalledWslDistros -ShowDetectionProgress `
+            -ProgressStart 57 -ProgressEnd 57 -Activity "验证已安装的 $DistroName"
         if ($DistroName -notin $installedDistros) { throw "$DistroName 安装后未出现在 WSL 发行版列表中。" }
     } else {
         Write-Host "$DistroName 已安装，跳过重复安装。" -ForegroundColor Green
