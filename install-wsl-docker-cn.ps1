@@ -5,8 +5,6 @@ param(
     [string]$ProjectPath = $PSScriptRoot,
     [ValidateSet('Auto', 'Store', 'Web')]
     [string]$WslDownloadChannel = 'Auto',
-    [ValidateRange(5, 60)]
-    [int]$ProgressIntervalSeconds = 10,
     [switch]$CheckOnly,
     [switch]$AutoReboot,
     [switch]$ResumeAfterRestart
@@ -415,56 +413,122 @@ function ConvertTo-NativeArgument([AllowEmptyString()][string]$Value) {
     return '"' + $escaped + '"'
 }
 
+function Write-InstallProgress {
+    param(
+        [ValidateRange(0, 100)]
+        [int]$Percent,
+        [string]$Activity,
+        [string]$Status = '',
+        [switch]$CompleteLine
+    )
+
+    $barWidth = 30
+    $filled = [math]::Floor($Percent * $barWidth / 100)
+    $empty = $barWidth - $filled
+    $bar = ('#' * $filled) + ('-' * $empty)
+    $detail = if ([string]::IsNullOrWhiteSpace($Status)) { $Activity } else { "$Activity - $Status" }
+    $line = ("[{0}] {1,3}%  {2}" -f $bar, $Percent, $detail).PadRight(110)
+    Write-Progress -Id 5291 -Activity '数据脱敏应用安装进度' -Status $detail -PercentComplete $Percent
+    Write-Host ("`r$line") -NoNewline -ForegroundColor Cyan
+    if ($CompleteLine) { Write-Host }
+}
+
+function Get-NativePercent([string[]]$Paths) {
+    $latestPercent = $null
+    foreach ($path in $Paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        try {
+            $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try {
+                $bytes = New-Object byte[] $stream.Length
+                $null = $stream.Read($bytes, 0, $bytes.Length)
+            } finally {
+                $stream.Dispose()
+            }
+            if ($bytes.Length -eq 0) { continue }
+            # WSL 在不同 Windows 版本上可能输出 UTF-8、系统代码页或 UTF-16；
+            # 百分比均为 ASCII 数字，去除 NUL 后即可可靠提取。
+            $text = [Text.Encoding]::UTF8.GetString($bytes) -replace "`0", ''
+            foreach ($match in [regex]::Matches($text, '(?<!\d)(100|[0-9]{1,2})(?:\.[0-9]+)?\s*%')) {
+                $value = [int][math]::Floor([double]$match.Groups[1].Value)
+                if ($value -ge 0 -and $value -le 100) { $latestPercent = $value }
+            }
+        } catch {
+            # 文件可能正在被子进程写入；下一轮继续读取。
+        }
+    }
+    return $latestPercent
+}
+
 function Invoke-NativeCommandWithProgress {
     param(
         [Parameter(Mandatory = $true)]
         [string]$FilePath,
         [string[]]$ArgumentList = @(),
         [string]$Activity = '正在执行',
-        [ValidateRange(5, 60)]
-        [int]$HeartbeatSeconds = 10,
-        [string]$SlowHint = ''
+        [ValidateRange(0, 100)]
+        [int]$ProgressStart = 0,
+        [ValidateRange(0, 100)]
+        [int]$ProgressEnd = 100
     )
 
+    if ($ProgressEnd -lt $ProgressStart) { throw '进度结束值不能小于起始值。' }
+    $stdoutPath = [IO.Path]::GetTempFileName()
+    $stderrPath = [IO.Path]::GetTempFileName()
+    $argumentText = (($ArgumentList | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
+    Write-InstallProgress -Percent $ProgressStart -Activity $Activity -Status '等待安装程序返回进度'
+    $resolvedCommand = Get-Command $FilePath -ErrorAction Stop
+    $nativePath = if ($resolvedCommand.Source) { $resolvedCommand.Source } else { $FilePath }
+    $redirectedCommand = '{0} {1} 1>{2} 2>{3}' -f `
+        (ConvertTo-NativeArgument $nativePath),
+        $argumentText,
+        (ConvertTo-NativeArgument $stdoutPath),
+        (ConvertTo-NativeArgument $stderrPath)
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $FilePath
-    $startInfo.Arguments = (($ArgumentList | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
+    $startInfo.FileName = $env:ComSpec
+    $startInfo.Arguments = '/d /s /c "' + $redirectedCommand + '"'
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
-    # 不重定向 WSL 输出：让它直接绘制自带的百分比/下载进度。
-    $startInfo.RedirectStandardOutput = $false
-    $startInfo.RedirectStandardError = $false
-
-    Write-Host ("[{0}] {1}；下面会显示 WSL 原生进度。" -f (Get-Date -Format 'HH:mm:ss'), $Activity) -ForegroundColor Cyan
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
-    if (-not $process.Start()) { throw "无法启动：$FilePath" }
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $slowHintShown = $false
-    $cancelled = $false
     try {
         try {
-            while (-not $process.WaitForExit($HeartbeatSeconds * 1000)) {
-                Write-Host ("[{0}] {1}仍在进行，已用时 {2:mm\:ss}；请勿关闭窗口。" -f `
-                    (Get-Date -Format 'HH:mm:ss'), $Activity, $stopwatch.Elapsed) -ForegroundColor DarkCyan
-                if (-not $slowHintShown -and -not [string]::IsNullOrWhiteSpace($SlowHint) `
-                    -and $stopwatch.Elapsed.TotalSeconds -ge 180) {
-                    Write-Warning $SlowHint
-                    $slowHintShown = $true
+            if (-not $process.Start()) { throw "无法启动：$FilePath" }
+            $lastShown = -1
+            while (-not $process.WaitForExit(250)) {
+                $nativePercent = Get-NativePercent @($stdoutPath, $stderrPath)
+                if ($null -ne $nativePercent) {
+                    $overallPercent = $ProgressStart + [math]::Floor(
+                        ($ProgressEnd - $ProgressStart) * $nativePercent / 100
+                    )
+                    if ($overallPercent -ne $lastShown) {
+                        Write-InstallProgress -Percent $overallPercent -Activity $Activity `
+                            -Status ("当前阶段 {0}%" -f $nativePercent)
+                        $lastShown = $overallPercent
+                    }
                 }
             }
             $process.WaitForExit()
-            return [pscustomobject]@{ Output = @(); ExitCode = $process.ExitCode }
+            $exitCode = $process.ExitCode
+            $capturedOutput = @()
+            foreach ($path in @($stdoutPath, $stderrPath)) {
+                if (Test-Path -LiteralPath $path) {
+                    $capturedOutput += @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
+                }
+            }
+            Write-InstallProgress -Percent $(if ($exitCode -eq 0) { $ProgressEnd } else { $ProgressStart }) `
+                -Activity $Activity -Status $(if ($exitCode -eq 0) { '完成' } else { '失败' }) -CompleteLine
+            if ($exitCode -ne 0) {
+                $capturedOutput | Select-Object -Last 30 | ForEach-Object { Write-Host ([string]$_) }
+            }
+            return [pscustomobject]@{ Output = $capturedOutput; ExitCode = $exitCode }
         } catch [System.Management.Automation.PipelineStoppedException] {
-            $cancelled = $true
+            if ($process -and -not $process.HasExited) { try { $process.Kill() } catch { } }
             throw
         }
     } finally {
-        if ($cancelled -and -not $process.HasExited) {
-            try { $process.Kill() } catch { }
-        }
-        $stopwatch.Stop()
-        $process.Dispose()
+        if ($process) { $process.Dispose() }
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -476,12 +540,15 @@ function Invoke-NativeCommand {
         [switch]$IgnoreStandardError,
         [switch]$DisplayOutput,
         [string]$Activity = '正在执行',
-        [string]$SlowHint = ''
+        [ValidateRange(0, 100)]
+        [int]$ProgressStart = 0,
+        [ValidateRange(0, 100)]
+        [int]$ProgressEnd = 100
     )
 
     if ($DisplayOutput) {
         return Invoke-NativeCommandWithProgress -FilePath $FilePath -ArgumentList $ArgumentList `
-            -Activity $Activity -HeartbeatSeconds $ProgressIntervalSeconds -SlowHint $SlowHint
+            -Activity $Activity -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd
     }
 
     $savedErrorActionPreference = $ErrorActionPreference
@@ -591,7 +658,7 @@ function Confirm-Installation {
 }
 
 function Start-ElevatedCopy {
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel -ProgressIntervalSeconds $ProgressIntervalSeconds"
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel"
     if ($CheckOnly) { $arguments += ' -CheckOnly' }
     if ($AutoReboot) { $arguments += ' -AutoReboot' }
     if ($ResumeAfterRestart) { $arguments += ' -ResumeAfterRestart' }
@@ -600,7 +667,7 @@ function Start-ElevatedCopy {
 }
 
 function Set-ResumeAfterRestart {
-    $command = "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel -ProgressIntervalSeconds $ProgressIntervalSeconds -ResumeAfterRestart"
+    $command = "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel -ResumeAfterRestart"
     if ($AutoReboot) { $command += ' -AutoReboot' }
     New-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' `
         -Name $ResumeName -Value $command -PropertyType String -Force | Out-Null
@@ -711,7 +778,9 @@ try {
     if ($blocking.Count -gt 0) {
         throw ("系统不符合安装要求：`n- " + ($blocking -join "`n- "))
     }
+    Write-InstallProgress -Percent 10 -Activity '系统与部署资源检测' -Status '完成' -CompleteLine
     if ($CheckOnly) {
+        Write-Progress -Id 5291 -Activity '数据脱敏应用安装进度' -Completed
         Write-Host "`n系统满足最低安装要求；未修改任何 WSL 或 Docker 配置。" -ForegroundColor Green
         return
     }
@@ -760,6 +829,7 @@ try {
         }
     )
     $installationState | Format-Table -AutoSize
+    Write-InstallProgress -Percent 20 -Activity '现有 WSL、Ubuntu 与 Docker 检测' -Status '完成' -CompleteLine
 
     if ($wslDocker.Docker -and ([version]$wslDocker.Docker -ge [version]$MaximumDockerVersion)) {
         throw "Docker Engine $($wslDocker.Docker) 超出支持范围 [${MinimumDockerVersion}, ${MaximumDockerVersion})；脚本不会自动降级。"
@@ -782,22 +852,20 @@ try {
         Stop-ForRestart
         return
     }
+    Write-InstallProgress -Percent 25 -Activity 'WSL2 Windows 功能' -Status '已就绪' -CompleteLine
 
     Write-Step "安装并初始化 $DistroName（WSL2）"
     if (-not $wslRuntimeVersion -or $wslRuntimeVersion -lt $MinimumWslVersion) {
         Write-Host "WSL 未安装或低于 $MinimumWslVersion，开始安装/更新。" -ForegroundColor Yellow
         $updateArguments = if ($WslDownloadChannel -eq 'Web') { @('--update', '--web-download') } else { @('--update') }
         $channelName = if ($WslDownloadChannel -eq 'Web') { 'GitHub 官方 Web 通道' } else { 'Microsoft Store 官方通道' }
-        $slowHint = if ($WslDownloadChannel -eq 'Auto') {
-            '若百分比一直停在 0%，可按 Ctrl+C 停止后重新运行：.\install-wsl-docker-cn.ps1 -WslDownloadChannel Web'
-        } else { '' }
         $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList $updateArguments `
-            -DisplayOutput -Activity "通过 $channelName 更新 WSL" -SlowHint $slowHint
+            -DisplayOutput -Activity "通过 $channelName 更新 WSL" -ProgressStart 25 -ProgressEnd 40
         if ($wslResult.ExitCode -ne 0 -and $WslDownloadChannel -eq 'Auto') {
             Write-Warning 'Microsoft Store 通道更新失败，自动切换到 GitHub 官方 Web 下载通道。'
             $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
                 -ArgumentList @('--update', '--web-download') -DisplayOutput `
-                -Activity '通过 GitHub 官方 Web 通道更新 WSL'
+                -Activity '通过 GitHub 官方 Web 通道更新 WSL' -ProgressStart 25 -ProgressEnd 40
         }
         if ($wslResult.ExitCode -ne 0) {
             throw 'WSL 运行时安装/更新失败。可重试，或使用 -WslDownloadChannel Web 切换到 GitHub 官方通道。'
@@ -808,9 +876,10 @@ try {
         }
     } else {
         Write-Host "WSL $wslRuntimeVersion 已满足要求，跳过重复安装/更新。" -ForegroundColor Green
+        Write-InstallProgress -Percent 40 -Activity 'WSL 运行时' -Status '版本满足要求，已跳过' -CompleteLine
     }
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-default-version', '2') `
-        -DisplayOutput -Activity '设置默认 WSL 版本为 2'
+        -DisplayOutput -Activity '设置默认 WSL 版本为 2' -ProgressStart 40 -ProgressEnd 42
     if ($wslResult.ExitCode -ne 0) { throw '无法把 WSL 默认版本设为 2。请先完成 Windows Update。' }
 
     if ($DistroName -notin $installedDistros) {
@@ -822,31 +891,34 @@ try {
         }
         $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
             -ArgumentList $installArguments -DisplayOutput -Activity "通过 $installChannelName 安装 $DistroName" `
-            -SlowHint $slowHint
+            -ProgressStart 42 -ProgressEnd 57
         if ($wslResult.ExitCode -ne 0 -and $WslDownloadChannel -eq 'Auto') {
             Write-Warning '常规 WSL 下载失败，改用 Microsoft Web Download 通道重试。'
             $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
                 -ArgumentList @('--install', '--web-download', '--distribution', $DistroName, '--no-launch') `
-                -DisplayOutput -Activity "通过 GitHub 官方 Web 通道安装 $DistroName"
+                -DisplayOutput -Activity "通过 GitHub 官方 Web 通道安装 $DistroName" `
+                -ProgressStart 42 -ProgressEnd 57
         }
         if ($wslResult.ExitCode -ne 0) { throw "$DistroName 安装失败。可改用 -WslDownloadChannel Web 或 Store 后重试。" }
         $installedDistros = Get-InstalledWslDistros
         if ($DistroName -notin $installedDistros) { throw "$DistroName 安装后未出现在 WSL 发行版列表中。" }
     } else {
         Write-Host "$DistroName 已安装，跳过重复安装。" -ForegroundColor Green
+        Write-InstallProgress -Percent 57 -Activity $DistroName -Status '已安装，已跳过' -CompleteLine
     }
 
     $distroGeneration = Get-WslDistroGeneration $DistroName
     if ($distroGeneration -ne 2) {
         $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-version', $DistroName, '2') `
-            -DisplayOutput -Activity "将 $DistroName 转换为 WSL2"
+            -DisplayOutput -Activity "将 $DistroName 转换为 WSL2" -ProgressStart 57 -ProgressEnd 62
         if ($wslResult.ExitCode -ne 0) { throw "无法把 $DistroName 转换为 WSL2。" }
     } else {
         Write-Host "$DistroName 已是 WSL2，跳过版本转换。" -ForegroundColor Green
+        Write-InstallProgress -Percent 62 -Activity 'WSL2 发行版版本' -Status '已满足要求' -CompleteLine
     }
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
         -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'bash', '-lc', 'true') `
-        -DisplayOutput -Activity "初始化 $DistroName"
+        -DisplayOutput -Activity "初始化 $DistroName" -ProgressStart 62 -ProgressEnd 65
     if ($wslResult.ExitCode -ne 0) { throw "$DistroName 初始化失败。" }
 
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
@@ -865,12 +937,12 @@ try {
     Write-Step '在 WSL 中配置国内镜像并安装 Docker Engine'
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
         -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'bash', $linuxInstaller, 'prepare', $linuxProject) `
-        -DisplayOutput -Activity '配置大陆镜像并安装 Docker'
+        -DisplayOutput -Activity '配置大陆镜像并安装 Docker' -ProgressStart 65 -ProgressEnd 78
     if ($wslResult.ExitCode -ne 0) { throw 'WSL 内的 Docker 安装或镜像配置失败。' }
 
     Write-Step '重启 WSL，使 systemd 与 Docker 服务生效'
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--shutdown') `
-        -DisplayOutput -Activity '关闭 WSL 以应用 systemd 配置'
+        -DisplayOutput -Activity '关闭 WSL 以应用 systemd 配置' -ProgressStart 78 -ProgressEnd 80
     if ($wslResult.ExitCode -ne 0) { throw 'WSL 重启失败。' }
     Start-Sleep -Seconds 3
 
@@ -883,7 +955,7 @@ try {
     Write-Step '生成安全配置、构建容器并启动应用'
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
         -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'env', "APP_ALLOWED_HOSTS=$allowedHosts", 'bash', $linuxInstaller, 'deploy', $linuxProject) `
-        -DisplayOutput -Activity '构建容器并部署应用'
+        -DisplayOutput -Activity '构建容器并部署应用' -ProgressStart 80 -ProgressEnd 95
     if ($wslResult.ExitCode -ne 0) { throw 'Docker 容器部署失败。' }
 
     $envPath = Join-Path $resolvedProject '.env'
@@ -907,6 +979,8 @@ try {
         }
     }
     if (-not $healthy) { throw '容器已启动，但 Windows 无法访问 http://localhost:5291/api/health/。' }
+    Write-InstallProgress -Percent 100 -Activity '应用健康检查' -Status '安装部署完成' -CompleteLine
+    Write-Progress -Id 5291 -Activity '数据脱敏应用安装进度' -Completed
 
     Clear-ResumeAfterRestart
     Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue

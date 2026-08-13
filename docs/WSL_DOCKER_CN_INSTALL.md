@@ -62,7 +62,7 @@ Windows 10 家庭版、专业版、企业版和教育版只要达到上述版本
 
 WSL 运行时和 Ubuntu 发行版属于 Windows 系统组件。微软官方只提供 Microsoft Store 和 `--web-download`（GitHub 官方发布）两种通道，没有公布可验证的中国大陆镜像；脚本不会从第三方网站下载或安装系统级 WSL 包。Ubuntu APT、Docker CE、PyPI、npm 和应用容器仍使用下一节列出的大陆镜像。
 
-默认使用 `Auto`：先尝试 Microsoft Store 官方通道；如果该命令明确失败，自动切换 GitHub 官方 Web 通道。如果持续 3 分钟仍未完成，脚本会提示如何安全地手工切换，但不会强制终止正在进行的系统组件更新。也可以在启动时固定通道：
+默认使用 `Auto`：先尝试 Microsoft Store 官方通道；如果该命令明确失败，自动切换 GitHub 官方 Web 通道。也可以在启动时固定通道：
 
 ```powershell
 # Microsoft Store 较慢或 0% 长时间不动时，按 Ctrl+C 后改用 GitHub 官方通道
@@ -72,13 +72,13 @@ WSL 运行时和 Ubuntu 发行版属于 Windows 系统组件。微软官方只�
 .\install-wsl-docker-cn.ps1 -WslDownloadChannel Store
 ```
 
-下载和安装过程中，脚本直接显示 WSL 自带的百分比进度；即使 WSL 暂时没有输出，也会默认每 10 秒打印当前阶段和累计用时。可以将提示间隔调整到 5–60 秒：
+安装窗口使用固定格式显示总进度：
 
-```powershell
-.\install-wsl-docker-cn.ps1 -ProgressIntervalSeconds 5
+```text
+[############------------------]  40%  通过 Microsoft Store 官方通道更新 WSL
 ```
 
-WSL 下载速度由 Microsoft Store/GitHub 官方链路决定，心跳提示只能证明进程仍在运行，不能精确计算服务器没有提供的剩余时间。
+进度由已完成安装阶段和命令返回的真实百分比计算。WSL 返回下载百分比时，当前阶段会实时细分；Microsoft Store 未返回下载字节进度时，进度条会停在当前阶段起点并显示“等待安装程序返回进度”，不会根据时间虚构百分比。阶段完成后再跳到下一确定进度。
 
 ## 自动配置的镜像
 
@@ -142,7 +142,7 @@ docker compose up -d --build      # 更新并重建
 
 ### WSL 更新长时间停在 0%
 
-先等待心跳提示确认进程仍在运行。若 Microsoft Store 通道长时间没有进展，按 `Ctrl+C` 停止后运行 `.\install-wsl-docker-cn.ps1 -WslDownloadChannel Web`，使用微软文档提供的 GitHub 官方 Web 下载通道。不要从不明第三方站点下载安装包。
+如果进度条长时间停在“等待安装程序返回进度”，按 `Ctrl+C` 停止后运行 `.\install-wsl-docker-cn.ps1 -WslDownloadChannel Web`，使用微软文档提供的 GitHub 官方 Web 下载通道。不要从不明第三方站点下载安装包。
 
 ### 国内 Docker 镜像不可用
 
