@@ -13,12 +13,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $utf8NoBom = New-Object Text.UTF8Encoding($false)
 [Console]::InputEncoding = $utf8NoBom
 [Console]::OutputEncoding = $utf8NoBom
 $OutputEncoding = $utf8NoBom
+$script:InstallProgressActive = $false
+$script:InstallProgressCells = 0
 $MinimumBuild = 19041
 $MinimumMemoryGB = 4
 $RecommendedMemoryGB = 8
@@ -344,7 +346,63 @@ deploy_application() {
     log "使用国内镜像构建并启动数据脱敏应用"
     cd "$PROJECT_DIR"
     retry docker compose pull db nginx
-    docker compose up -d --build --remove-orphans
+    docker compose build backend frontend
+
+    compose_diagnostics() {
+        local service="$1"
+        local container_id
+        container_id="$(docker compose ps -aq "$service" | tail -n 1)"
+        printf '\n===== %s 容器诊断 =====\n' "$service" >&2
+        if [[ -n "$container_id" ]]; then
+            docker inspect --format '状态={{.State.Status}} 退出码={{.State.ExitCode}} 错误={{.State.Error}}' "$container_id" 2>/dev/null || true
+            docker inspect --format '{{if .State.Health}}健康={{.State.Health.Status}}{{range .State.Health.Log}}{{println "\n检查时间=" .End " 退出码=" .ExitCode " 输出=" .Output}}{{end}}{{end}}' "$container_id" 2>/dev/null || true
+        else
+            echo "未找到 ${service} 容器。" >&2
+        fi
+        docker compose logs --no-color --tail=100 "$service" 2>&1 || true
+    }
+
+    wait_for_healthy() {
+        local service="$1"
+        local maximum_attempts="$2"
+        local attempt container_id state health
+        for ((attempt = 1; attempt <= maximum_attempts; attempt++)); do
+            container_id="$(docker compose ps -aq "$service" | tail -n 1)"
+            if [[ -z "$container_id" ]]; then
+                sleep 3
+                continue
+            fi
+            state="$(docker inspect --format '{{.State.Status}}' "$container_id" 2>/dev/null || true)"
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" 2>/dev/null || true)"
+            if [[ "$health" == "healthy" ]]; then
+                return 0
+            fi
+            if [[ "$state" == "exited" || "$state" == "dead" ]]; then
+                compose_diagnostics "$service"
+                return 1
+            fi
+            sleep 3
+        done
+        compose_diagnostics "$service"
+        return 1
+    }
+
+    log "启动 MySQL 与前端容器"
+    docker compose up -d --remove-orphans db frontend
+    if ! wait_for_healthy db 60; then
+        echo "MySQL 容器未能在 180 秒内通过健康检查。" >&2
+        exit 1
+    fi
+
+    log "启动并检查 Django 后端容器"
+    docker compose up -d --no-deps backend
+    if ! wait_for_healthy backend 60; then
+        echo "Django 后端容器未能在 180 秒内通过健康检查；诊断信息见上方及安装日志。" >&2
+        exit 1
+    fi
+
+    log "启动 Nginx 入口容器"
+    docker compose up -d --no-deps nginx
 
     log "等待应用健康检查"
     local attempt
@@ -356,8 +414,9 @@ deploy_application() {
         fi
         sleep 3
     done
-    docker compose ps
-    docker compose logs --tail=100
+    docker compose ps -a
+    compose_diagnostics backend
+    compose_diagnostics nginx
     echo "应用未能在 180 秒内通过健康检查。" >&2
     exit 1
 }
@@ -371,6 +430,7 @@ esac
 '@
 
 function Write-Step([string]$Message) {
+    Clear-InstallProgressLine
     Write-Host "`n==> $Message" -ForegroundColor Cyan
 }
 
@@ -429,14 +489,54 @@ function Write-InstallProgress {
         [switch]$CompleteLine
     )
 
+    $barWidth = 20
+    $filled = [math]::Floor($Percent * $barWidth / 100)
+    $bar = ('#' * $filled) + ('-' * ($barWidth - $filled))
     $detail = if ([string]::IsNullOrWhiteSpace($Status)) { $Activity } else { "$Activity - $Status" }
-    Write-Progress -Id 5291 -Activity '数据脱敏应用安装进度' -Status $detail -PercentComplete $Percent
+    $line = "[$bar] $($Percent.ToString().PadLeft(3))%  $detail"
+    $bufferWidth = try { [math]::Max(2, [Console]::BufferWidth) } catch { 100 }
+    $maximumCells = [math]::Max(1, $bufferWidth - 1)
+    $line = Limit-ConsoleText -Text $line -MaximumCells $maximumCells
+    $lineCells = Get-ConsoleTextWidth $line
+    $eraseCells = [math]::Max($script:InstallProgressCells, $lineCells)
+    Write-Host ("`r" + $line + (' ' * ($eraseCells - $lineCells)) + "`r") -NoNewline -ForegroundColor Cyan
+    $script:InstallProgressActive = $true
+    $script:InstallProgressCells = $lineCells
     if ($CompleteLine) {
-        # Write-Progress owns one reusable console region. Complete it before writing
-        # the final result so high-frequency download updates never become log lines.
-        Write-Progress -Id 5291 -Activity '数据脱敏应用安装进度' -Completed
+        Clear-InstallProgressLine
         Write-Host ("[{0,3}%] {1}" -f $Percent, $detail) -ForegroundColor Cyan
     }
+}
+
+function Get-ConsoleTextWidth([string]$Text) {
+    $width = 0
+    foreach ($character in $Text.ToCharArray()) {
+        $code = [int]$character
+        $width += if ($code -le 0x7F) { 1 } else { 2 }
+    }
+    return $width
+}
+
+function Limit-ConsoleText([string]$Text, [int]$MaximumCells) {
+    if ($MaximumCells -le 0) { return '' }
+    $builder = New-Object Text.StringBuilder
+    $cells = 0
+    foreach ($character in $Text.ToCharArray()) {
+        $characterCells = if ([int]$character -le 0x7F) { 1 } else { 2 }
+        if (($cells + $characterCells) -gt $MaximumCells) { break }
+        $null = $builder.Append($character)
+        $cells += $characterCells
+    }
+    return $builder.ToString()
+}
+
+function Clear-InstallProgressLine {
+    if (-not $script:InstallProgressActive) { return }
+    $bufferWidth = try { [math]::Max(2, [Console]::BufferWidth) } catch { 100 }
+    $clearCells = [math]::Min([math]::Max($script:InstallProgressCells, 1), $bufferWidth - 1)
+    Write-Host ("`r" + (' ' * $clearCells) + "`r") -NoNewline
+    $script:InstallProgressActive = $false
+    $script:InstallProgressCells = 0
 }
 
 function ConvertFrom-NativeBytes([byte[]]$Bytes) {
@@ -608,7 +708,8 @@ function Invoke-NativeCommandWithProgress {
             Write-InstallProgress -Percent $(if ($exitCode -eq 0) { $ProgressEnd } else { $ProgressStart }) `
                 -Activity $Activity -Status $resultStatus -CompleteLine
             if ($exitCode -ne 0 -and -not $SuppressFailureOutput) {
-                $capturedOutput | Select-Object -Last 30 | ForEach-Object { Write-Host ([string]$_) }
+                Clear-InstallProgressLine
+                $capturedOutput | Select-Object -Last 120 | ForEach-Object { Write-Host ([string]$_) }
             }
             return [pscustomobject]@{
                 Output = $capturedOutput
@@ -1062,6 +1163,7 @@ function Invoke-DotNetFileDownloadWithProgress {
             return $Destination
         } catch {
             if ($attempt -ge 3) { throw "下载失败（已重试 3 次，保留断点文件）：$($_.Exception.Message)" }
+            Clear-InstallProgressLine
             Write-Warning "下载中断，2 秒后从断点重试（$attempt/3）：$($_.Exception.Message)"
             Start-Sleep -Seconds 2
         } finally {
@@ -1201,6 +1303,7 @@ function Invoke-FileDownloadWithProgress {
 
         # curl 退出码 33 表示服务端拒绝断点续传；仅此情况清除断点并完整重试一次。
         if ($exitCode -eq 33 -and $existingBytes -gt 0 -and $attempt -lt 2) {
+            Clear-InstallProgressLine
             Write-Warning '下载服务器暂不接受该断点，正在从头重试。'
             Remove-Item -LiteralPath $partialPath -Force -ErrorAction SilentlyContinue
             continue
@@ -1546,7 +1649,7 @@ try {
     }
     Write-InstallProgress -Percent 10 -Activity '系统与部署资源检测' -Status '完成' -CompleteLine
     if ($CheckOnly) {
-        Write-Progress -Id 5291 -Activity '数据脱敏应用安装进度' -Completed
+        Clear-InstallProgressLine
         Write-Host "`n系统满足最低安装要求；未修改任何 WSL 或 Docker 配置。" -ForegroundColor Green
         return
     }
@@ -1727,7 +1830,7 @@ try {
     }
     if (-not $healthy) { throw '容器已启动，但 Windows 无法访问 http://localhost:5291/api/health/。' }
     Write-InstallProgress -Percent 100 -Activity '应用健康检查' -Status '安装部署完成' -CompleteLine
-    Write-Progress -Id 5291 -Activity '数据脱敏应用安装进度' -Completed
+    Clear-InstallProgressLine
 
     Clear-ResumeAfterRestart
     Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
@@ -1735,6 +1838,7 @@ try {
     Write-Host "安装日志：$logPath"
 }
 catch {
+    Clear-InstallProgressLine
     Write-Host "`n安装失败：$($_.Exception.Message)" -ForegroundColor Red
     if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
         Write-Host "错误位置：$($_.InvocationInfo.PositionMessage)" -ForegroundColor Red
@@ -1747,6 +1851,7 @@ catch {
     throw
 }
 finally {
+    Clear-InstallProgressLine
     if (Get-Variable -Name bootstrapPath -ErrorAction SilentlyContinue) {
         Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
     }
