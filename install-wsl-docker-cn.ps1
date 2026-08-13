@@ -53,6 +53,17 @@ log() {
     printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
 }
 
+progress() {
+    local percent="$1"
+    shift
+    local marker
+    marker="__DA_PROGRESS__|${percent}|$*"
+    printf '%s\n' "$marker"
+    if [[ -n "${DA_PROGRESS_FILE:-}" ]]; then
+        printf '%s\n' "$marker" >"$DA_PROGRESS_FILE"
+    fi
+}
+
 retry() {
     local attempt=1
     local max_attempts=3
@@ -341,12 +352,18 @@ deploy_application() {
         echo "项目目录无效或缺少 docker-compose.yml：${PROJECT_DIR}" >&2
         exit 1
     fi
+    progress 2 "步骤 1/11：启动并检查 Docker Engine"
     start_docker
+    progress 8 "步骤 2/11：检查并生成安全配置"
     write_secure_environment
     log "使用国内镜像构建并启动数据脱敏应用"
     cd "$PROJECT_DIR"
+    progress 15 "步骤 3/11：拉取 MySQL 与 Nginx 基础镜像"
     retry docker compose pull db nginx
-    docker compose build backend frontend
+    progress 30 "步骤 4/11：构建 Django 后端镜像"
+    docker compose build backend
+    progress 48 "步骤 5/11：构建 Vue 前端镜像"
+    docker compose build frontend
 
     compose_diagnostics() {
         local service="$1"
@@ -365,10 +382,13 @@ deploy_application() {
     wait_for_healthy() {
         local service="$1"
         local maximum_attempts="$2"
+        local stage_percent="$3"
+        local stage_label="$4"
         local attempt container_id state health
         for ((attempt = 1; attempt <= maximum_attempts; attempt++)); do
             container_id="$(docker compose ps -aq "$service" | tail -n 1)"
             if [[ -z "$container_id" ]]; then
+                progress "$stage_percent" "${stage_label}（第 ${attempt}/${maximum_attempts} 次：等待容器创建）"
                 sleep 3
                 continue
             fi
@@ -377,6 +397,7 @@ deploy_application() {
             if [[ "$health" == "healthy" ]]; then
                 return 0
             fi
+            progress "$stage_percent" "${stage_label}（第 ${attempt}/${maximum_attempts} 次：容器 ${state:-未知}，健康 ${health:-未知}）"
             if [[ "$state" == "exited" || "$state" == "dead" ]]; then
                 compose_diagnostics "$service"
                 return 1
@@ -388,27 +409,34 @@ deploy_application() {
     }
 
     log "启动 MySQL 与前端容器"
+    progress 62 "步骤 6/11：启动 MySQL 与前端容器"
     docker compose up -d --remove-orphans db frontend
-    if ! wait_for_healthy db 60; then
+    progress 70 "步骤 7/11：等待 MySQL 接受应用账号连接"
+    if ! wait_for_healthy db 60 70 "步骤 7/11：等待 MySQL 接受应用账号连接"; then
         echo "MySQL 容器未能在 180 秒内通过健康检查。" >&2
         exit 1
     fi
 
     log "启动并检查 Django 后端容器"
+    progress 78 "步骤 8/11：启动 Django 后端容器"
     docker compose up -d --no-deps backend
-    if ! wait_for_healthy backend 60; then
+    progress 85 "步骤 9/11：等待数据库迁移与后端健康检查"
+    if ! wait_for_healthy backend 60 85 "步骤 9/11：等待数据库迁移与后端健康检查"; then
         echo "Django 后端容器未能在 180 秒内通过健康检查；诊断信息见上方及安装日志。" >&2
         exit 1
     fi
 
     log "启动 Nginx 入口容器"
+    progress 93 "步骤 10/11：启动 Nginx 入口容器"
     docker compose up -d --no-deps nginx
 
     log "等待应用健康检查"
     local attempt
     for attempt in {1..60}; do
+        progress 97 "步骤 11/11：检查 http://127.0.0.1:5291（第 ${attempt}/60 次）"
         if curl -fsS http://127.0.0.1:5291/api/health/ >/dev/null 2>&1; then
             docker compose ps
+            progress 100 "步骤 11/11：应用健康检查通过"
             printf '\n部署成功：http://localhost:5291\n'
             return
         fi
@@ -582,6 +610,29 @@ function Read-NativeOutputFile([string]$Path) {
     }
 }
 
+function Read-NativeOutputTail([string]$Path, [int]$MaximumBytes = 524288) {
+    if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        $length = [long]$stream.Length
+        $bytesToRead = [int][math]::Min($length, [math]::Max(1, $MaximumBytes))
+        $isTail = $length -gt $bytesToRead
+        if ($isTail) { $null = $stream.Seek(-$bytesToRead, [IO.SeekOrigin]::End) }
+        $bytes = New-Object byte[] $bytesToRead
+        $actual = $stream.Read($bytes, 0, $bytes.Length)
+        if ($actual -le 0) { return '' }
+        if ($actual -lt $bytes.Length) { $bytes = $bytes[0..($actual - 1)] }
+        if ($isTail) {
+            $skip = 0
+            while ($skip -lt [math]::Min(3, $bytes.Length) -and (($bytes[$skip] -band 0xC0) -eq 0x80)) { $skip++ }
+            if ($skip -gt 0 -and $skip -lt $bytes.Length) { $bytes = $bytes[$skip..($bytes.Length - 1)] }
+        }
+        return ConvertFrom-NativeBytes $bytes
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Get-NativePercent([string[]]$Paths) {
     $latestPercent = $null
     foreach ($path in $Paths) {
@@ -598,6 +649,51 @@ function Get-NativePercent([string[]]$Paths) {
         }
     }
     return $latestPercent
+}
+
+function Get-NativeProgressState([string[]]$Paths) {
+    $latestMarkerPercent = $null
+    $latestMarkerStatus = $null
+    $latestOutput = $null
+    $latestPlainPercent = $null
+    foreach ($path in $Paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        try {
+            # Docker build logs can grow to many megabytes. Only inspect the tail on
+            # each refresh; the caller keeps the most recent structured marker.
+            $text = Read-NativeOutputTail $path
+            if ([string]::IsNullOrWhiteSpace($text)) { continue }
+            foreach ($match in [regex]::Matches($text, '(?m)^__DA_PROGRESS__\|(100|[0-9]{1,2})\|([^\r\n]*)')) {
+                $latestMarkerPercent = [int]$match.Groups[1].Value
+                $latestMarkerStatus = $match.Groups[2].Value.Trim()
+            }
+            foreach ($match in [regex]::Matches($text, '(?<!\d)(100|[0-9]{1,2})(?:\.[0-9]+)?\s*%')) {
+                $value = [int][math]::Floor([double]$match.Groups[1].Value)
+                if ($value -ge 0 -and $value -le 100) { $latestPlainPercent = $value }
+            }
+            foreach ($line in @($text -split "`r?`n")) {
+                $clean = [regex]::Replace([string]$line, "$([char]27)\[[0-?]*[ -/]*[@-~]", '')
+                $clean = ($clean -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', '').Trim()
+                if ([string]::IsNullOrWhiteSpace($clean) -or $clean -match '^__DA_PROGRESS__\|') { continue }
+                if ($clean -match '(?i)(PASSWORD|SECRET_KEY|ENCRYPTION_KEY)\s*=') { continue }
+                $latestOutput = $clean
+            }
+        } catch {
+            # 子进程可能正在写入；下一轮重新读取。
+        }
+    }
+    $percent = if ($null -ne $latestMarkerPercent) { $latestMarkerPercent } else { $latestPlainPercent }
+    return [pscustomobject]@{
+        Percent = $percent
+        Status = $latestMarkerStatus
+        LatestOutput = $latestOutput
+        HasMarker = $null -ne $latestMarkerPercent
+    }
+}
+
+function Format-Elapsed([TimeSpan]$Elapsed) {
+    if ($Elapsed.TotalHours -ge 1) { return ('{0:00}:{1:00}:{2:00}' -f [int]$Elapsed.TotalHours, $Elapsed.Minutes, $Elapsed.Seconds) }
+    return ('{0:00}:{1:00}' -f [int]$Elapsed.TotalMinutes, $Elapsed.Seconds)
 }
 
 function Stop-NativeProcessTree([System.Diagnostics.Process]$Process) {
@@ -628,14 +724,18 @@ function Invoke-NativeCommandWithProgress {
         [int]$NoProgressTimeoutSeconds = 0,
         [ValidateRange(0, 3600)]
         [int]$CommandTimeoutSeconds = 0,
+        [string]$ProgressStatePath = '',
         [switch]$SuppressFailureOutput
     )
 
     if ($ProgressEnd -lt $ProgressStart) { throw '进度结束值不能小于起始值。' }
     $stdoutPath = [IO.Path]::GetTempFileName()
     $stderrPath = [IO.Path]::GetTempFileName()
+    if (-not [string]::IsNullOrWhiteSpace($ProgressStatePath)) {
+        Remove-Item -LiteralPath $ProgressStatePath -Force -ErrorAction SilentlyContinue
+    }
     $argumentText = (($ArgumentList | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
-    Write-InstallProgress -Percent $ProgressStart -Activity $Activity -Status '等待安装程序返回进度'
+    Write-InstallProgress -Percent $ProgressStart -Activity $Activity -Status '正在启动子进程（已等待 00:00）'
     $resolvedCommand = Get-Command $FilePath -ErrorAction Stop
     $nativePath = if ($resolvedCommand.Source) { $resolvedCommand.Source } else { $FilePath }
     $redirectedCommand = '{0} {1} 1>{2} 2>{3}' -f `
@@ -657,26 +757,69 @@ function Invoke-NativeCommandWithProgress {
             $lastNativePercent = -1
             $lastProgressAt = [DateTime]::UtcNow
             $startedAt = [DateTime]::UtcNow
+            $lastDisplayAt = [DateTime]::MinValue
+            $lastDisplayText = ''
+            $nativePercent = $null
+            $markerPercent = $null
+            $markerStatus = $null
+            $markerStepKey = ''
+            $stepStartedAt = $startedAt
+            $latestOutput = $null
             $timedOut = $false
             $timeoutStatus = ''
             while (-not $process.WaitForExit(250)) {
-                $nativePercent = Get-NativePercent @($stdoutPath, $stderrPath)
-                if ($null -ne $nativePercent) {
-                    if ($nativePercent -gt $lastNativePercent) {
-                        $lastNativePercent = $nativePercent
-                        $lastProgressAt = [DateTime]::UtcNow
+                $now = [DateTime]::UtcNow
+                if (($now - $lastDisplayAt).TotalSeconds -ge 1) {
+                    $progressPaths = @($stdoutPath, $stderrPath)
+                    if (-not [string]::IsNullOrWhiteSpace($ProgressStatePath)) { $progressPaths += $ProgressStatePath }
+                    $nativeState = Get-NativeProgressState $progressPaths
+                    if ($nativeState.HasMarker) {
+                        $markerPercent = $nativeState.Percent
+                        $markerStatus = $nativeState.Status
+                        $newStepKey = if ($markerStatus -match '^(步骤\s+\d+/\d+)') { $Matches[1] } else { $markerStatus }
+                        if ($newStepKey -ne $markerStepKey) {
+                            $markerStepKey = $newStepKey
+                            $stepStartedAt = $now
+                        }
                     }
+                    if (-not [string]::IsNullOrWhiteSpace($nativeState.LatestOutput)) {
+                        $latestOutput = $nativeState.LatestOutput
+                    }
+                    $nativePercent = if ($null -ne $markerPercent) { $markerPercent } else { $nativeState.Percent }
+                    if ($null -ne $nativePercent -and $nativePercent -gt $lastNativePercent) {
+                        $lastNativePercent = $nativePercent
+                        $lastProgressAt = $now
+                    }
+                }
+                if ($null -ne $nativePercent) {
                     $overallPercent = $ProgressStart + [math]::Floor(
                         ($ProgressEnd - $ProgressStart) * $nativePercent / 100
                     )
-                    if ($overallPercent -ne $lastShown) {
-                        Write-InstallProgress -Percent $overallPercent -Activity $Activity `
-                            -Status ("当前阶段 {0}%" -f $nativePercent)
+                } else {
+                    $overallPercent = $ProgressStart
+                }
+                if (($now - $lastDisplayAt).TotalSeconds -ge 1) {
+                    $elapsedText = Format-Elapsed ($now - $startedAt)
+                    $stepElapsedText = Format-Elapsed ($now - $stepStartedAt)
+                    if (-not [string]::IsNullOrWhiteSpace($markerStatus)) {
+                        $statusText = "$markerStatus；本步骤 $stepElapsedText；总计 $elapsedText"
+                    } elseif ($null -ne $nativePercent) {
+                        $statusText = "当前阶段 $nativePercent%；已等待 $elapsedText"
+                    } else {
+                        $statusText = "子进程正在运行；已等待 $elapsedText"
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($latestOutput) -and $latestOutput -ne $markerStatus) {
+                        $statusText += "；最近：$latestOutput"
+                    }
+                    if ($statusText -ne $lastDisplayText -or $overallPercent -ne $lastShown) {
+                        Write-InstallProgress -Percent $overallPercent -Activity $Activity -Status $statusText
+                        $lastDisplayText = $statusText
                         $lastShown = $overallPercent
                     }
+                    $lastDisplayAt = $now
                 }
                 if ($CommandTimeoutSeconds -gt 0 -and
-                    ([DateTime]::UtcNow - $startedAt).TotalSeconds -ge $CommandTimeoutSeconds) {
+                    ($now - $startedAt).TotalSeconds -ge $CommandTimeoutSeconds) {
                     $timedOut = $true
                     $timeoutStatus = "超过 $CommandTimeoutSeconds 秒无响应，已停止"
                     Write-InstallProgress -Percent $ProgressStart -Activity $Activity -Status $timeoutStatus
@@ -684,7 +827,7 @@ function Invoke-NativeCommandWithProgress {
                     break
                 }
                 if ($NoProgressTimeoutSeconds -gt 0 -and $lastNativePercent -lt 100 -and
-                    ([DateTime]::UtcNow - $lastProgressAt).TotalSeconds -ge $NoProgressTimeoutSeconds) {
+                    ($now - $lastProgressAt).TotalSeconds -ge $NoProgressTimeoutSeconds) {
                     $timedOut = $true
                     $timeoutStatus = "连续 $NoProgressTimeoutSeconds 秒无真实下载进展，正在切换通道"
                     Write-InstallProgress -Percent $ProgressStart -Activity $Activity `
@@ -709,7 +852,8 @@ function Invoke-NativeCommandWithProgress {
                 -Activity $Activity -Status $resultStatus -CompleteLine
             if ($exitCode -ne 0 -and -not $SuppressFailureOutput) {
                 Clear-InstallProgressLine
-                $capturedOutput | Select-Object -Last 120 | ForEach-Object { Write-Host ([string]$_) }
+                $capturedOutput | Where-Object { $_ -notmatch '^__DA_PROGRESS__\|' } |
+                    Select-Object -Last 120 | ForEach-Object { Write-Host ([string]$_) }
             }
             return [pscustomobject]@{
                 Output = $capturedOutput
@@ -724,6 +868,9 @@ function Invoke-NativeCommandWithProgress {
     } finally {
         if ($process) { $process.Dispose() }
         Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($ProgressStatePath)) {
+            Remove-Item -LiteralPath $ProgressStatePath -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -742,13 +889,15 @@ function Invoke-NativeCommand {
         [ValidateRange(0, 3600)]
         [int]$NoProgressTimeoutSeconds = 0,
         [ValidateRange(0, 3600)]
-        [int]$CommandTimeoutSeconds = 0
+        [int]$CommandTimeoutSeconds = 0,
+        [string]$ProgressStatePath = ''
     )
 
     if ($DisplayOutput) {
         return Invoke-NativeCommandWithProgress -FilePath $FilePath -ArgumentList $ArgumentList `
             -Activity $Activity -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd `
             -NoProgressTimeoutSeconds $NoProgressTimeoutSeconds -CommandTimeoutSeconds $CommandTimeoutSeconds `
+            -ProgressStatePath $ProgressStatePath `
             -SuppressFailureOutput:$IgnoreStandardError
     }
 
@@ -1783,6 +1932,9 @@ try {
     $bootstrapPath = Join-Path $runtimeDirectory 'wsl-bootstrap.sh'
     Write-WslBootstrap $bootstrapPath
     $linuxInstaller = ConvertTo-WslPath -Distribution $DistroName -WindowsPath $bootstrapPath
+    $deployProgressPath = Join-Path $runtimeDirectory 'wsl-deploy-progress.txt'
+    $linuxDeployProgressPath = ConvertTo-WslPath -Distribution $DistroName -WindowsPath $runtimeDirectory
+    $linuxDeployProgressPath = "$linuxDeployProgressPath/wsl-deploy-progress.txt"
 
     Write-Step '在 WSL 中配置国内镜像并安装 Docker Engine'
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
@@ -1804,8 +1956,9 @@ try {
 
     Write-Step '生成安全配置、构建容器并启动应用'
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'env', "APP_ALLOWED_HOSTS=$allowedHosts", 'bash', $linuxInstaller, 'deploy', $linuxProject) `
-        -DisplayOutput -Activity '构建容器并部署应用' -ProgressStart 80 -ProgressEnd 95
+        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'env', "APP_ALLOWED_HOSTS=$allowedHosts", "DA_PROGRESS_FILE=$linuxDeployProgressPath", 'bash', $linuxInstaller, 'deploy', $linuxProject) `
+        -DisplayOutput -Activity '构建容器并部署应用' -ProgressStart 80 -ProgressEnd 95 `
+        -ProgressStatePath $deployProgressPath
     if ($wslResult.ExitCode -ne 0) { throw 'Docker 容器部署失败。' }
 
     $envPath = Join-Path $resolvedProject '.env'
