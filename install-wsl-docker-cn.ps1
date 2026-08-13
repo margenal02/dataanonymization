@@ -3,6 +3,10 @@
 param(
     [string]$DistroName = 'Ubuntu-24.04',
     [string]$ProjectPath = $PSScriptRoot,
+    [ValidateSet('Auto', 'Store', 'Web')]
+    [string]$WslDownloadChannel = 'Auto',
+    [ValidateRange(5, 60)]
+    [int]$ProgressIntervalSeconds = 10,
     [switch]$CheckOnly,
     [switch]$AutoReboot,
     [switch]$ResumeAfterRestart
@@ -403,14 +407,82 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function ConvertTo-NativeArgument([AllowEmptyString()][string]$Value) {
+    if ($null -eq $Value -or $Value.Length -eq 0) { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
+function Invoke-NativeCommandWithProgress {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [string]$Activity = '正在执行',
+        [ValidateRange(5, 60)]
+        [int]$HeartbeatSeconds = 10,
+        [string]$SlowHint = ''
+    )
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = (($ArgumentList | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    # 不重定向 WSL 输出：让它直接绘制自带的百分比/下载进度。
+    $startInfo.RedirectStandardOutput = $false
+    $startInfo.RedirectStandardError = $false
+
+    Write-Host ("[{0}] {1}；下面会显示 WSL 原生进度。" -f (Get-Date -Format 'HH:mm:ss'), $Activity) -ForegroundColor Cyan
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw "无法启动：$FilePath" }
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $slowHintShown = $false
+    $cancelled = $false
+    try {
+        try {
+            while (-not $process.WaitForExit($HeartbeatSeconds * 1000)) {
+                Write-Host ("[{0}] {1}仍在进行，已用时 {2:mm\:ss}；请勿关闭窗口。" -f `
+                    (Get-Date -Format 'HH:mm:ss'), $Activity, $stopwatch.Elapsed) -ForegroundColor DarkCyan
+                if (-not $slowHintShown -and -not [string]::IsNullOrWhiteSpace($SlowHint) `
+                    -and $stopwatch.Elapsed.TotalSeconds -ge 180) {
+                    Write-Warning $SlowHint
+                    $slowHintShown = $true
+                }
+            }
+            $process.WaitForExit()
+            return [pscustomobject]@{ Output = @(); ExitCode = $process.ExitCode }
+        } catch [System.Management.Automation.PipelineStoppedException] {
+            $cancelled = $true
+            throw
+        }
+    } finally {
+        if ($cancelled -and -not $process.HasExited) {
+            try { $process.Kill() } catch { }
+        }
+        $stopwatch.Stop()
+        $process.Dispose()
+    }
+}
+
 function Invoke-NativeCommand {
     param(
         [Parameter(Mandatory = $true)]
         [string]$FilePath,
         [string[]]$ArgumentList = @(),
         [switch]$IgnoreStandardError,
-        [switch]$DisplayOutput
+        [switch]$DisplayOutput,
+        [string]$Activity = '正在执行',
+        [string]$SlowHint = ''
     )
+
+    if ($DisplayOutput) {
+        return Invoke-NativeCommandWithProgress -FilePath $FilePath -ArgumentList $ArgumentList `
+            -Activity $Activity -HeartbeatSeconds $ProgressIntervalSeconds -SlowHint $SlowHint
+    }
 
     $savedErrorActionPreference = $ErrorActionPreference
     try {
@@ -419,12 +491,6 @@ function Invoke-NativeCommand {
         $ErrorActionPreference = 'Continue'
         if ($IgnoreStandardError) {
             $output = @(& $FilePath @ArgumentList 2>$null)
-        } elseif ($DisplayOutput) {
-            # 合并输出流后逐行显示，长时间的更新/安装过程不会看起来像“卡住”。
-            $output = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object {
-                Write-Host ([string]$_)
-                $_
-            })
         } else {
             $output = @(& $FilePath @ArgumentList)
         }
@@ -525,7 +591,7 @@ function Confirm-Installation {
 }
 
 function Start-ElevatedCopy {
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`""
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel -ProgressIntervalSeconds $ProgressIntervalSeconds"
     if ($CheckOnly) { $arguments += ' -CheckOnly' }
     if ($AutoReboot) { $arguments += ' -AutoReboot' }
     if ($ResumeAfterRestart) { $arguments += ' -ResumeAfterRestart' }
@@ -534,7 +600,7 @@ function Start-ElevatedCopy {
 }
 
 function Set-ResumeAfterRestart {
-    $command = "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -ResumeAfterRestart"
+    $command = "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel -ProgressIntervalSeconds $ProgressIntervalSeconds -ResumeAfterRestart"
     if ($AutoReboot) { $command += ' -AutoReboot' }
     New-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' `
         -Name $ResumeName -Value $command -PropertyType String -Force | Out-Null
@@ -719,10 +785,22 @@ try {
 
     Write-Step "安装并初始化 $DistroName（WSL2）"
     if (-not $wslRuntimeVersion -or $wslRuntimeVersion -lt $MinimumWslVersion) {
-        Write-Host "WSL 未安装或低于 $MinimumWslVersion，开始安装/更新……" -ForegroundColor Yellow
-        $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--update') -DisplayOutput
+        Write-Host "WSL 未安装或低于 $MinimumWslVersion，开始安装/更新。" -ForegroundColor Yellow
+        $updateArguments = if ($WslDownloadChannel -eq 'Web') { @('--update', '--web-download') } else { @('--update') }
+        $channelName = if ($WslDownloadChannel -eq 'Web') { 'GitHub 官方 Web 通道' } else { 'Microsoft Store 官方通道' }
+        $slowHint = if ($WslDownloadChannel -eq 'Auto') {
+            '若百分比一直停在 0%，可按 Ctrl+C 停止后重新运行：.\install-wsl-docker-cn.ps1 -WslDownloadChannel Web'
+        } else { '' }
+        $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList $updateArguments `
+            -DisplayOutput -Activity "通过 $channelName 更新 WSL" -SlowHint $slowHint
+        if ($wslResult.ExitCode -ne 0 -and $WslDownloadChannel -eq 'Auto') {
+            Write-Warning 'Microsoft Store 通道更新失败，自动切换到 GitHub 官方 Web 下载通道。'
+            $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
+                -ArgumentList @('--update', '--web-download') -DisplayOutput `
+                -Activity '通过 GitHub 官方 Web 通道更新 WSL'
+        }
         if ($wslResult.ExitCode -ne 0) {
-            throw 'WSL 运行时安装/更新失败。请检查 Microsoft WSL 服务连接后重试。'
+            throw 'WSL 运行时安装/更新失败。可重试，或使用 -WslDownloadChannel Web 切换到 GitHub 官方通道。'
         }
         $wslRuntimeVersion = Get-WslRuntimeVersion
         if (-not $wslRuntimeVersion -or $wslRuntimeVersion -lt $MinimumWslVersion) {
@@ -731,18 +809,27 @@ try {
     } else {
         Write-Host "WSL $wslRuntimeVersion 已满足要求，跳过重复安装/更新。" -ForegroundColor Green
     }
-    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-default-version', '2') -DisplayOutput
+    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-default-version', '2') `
+        -DisplayOutput -Activity '设置默认 WSL 版本为 2'
     if ($wslResult.ExitCode -ne 0) { throw '无法把 WSL 默认版本设为 2。请先完成 Windows Update。' }
 
     if ($DistroName -notin $installedDistros) {
+        $installArguments = @('--install', '--distribution', $DistroName, '--no-launch')
+        $installChannelName = 'Microsoft Store 官方通道'
+        if ($WslDownloadChannel -eq 'Web') {
+            $installArguments = @('--install', '--web-download', '--distribution', $DistroName, '--no-launch')
+            $installChannelName = 'GitHub 官方 Web 通道'
+        }
         $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-            -ArgumentList @('--install', '--distribution', $DistroName, '--no-launch') -DisplayOutput
-        if ($wslResult.ExitCode -ne 0) {
+            -ArgumentList $installArguments -DisplayOutput -Activity "通过 $installChannelName 安装 $DistroName" `
+            -SlowHint $slowHint
+        if ($wslResult.ExitCode -ne 0 -and $WslDownloadChannel -eq 'Auto') {
             Write-Warning '常规 WSL 下载失败，改用 Microsoft Web Download 通道重试。'
             $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-                -ArgumentList @('--install', '--web-download', '--distribution', $DistroName, '--no-launch') -DisplayOutput
-            if ($wslResult.ExitCode -ne 0) { throw "$DistroName 安装失败。" }
+                -ArgumentList @('--install', '--web-download', '--distribution', $DistroName, '--no-launch') `
+                -DisplayOutput -Activity "通过 GitHub 官方 Web 通道安装 $DistroName"
         }
+        if ($wslResult.ExitCode -ne 0) { throw "$DistroName 安装失败。可改用 -WslDownloadChannel Web 或 Store 后重试。" }
         $installedDistros = Get-InstalledWslDistros
         if ($DistroName -notin $installedDistros) { throw "$DistroName 安装后未出现在 WSL 发行版列表中。" }
     } else {
@@ -751,13 +838,15 @@ try {
 
     $distroGeneration = Get-WslDistroGeneration $DistroName
     if ($distroGeneration -ne 2) {
-        $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-version', $DistroName, '2') -DisplayOutput
+        $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-version', $DistroName, '2') `
+            -DisplayOutput -Activity "将 $DistroName 转换为 WSL2"
         if ($wslResult.ExitCode -ne 0) { throw "无法把 $DistroName 转换为 WSL2。" }
     } else {
         Write-Host "$DistroName 已是 WSL2，跳过版本转换。" -ForegroundColor Green
     }
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'bash', '-lc', 'true') -DisplayOutput
+        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'bash', '-lc', 'true') `
+        -DisplayOutput -Activity "初始化 $DistroName"
     if ($wslResult.ExitCode -ne 0) { throw "$DistroName 初始化失败。" }
 
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
@@ -775,11 +864,13 @@ try {
 
     Write-Step '在 WSL 中配置国内镜像并安装 Docker Engine'
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'bash', $linuxInstaller, 'prepare', $linuxProject) -DisplayOutput
+        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'bash', $linuxInstaller, 'prepare', $linuxProject) `
+        -DisplayOutput -Activity '配置大陆镜像并安装 Docker'
     if ($wslResult.ExitCode -ne 0) { throw 'WSL 内的 Docker 安装或镜像配置失败。' }
 
     Write-Step '重启 WSL，使 systemd 与 Docker 服务生效'
-    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--shutdown') -DisplayOutput
+    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--shutdown') `
+        -DisplayOutput -Activity '关闭 WSL 以应用 systemd 配置'
     if ($wslResult.ExitCode -ne 0) { throw 'WSL 重启失败。' }
     Start-Sleep -Seconds 3
 
@@ -791,7 +882,8 @@ try {
 
     Write-Step '生成安全配置、构建容器并启动应用'
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'env', "APP_ALLOWED_HOSTS=$allowedHosts", 'bash', $linuxInstaller, 'deploy', $linuxProject) -DisplayOutput
+        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'env', "APP_ALLOWED_HOSTS=$allowedHosts", 'bash', $linuxInstaller, 'deploy', $linuxProject) `
+        -DisplayOutput -Activity '构建容器并部署应用'
     if ($wslResult.ExitCode -ne 0) { throw 'Docker 容器部署失败。' }
 
     $envPath = Join-Path $resolvedProject '.env'
