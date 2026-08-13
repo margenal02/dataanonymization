@@ -325,11 +325,12 @@ function Start-ElevatedCopy {
     $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`""
     if ($CheckOnly) { $arguments += ' -CheckOnly' }
     if ($AutoReboot) { $arguments += ' -AutoReboot' }
-    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $arguments
+    # 保留自动提权后的窗口，让用户能够看到检测结果或错误信息。
+    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList "-NoExit $arguments"
 }
 
 function Set-ResumeAfterRestart {
-    $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`""
+    $command = "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`""
     if ($AutoReboot) { $command += ' -AutoReboot' }
     New-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' `
         -Name $ResumeName -Value $command -PropertyType String -Force | Out-Null
@@ -349,13 +350,13 @@ function Stop-ForRestart {
     } else {
         Write-Host '请保存工作并手动重启 Windows；下次登录时脚本会自动续跑。' -ForegroundColor Yellow
     }
-    exit 3010
+    return
 }
 
 if (-not (Test-Administrator)) {
     Write-Host '正在请求管理员权限……' -ForegroundColor Yellow
     Start-ElevatedCopy
-    exit 0
+    return
 }
 
 $resolvedProject = [IO.Path]::GetFullPath($ProjectPath)
@@ -442,7 +443,7 @@ try {
     }
     if ($CheckOnly) {
         Write-Host "`n系统满足最低安装要求；未修改任何 WSL 或 Docker 配置。" -ForegroundColor Green
-        exit 0
+        return
     }
 
     Write-Step '启用 WSL2 所需的 Windows 功能'
@@ -457,6 +458,7 @@ try {
     }
     if ($wslFeature.State -ne 'Enabled' -or $vmFeature.State -ne 'Enabled' -or $restartNeeded) {
         Stop-ForRestart
+        return
     }
 
     Write-Step "安装并初始化 $DistroName（WSL2）"
@@ -547,7 +549,8 @@ catch {
         Write-Host "调用栈：$($_.ScriptStackTrace)" -ForegroundColor DarkRed
     }
     Write-Host "日志位置：$logPath" -ForegroundColor Yellow
-    exit 1
+    # 抛回调用者而不是退出整个 PowerShell 主机，避免窗口直接关闭。
+    throw
 }
 finally {
     if (Get-Variable -Name bootstrapPath -ErrorAction SilentlyContinue) {
