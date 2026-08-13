@@ -35,7 +35,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 如只做检测，可为同一脚本添加 `-CheckOnly`。完整流程、支持版本、国内镜像配置、重启续跑和故障排查参见 [Windows + WSL2 + Docker 中国大陆一键安装说明](docs/WSL_DOCKER_CN_INSTALL.md)。
 
-WSL 本身只使用 Microsoft Store/GitHub 官方通道；`Auto` 会快速检测并优先选择可访问的官方通道，首选通道连续 60 秒无真实进展时自动切换。安装窗口显示 `[进度条] 百分比 当前阶段`；没有返回真实百分比时停留在当前阶段起点，不使用时间伪造进度。Ubuntu、Docker、PyPI、npm 和应用容器继续使用大陆镜像。
+WSL 本身只使用 Microsoft Store/GitHub 官方通道；`Auto` 会快速检测并优先选择可访问的官方通道，首选通道连续 60 秒无真实进展时自动切换。现有 WSL、发行版和 Docker 检测也有 12～20 秒超时保护，并显示正在检测的具体项目。安装窗口显示 `[进度条] 百分比 当前阶段`；没有返回真实百分比时停留在当前阶段起点，不使用时间伪造进度。Ubuntu、Docker、PyPI、npm 和应用容器继续使用大陆镜像。
 
 安装完成后访问 [http://localhost:5291](http://localhost:5291)。日常运维统一进入 WSL2：
 

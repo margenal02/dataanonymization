@@ -487,7 +487,9 @@ function Invoke-NativeCommandWithProgress {
         [ValidateRange(0, 100)]
         [int]$ProgressEnd = 100,
         [ValidateRange(0, 3600)]
-        [int]$NoProgressTimeoutSeconds = 0
+        [int]$NoProgressTimeoutSeconds = 0,
+        [ValidateRange(0, 3600)]
+        [int]$CommandTimeoutSeconds = 0
     )
 
     if ($ProgressEnd -lt $ProgressStart) { throw '进度结束值不能小于起始值。' }
@@ -515,7 +517,9 @@ function Invoke-NativeCommandWithProgress {
             $lastShown = -1
             $lastNativePercent = -1
             $lastProgressAt = [DateTime]::UtcNow
+            $startedAt = [DateTime]::UtcNow
             $timedOut = $false
+            $timeoutStatus = ''
             while (-not $process.WaitForExit(250)) {
                 $nativePercent = Get-NativePercent @($stdoutPath, $stderrPath)
                 if ($null -ne $nativePercent) {
@@ -532,11 +536,20 @@ function Invoke-NativeCommandWithProgress {
                         $lastShown = $overallPercent
                     }
                 }
+                if ($CommandTimeoutSeconds -gt 0 -and
+                    ([DateTime]::UtcNow - $startedAt).TotalSeconds -ge $CommandTimeoutSeconds) {
+                    $timedOut = $true
+                    $timeoutStatus = "超过 $CommandTimeoutSeconds 秒无响应，已停止"
+                    Write-InstallProgress -Percent $ProgressStart -Activity $Activity -Status $timeoutStatus
+                    Stop-NativeProcessTree $process
+                    break
+                }
                 if ($NoProgressTimeoutSeconds -gt 0 -and $lastNativePercent -lt 100 -and
                     ([DateTime]::UtcNow - $lastProgressAt).TotalSeconds -ge $NoProgressTimeoutSeconds) {
                     $timedOut = $true
+                    $timeoutStatus = "连续 $NoProgressTimeoutSeconds 秒无真实下载进展，正在切换通道"
                     Write-InstallProgress -Percent $ProgressStart -Activity $Activity `
-                        -Status ("连续 {0} 秒无真实下载进展，正在切换通道" -f $NoProgressTimeoutSeconds)
+                        -Status $timeoutStatus
                     Stop-NativeProcessTree $process
                     break
                 }
@@ -549,13 +562,18 @@ function Invoke-NativeCommandWithProgress {
                     $capturedOutput += @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
                 }
             }
-            $resultStatus = if ($timedOut) { '无进展，已停止' } elseif ($exitCode -eq 0) { '完成' } else { '失败' }
+            $resultStatus = if ($timedOut) { $timeoutStatus } elseif ($exitCode -eq 0) { '完成' } else { '失败' }
             Write-InstallProgress -Percent $(if ($exitCode -eq 0) { $ProgressEnd } else { $ProgressStart }) `
                 -Activity $Activity -Status $resultStatus -CompleteLine
             if ($exitCode -ne 0) {
                 $capturedOutput | Select-Object -Last 30 | ForEach-Object { Write-Host ([string]$_) }
             }
-            return [pscustomobject]@{ Output = $capturedOutput; ExitCode = $exitCode; TimedOut = $timedOut }
+            return [pscustomobject]@{
+                Output = $capturedOutput
+                ExitCode = $exitCode
+                TimedOut = $timedOut
+                TimeoutStatus = $timeoutStatus
+            }
         } catch [System.Management.Automation.PipelineStoppedException] {
             Stop-NativeProcessTree $process
             throw
@@ -579,13 +597,15 @@ function Invoke-NativeCommand {
         [ValidateRange(0, 100)]
         [int]$ProgressEnd = 100,
         [ValidateRange(0, 3600)]
-        [int]$NoProgressTimeoutSeconds = 0
+        [int]$NoProgressTimeoutSeconds = 0,
+        [ValidateRange(0, 3600)]
+        [int]$CommandTimeoutSeconds = 0
     )
 
     if ($DisplayOutput) {
         return Invoke-NativeCommandWithProgress -FilePath $FilePath -ArgumentList $ArgumentList `
             -Activity $Activity -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd `
-            -NoProgressTimeoutSeconds $NoProgressTimeoutSeconds
+            -NoProgressTimeoutSeconds $NoProgressTimeoutSeconds -CommandTimeoutSeconds $CommandTimeoutSeconds
     }
 
     $savedErrorActionPreference = $ErrorActionPreference
@@ -609,9 +629,15 @@ function Invoke-NativeCommand {
     }
 }
 
-function Get-WslRuntimeVersion {
+function Get-WslRuntimeVersion([switch]$ShowDetectionProgress) {
     if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $null }
-    $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--version') -IgnoreStandardError
+    if ($ShowDetectionProgress) {
+        $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--version') -IgnoreStandardError `
+            -DisplayOutput -Activity '检测 WSL 运行时版本' -ProgressStart 10 -ProgressEnd 13 `
+            -CommandTimeoutSeconds 12
+    } else {
+        $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--version') -IgnoreStandardError
+    }
     if ($result.ExitCode -ne 0) { return $null }
     foreach ($line in $result.Output) {
         $cleanLine = [string]($line -replace "`0", '')
@@ -622,28 +648,44 @@ function Get-WslRuntimeVersion {
     return $null
 }
 
-function Get-InstalledWslDistros {
+function Get-InstalledWslDistros([switch]$ShowDetectionProgress) {
     if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return @() }
-    $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--list', '--quiet') -IgnoreStandardError
+    if ($ShowDetectionProgress) {
+        $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--list', '--quiet') -IgnoreStandardError `
+            -DisplayOutput -Activity '检测已安装的 WSL 发行版' -ProgressStart 13 -ProgressEnd 16 `
+            -CommandTimeoutSeconds 12
+    } else {
+        $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--list', '--quiet') -IgnoreStandardError
+    }
     if ($result.ExitCode -ne 0) { return @() }
     return @($result.Output | ForEach-Object {
         ([string]($_ -replace "`0", '')).Trim().TrimStart('*').Trim()
     } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
 
-function Get-WslDistroGeneration([string]$Name) {
+function Get-WslDistroGeneration([string]$Name, [switch]$ShowDetectionProgress) {
     $lxssPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
     if (Test-Path $lxssPath) {
         foreach ($key in @(Get-ChildItem -Path $lxssPath -ErrorAction SilentlyContinue)) {
             $properties = Get-ItemProperty -Path $key.PSPath -ErrorAction SilentlyContinue
             if ($properties.DistributionName -eq $Name -and [int]$properties.Version -in @(1, 2)) {
+                if ($ShowDetectionProgress) {
+                    Write-InstallProgress -Percent 18 -Activity "检测 $Name 的 WSL 版本" `
+                        -Status '从系统注册信息读取完成' -CompleteLine
+                }
                 return [int]$properties.Version
             }
         }
     }
 
     $escapedName = [regex]::Escape($Name)
-    $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--list', '--verbose') -IgnoreStandardError
+    if ($ShowDetectionProgress) {
+        $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--list', '--verbose') -IgnoreStandardError `
+            -DisplayOutput -Activity "检测 $Name 的 WSL 版本" -ProgressStart 16 -ProgressEnd 18 `
+            -CommandTimeoutSeconds 12
+    } else {
+        $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--list', '--verbose') -IgnoreStandardError
+    }
     foreach ($line in $result.Output) {
         $cleanLine = [string]($line -replace "`0", '')
         if ($cleanLine -match "^\s*\*?\s*$escapedName\s+\S+\s+([12])\s*$") {
@@ -653,13 +695,20 @@ function Get-WslDistroGeneration([string]$Name) {
     return $null
 }
 
-function Get-WslDockerVersions([string]$Name, [int]$Generation) {
+function Get-WslDockerVersions([string]$Name, [int]$Generation, [switch]$ShowDetectionProgress) {
     $state = [ordered]@{ Docker = $null; Compose = $null }
     if ($Generation -ne 2) { return [pscustomobject]$state }
     $command = 'docker_version=$(docker --version 2>/dev/null | sed -nE "s/.*version ([0-9]+(\.[0-9]+){1,3}).*/\1/p"); compose_version=$(docker compose version --short 2>/dev/null | sed -nE "s/^v?([0-9]+(\.[0-9]+){1,3}).*/\1/p"); printf "%s|%s\n" "$docker_version" "$compose_version"'
-    $result = Invoke-NativeCommand -FilePath 'wsl.exe' `
-        -ArgumentList @('--distribution', $Name, '--user', 'root', '--', 'bash', '-lc', $command) `
-        -IgnoreStandardError
+    if ($ShowDetectionProgress) {
+        $result = Invoke-NativeCommand -FilePath 'wsl.exe' `
+            -ArgumentList @('--distribution', $Name, '--user', 'root', '--', 'bash', '-lc', $command) `
+            -IgnoreStandardError -DisplayOutput -Activity '检测 Docker 与 Compose 版本' `
+            -ProgressStart 18 -ProgressEnd 20 -CommandTimeoutSeconds 20
+    } else {
+        $result = Invoke-NativeCommand -FilePath 'wsl.exe' `
+            -ArgumentList @('--distribution', $Name, '--user', 'root', '--', 'bash', '-lc', $command) `
+            -IgnoreStandardError
+    }
     foreach ($line in $result.Output) {
         $cleanLine = ([string]($line -replace "`0", '')).Trim()
         if ($cleanLine -match '^([^|]*)\|([^|]*)$') {
@@ -897,13 +946,21 @@ try {
     }
 
     Write-Step '检测主机现有的 WSL、Ubuntu 与 Docker'
-    $wslRuntimeVersion = Get-WslRuntimeVersion
-    $installedDistros = Get-InstalledWslDistros
+    $wslRuntimeVersion = Get-WslRuntimeVersion -ShowDetectionProgress
+    $installedDistros = Get-InstalledWslDistros -ShowDetectionProgress
     $distroInstalled = $DistroName -in $installedDistros
-    $distroGeneration = if ($distroInstalled) { Get-WslDistroGeneration $DistroName } else { $null }
-    $wslDocker = if ($distroInstalled) {
-        Get-WslDockerVersions $DistroName $distroGeneration
+    $distroGeneration = if ($distroInstalled) {
+        Get-WslDistroGeneration $DistroName -ShowDetectionProgress
     } else {
+        Write-InstallProgress -Percent 18 -Activity "检测 $DistroName 的 WSL 版本" `
+            -Status '发行版未安装，已跳过' -CompleteLine
+        $null
+    }
+    $wslDocker = if ($distroInstalled) {
+        Get-WslDockerVersions $DistroName $distroGeneration -ShowDetectionProgress
+    } else {
+        Write-InstallProgress -Percent 20 -Activity '检测 Docker 与 Compose 版本' `
+            -Status '发行版未安装，已跳过' -CompleteLine
         [pscustomobject]@{ Docker = $null; Compose = $null }
     }
     $dockerInRange = Test-VersionInRange $wslDocker.Docker ([version]$MinimumDockerVersion) ([version]$MaximumDockerVersion)
