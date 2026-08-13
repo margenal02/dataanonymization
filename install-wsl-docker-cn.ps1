@@ -13,7 +13,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
+$ProgressPreference = 'Continue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $utf8NoBom = New-Object Text.UTF8Encoding($false)
 [Console]::InputEncoding = $utf8NoBom
@@ -429,15 +429,14 @@ function Write-InstallProgress {
         [switch]$CompleteLine
     )
 
-    $barWidth = 30
-    $filled = [math]::Floor($Percent * $barWidth / 100)
-    $empty = $barWidth - $filled
-    $bar = ('#' * $filled) + ('-' * $empty)
     $detail = if ([string]::IsNullOrWhiteSpace($Status)) { $Activity } else { "$Activity - $Status" }
-    $line = ("[{0}] {1,3}%  {2}" -f $bar, $Percent, $detail).PadRight(110)
     Write-Progress -Id 5291 -Activity '数据脱敏应用安装进度' -Status $detail -PercentComplete $Percent
-    Write-Host ("`r$line") -NoNewline -ForegroundColor Cyan
-    if ($CompleteLine) { Write-Host }
+    if ($CompleteLine) {
+        # Write-Progress owns one reusable console region. Complete it before writing
+        # the final result so high-frequency download updates never become log lines.
+        Write-Progress -Id 5291 -Activity '数据脱敏应用安装进度' -Completed
+        Write-Host ("[{0,3}%] {1}" -f $Percent, $detail) -ForegroundColor Cyan
+    }
 }
 
 function ConvertFrom-NativeBytes([byte[]]$Bytes) {
@@ -671,6 +670,48 @@ function Invoke-NativeCommand {
         Output = $output
         ExitCode = $exitCode
     }
+}
+
+function Get-LastNonEmptyNativeOutput($Result) {
+    if ($null -eq $Result -or $null -eq $Result.Output) { return $null }
+    $lastLine = @($Result.Output | ForEach-Object {
+        ([string]($_ -replace "`0", '')).Trim()
+    } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
+    if ($lastLine.Count -eq 0) { return $null }
+    return [string]$lastLine[0]
+}
+
+function ConvertTo-WslPath([string]$Distribution, [string]$WindowsPath) {
+    $result = Invoke-NativeCommand -FilePath 'wsl.exe' `
+        -ArgumentList @('--distribution', $Distribution, '--user', 'root', '--', 'wslpath', '-a', '-u', $WindowsPath) `
+        -IgnoreStandardError
+    $convertedPath = Get-LastNonEmptyNativeOutput $result
+    if ($result.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($convertedPath)) {
+        return $convertedPath
+    }
+
+    # A newly installed WSL distribution can occasionally return exit code 0 but
+    # no captured wslpath output. Fall back only for a normal local drive path,
+    # then ask the target distribution to verify the resulting mount path.
+    if ($WindowsPath -match '^([A-Za-z]):[\\/]*(.*)$') {
+        $drive = $Matches[1].ToLowerInvariant()
+        $relativePath = $Matches[2] -replace '\\', '/'
+        $fallbackPath = if ([string]::IsNullOrWhiteSpace($relativePath)) {
+            "/mnt/$drive"
+        } else {
+            "/mnt/$drive/$relativePath"
+        }
+        $validation = Invoke-NativeCommand -FilePath 'wsl.exe' `
+            -ArgumentList @('--distribution', $Distribution, '--user', 'root', '--', 'test', '-e', $fallbackPath) `
+            -IgnoreStandardError
+        if ($validation.ExitCode -eq 0) {
+            Write-Warning "wslpath 未返回结果，已验证并使用标准 WSL 挂载路径：$fallbackPath"
+            return $fallbackPath
+        }
+    }
+
+    $exitDescription = if ($null -eq $result) { '无执行结果' } else { "退出码 $($result.ExitCode)" }
+    throw "无法把 Windows 路径转换为 WSL 路径（$exitDescription）：$WindowsPath"
 }
 
 function Get-WslRuntimeVersion(
@@ -1635,18 +1676,10 @@ try {
         -DisplayOutput -Activity "初始化 $DistroName" -ProgressStart 62 -ProgressEnd 65
     if ($wslResult.ExitCode -ne 0) { throw "$DistroName 初始化失败。" }
 
-    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'wslpath', '-a', $resolvedProject) `
-        -IgnoreStandardError
-    $linuxProject = ([string]($wslResult.Output | Select-Object -Last 1)).Trim()
-    if ([string]::IsNullOrWhiteSpace($linuxProject)) { throw '无法把 Windows 项目目录转换为 WSL 路径。' }
+    $linuxProject = ConvertTo-WslPath -Distribution $DistroName -WindowsPath $resolvedProject
     $bootstrapPath = Join-Path $runtimeDirectory 'wsl-bootstrap.sh'
     Write-WslBootstrap $bootstrapPath
-    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'wslpath', '-a', $bootstrapPath) `
-        -IgnoreStandardError
-    $linuxInstaller = ([string]($wslResult.Output | Select-Object -Last 1)).Trim()
-    if ([string]::IsNullOrWhiteSpace($linuxInstaller)) { throw '无法创建内嵌的 WSL 安装流程。' }
+    $linuxInstaller = ConvertTo-WslPath -Distribution $DistroName -WindowsPath $bootstrapPath
 
     Write-Step '在 WSL 中配置国内镜像并安装 Docker Engine'
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
