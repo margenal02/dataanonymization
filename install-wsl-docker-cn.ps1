@@ -5,6 +5,8 @@ param(
     [string]$ProjectPath = $PSScriptRoot,
     [ValidateSet('Auto', 'Store', 'Web')]
     [string]$WslDownloadChannel = 'Auto',
+    [ValidateRange(30, 600)]
+    [int]$WslNoProgressTimeoutSeconds = 60,
     [switch]$CheckOnly,
     [switch]$AutoReboot,
     [switch]$ResumeAfterRestart
@@ -460,6 +462,20 @@ function Get-NativePercent([string[]]$Paths) {
     return $latestPercent
 }
 
+function Stop-NativeProcessTree([System.Diagnostics.Process]$Process) {
+    if (-not $Process) { return }
+    try {
+        if (-not $Process.HasExited) {
+            # Windows PowerShell 5.1/.NET Framework 没有 Process.Kill(true)，
+            # 使用 taskkill 只结束本次启动的 cmd 及其 WSL 子进程。
+            & taskkill.exe /PID $Process.Id /T /F 2>$null | Out-Null
+            if (-not $Process.WaitForExit(5000)) { $Process.Kill() }
+        }
+    } catch {
+        try { if (-not $Process.HasExited) { $Process.Kill() } } catch { }
+    }
+}
+
 function Invoke-NativeCommandWithProgress {
     param(
         [Parameter(Mandatory = $true)]
@@ -469,7 +485,9 @@ function Invoke-NativeCommandWithProgress {
         [ValidateRange(0, 100)]
         [int]$ProgressStart = 0,
         [ValidateRange(0, 100)]
-        [int]$ProgressEnd = 100
+        [int]$ProgressEnd = 100,
+        [ValidateRange(0, 3600)]
+        [int]$NoProgressTimeoutSeconds = 0
     )
 
     if ($ProgressEnd -lt $ProgressStart) { throw '进度结束值不能小于起始值。' }
@@ -495,9 +513,16 @@ function Invoke-NativeCommandWithProgress {
         try {
             if (-not $process.Start()) { throw "无法启动：$FilePath" }
             $lastShown = -1
+            $lastNativePercent = -1
+            $lastProgressAt = [DateTime]::UtcNow
+            $timedOut = $false
             while (-not $process.WaitForExit(250)) {
                 $nativePercent = Get-NativePercent @($stdoutPath, $stderrPath)
                 if ($null -ne $nativePercent) {
+                    if ($nativePercent -gt $lastNativePercent) {
+                        $lastNativePercent = $nativePercent
+                        $lastProgressAt = [DateTime]::UtcNow
+                    }
                     $overallPercent = $ProgressStart + [math]::Floor(
                         ($ProgressEnd - $ProgressStart) * $nativePercent / 100
                     )
@@ -507,23 +532,32 @@ function Invoke-NativeCommandWithProgress {
                         $lastShown = $overallPercent
                     }
                 }
+                if ($NoProgressTimeoutSeconds -gt 0 -and $lastNativePercent -lt 100 -and
+                    ([DateTime]::UtcNow - $lastProgressAt).TotalSeconds -ge $NoProgressTimeoutSeconds) {
+                    $timedOut = $true
+                    Write-InstallProgress -Percent $ProgressStart -Activity $Activity `
+                        -Status ("连续 {0} 秒无真实下载进展，正在切换通道" -f $NoProgressTimeoutSeconds)
+                    Stop-NativeProcessTree $process
+                    break
+                }
             }
-            $process.WaitForExit()
-            $exitCode = $process.ExitCode
+            if (-not $timedOut) { $process.WaitForExit() }
+            $exitCode = if ($timedOut) { -1 } else { $process.ExitCode }
             $capturedOutput = @()
             foreach ($path in @($stdoutPath, $stderrPath)) {
                 if (Test-Path -LiteralPath $path) {
                     $capturedOutput += @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
                 }
             }
+            $resultStatus = if ($timedOut) { '无进展，已停止' } elseif ($exitCode -eq 0) { '完成' } else { '失败' }
             Write-InstallProgress -Percent $(if ($exitCode -eq 0) { $ProgressEnd } else { $ProgressStart }) `
-                -Activity $Activity -Status $(if ($exitCode -eq 0) { '完成' } else { '失败' }) -CompleteLine
+                -Activity $Activity -Status $resultStatus -CompleteLine
             if ($exitCode -ne 0) {
                 $capturedOutput | Select-Object -Last 30 | ForEach-Object { Write-Host ([string]$_) }
             }
-            return [pscustomobject]@{ Output = $capturedOutput; ExitCode = $exitCode }
+            return [pscustomobject]@{ Output = $capturedOutput; ExitCode = $exitCode; TimedOut = $timedOut }
         } catch [System.Management.Automation.PipelineStoppedException] {
-            if ($process -and -not $process.HasExited) { try { $process.Kill() } catch { } }
+            Stop-NativeProcessTree $process
             throw
         }
     } finally {
@@ -543,12 +577,15 @@ function Invoke-NativeCommand {
         [ValidateRange(0, 100)]
         [int]$ProgressStart = 0,
         [ValidateRange(0, 100)]
-        [int]$ProgressEnd = 100
+        [int]$ProgressEnd = 100,
+        [ValidateRange(0, 3600)]
+        [int]$NoProgressTimeoutSeconds = 0
     )
 
     if ($DisplayOutput) {
         return Invoke-NativeCommandWithProgress -FilePath $FilePath -ArgumentList $ArgumentList `
-            -Activity $Activity -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd
+            -Activity $Activity -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd `
+            -NoProgressTimeoutSeconds $NoProgressTimeoutSeconds
     }
 
     $savedErrorActionPreference = $ErrorActionPreference
@@ -643,6 +680,76 @@ function Test-VersionInRange([string]$Value, [version]$Minimum, [version]$Maximu
     }
 }
 
+function Test-WslWebChannel {
+    try {
+        $null = Invoke-WebRequest -UseBasicParsing -Method Head `
+            -Uri 'https://github.com/microsoft/WSL/releases/latest' -TimeoutSec 8
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-WslChannelOrder {
+    if ($WslDownloadChannel -eq 'Web') { return @('Web') }
+    if ($WslDownloadChannel -eq 'Store') { return @('Store') }
+    if (Test-WslWebChannel) {
+        Write-Host 'GitHub 官方 WSL 发布页可访问，Auto 优先使用 Web 通道。' -ForegroundColor Green
+        return @('Web', 'Store')
+    }
+    Write-Host 'GitHub 官方 WSL 发布页当前不可访问，Auto 优先使用 Microsoft Store。' -ForegroundColor Yellow
+    return @('Store', 'Web')
+}
+
+function Invoke-WslOfficialDownload {
+    param(
+        [ValidateSet('Update', 'Install')]
+        [string]$Operation,
+        [string]$Distribution = '',
+        [int]$ProgressStart,
+        [int]$ProgressEnd
+    )
+
+    $channels = @(Get-WslChannelOrder)
+    $lastResult = $null
+    for ($index = 0; $index -lt $channels.Count; $index++) {
+        $channel = $channels[$index]
+        $channelName = if ($channel -eq 'Web') { 'GitHub 官方 Web 通道' } else { 'Microsoft Store 官方通道' }
+        if ($Operation -eq 'Update') {
+            $arguments = @('--update')
+            $activity = "通过 $channelName 更新 WSL"
+        } else {
+            $arguments = @('--install', '--distribution', $Distribution, '--no-launch')
+            $activity = "通过 $channelName 安装 $Distribution"
+        }
+        if ($channel -eq 'Web') {
+            if ($Operation -eq 'Update') {
+                $arguments += '--web-download'
+            } else {
+                $arguments = @('--install', '--web-download', '--distribution', $Distribution, '--no-launch')
+            }
+        }
+
+        # Auto 的首选通道无进展时才超时切换；最后一个或用户固定的通道不被脚本强制中断。
+        $timeoutForAttempt = if ($channels.Count -gt 1 -and $index -lt $channels.Count - 1) {
+            $WslNoProgressTimeoutSeconds
+        } else {
+            0
+        }
+        $lastResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList $arguments `
+            -DisplayOutput -Activity $activity -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd `
+            -NoProgressTimeoutSeconds $timeoutForAttempt
+        if ($lastResult.ExitCode -eq 0) { return $lastResult }
+
+        if ($index -lt $channels.Count - 1) {
+            $nextName = if ($channels[$index + 1] -eq 'Web') { 'GitHub 官方 Web 通道' } else { 'Microsoft Store 官方通道' }
+            $reason = if ($lastResult.TimedOut) { "连续 $WslNoProgressTimeoutSeconds 秒没有真实进展" } else { '当前通道返回失败' }
+            Write-Warning "$reason，自动切换到 $nextName。"
+        }
+    }
+    return $lastResult
+}
+
 function Confirm-Installation {
     $choices = @(
         (New-Object System.Management.Automation.Host.ChoiceDescription '&Yes（是）', '继续安装 WSL2、Docker 并部署应用'),
@@ -658,7 +765,7 @@ function Confirm-Installation {
 }
 
 function Start-ElevatedCopy {
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel"
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel -WslNoProgressTimeoutSeconds $WslNoProgressTimeoutSeconds"
     if ($CheckOnly) { $arguments += ' -CheckOnly' }
     if ($AutoReboot) { $arguments += ' -AutoReboot' }
     if ($ResumeAfterRestart) { $arguments += ' -ResumeAfterRestart' }
@@ -667,7 +774,7 @@ function Start-ElevatedCopy {
 }
 
 function Set-ResumeAfterRestart {
-    $command = "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel -ResumeAfterRestart"
+    $command = "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel -WslNoProgressTimeoutSeconds $WslNoProgressTimeoutSeconds -ResumeAfterRestart"
     if ($AutoReboot) { $command += ' -AutoReboot' }
     New-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' `
         -Name $ResumeName -Value $command -PropertyType String -Force | Out-Null
@@ -857,18 +964,9 @@ try {
     Write-Step "安装并初始化 $DistroName（WSL2）"
     if (-not $wslRuntimeVersion -or $wslRuntimeVersion -lt $MinimumWslVersion) {
         Write-Host "WSL 未安装或低于 $MinimumWslVersion，开始安装/更新。" -ForegroundColor Yellow
-        $updateArguments = if ($WslDownloadChannel -eq 'Web') { @('--update', '--web-download') } else { @('--update') }
-        $channelName = if ($WslDownloadChannel -eq 'Web') { 'GitHub 官方 Web 通道' } else { 'Microsoft Store 官方通道' }
-        $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList $updateArguments `
-            -DisplayOutput -Activity "通过 $channelName 更新 WSL" -ProgressStart 25 -ProgressEnd 40
-        if ($wslResult.ExitCode -ne 0 -and $WslDownloadChannel -eq 'Auto') {
-            Write-Warning 'Microsoft Store 通道更新失败，自动切换到 GitHub 官方 Web 下载通道。'
-            $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-                -ArgumentList @('--update', '--web-download') -DisplayOutput `
-                -Activity '通过 GitHub 官方 Web 通道更新 WSL' -ProgressStart 25 -ProgressEnd 40
-        }
+        $wslResult = Invoke-WslOfficialDownload -Operation Update -ProgressStart 25 -ProgressEnd 40
         if ($wslResult.ExitCode -ne 0) {
-            throw 'WSL 运行时安装/更新失败。可重试，或使用 -WslDownloadChannel Web 切换到 GitHub 官方通道。'
+            throw 'WSL 运行时安装/更新失败。Auto 已尝试可用的微软官方通道；请检查 Microsoft Store/GitHub 网络后重试。'
         }
         $wslRuntimeVersion = Get-WslRuntimeVersion
         if (-not $wslRuntimeVersion -or $wslRuntimeVersion -lt $MinimumWslVersion) {
@@ -883,23 +981,9 @@ try {
     if ($wslResult.ExitCode -ne 0) { throw '无法把 WSL 默认版本设为 2。请先完成 Windows Update。' }
 
     if ($DistroName -notin $installedDistros) {
-        $installArguments = @('--install', '--distribution', $DistroName, '--no-launch')
-        $installChannelName = 'Microsoft Store 官方通道'
-        if ($WslDownloadChannel -eq 'Web') {
-            $installArguments = @('--install', '--web-download', '--distribution', $DistroName, '--no-launch')
-            $installChannelName = 'GitHub 官方 Web 通道'
-        }
-        $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-            -ArgumentList $installArguments -DisplayOutput -Activity "通过 $installChannelName 安装 $DistroName" `
+        $wslResult = Invoke-WslOfficialDownload -Operation Install -Distribution $DistroName `
             -ProgressStart 42 -ProgressEnd 57
-        if ($wslResult.ExitCode -ne 0 -and $WslDownloadChannel -eq 'Auto') {
-            Write-Warning '常规 WSL 下载失败，改用 Microsoft Web Download 通道重试。'
-            $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-                -ArgumentList @('--install', '--web-download', '--distribution', $DistroName, '--no-launch') `
-                -DisplayOutput -Activity "通过 GitHub 官方 Web 通道安装 $DistroName" `
-                -ProgressStart 42 -ProgressEnd 57
-        }
-        if ($wslResult.ExitCode -ne 0) { throw "$DistroName 安装失败。可改用 -WslDownloadChannel Web 或 Store 后重试。" }
+        if ($wslResult.ExitCode -ne 0) { throw "$DistroName 安装失败。Auto 已尝试可用的微软官方通道，请检查网络后重试。" }
         $installedDistros = Get-InstalledWslDistros
         if ($DistroName -notin $installedDistros) { throw "$DistroName 安装后未出现在 WSL 发行版列表中。" }
     } else {
