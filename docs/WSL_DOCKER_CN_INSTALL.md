@@ -1,6 +1,6 @@
 # Windows + WSL2 + Docker 中国大陆一键安装说明
 
-本项目只需一个 Windows PowerShell 脚本 `install-wsl-docker-cn.ps1`，可按顺序完成系统检测、WSL2/Ubuntu 安装、Docker Engine 与 Compose 安装、国内镜像配置、安全密钥生成、容器部署和健康检查。脚本执行时会在已忽略的 `.runtime` 目录临时展开 WSL 命令，成功后自动删除，不需要附带第二个安装脚本。
+本项目只需一个 Windows PowerShell 脚本 `install-wsl-docker-cn.ps1`，检测与安装已合并。直接运行后，脚本先执行只读系统检测；只有检测合格才询问是否继续。选择“是”后，它会继续检查现有 WSL、Ubuntu、Docker Engine 与 Compose，符合版本范围的组件会明确显示“跳过安装”，只补装或升级缺失、过旧的组件，最后完成国内镜像配置、安全密钥生成、容器部署和健康检查。脚本执行时会在已忽略的 `.runtime` 目录临时展开 WSL 命令，成功后自动删除，不需要附带第二个安装脚本。
 
 ## 系统要求
 
@@ -16,28 +16,39 @@
 
 Windows 10 家庭版、专业版、企业版和教育版只要达到上述版本并支持 WSL2，均可使用。WSL 本身是 Windows 签名系统组件，仍从 Microsoft 官方服务安装；Ubuntu APT、Docker CE、PyPI、npm 和应用基础容器使用中国大陆镜像。
 
-脚本默认部署 Ubuntu 24.04、Docker Engine 24 或更高版本、Docker Compose v2.20 或更高版本、Python 3.13、Django 5.2、MySQL 8.4、Node.js 22 和 Nginx 1.27。Docker 与 Compose 从镜像仓库安装当前稳定版；已有版本低于兼容线时会自动升级。
+脚本默认部署 Ubuntu 24.04、Python 3.13、Django 5.2、MySQL 8.4、Node.js 22 和 Nginx 1.27。组件兼容范围如下：
+
+| 组件 | 支持范围 | 已符合范围时 | 低于范围时 | 高于范围时 |
+|---|---|---|---|---|
+| WSL 运行时 | `>= 0.67.6`（systemd 最低要求） | 跳过更新 | 执行 `wsl --update` | 保留现有版本 |
+| Ubuntu | Ubuntu 24.04，且运行于 WSL2 | 跳过安装/转换 | 安装或转换为 WSL2 | 不适用 |
+| Docker Engine | `>= 24.0` 且 `< 30.0`，即 24.x–29.x | 跳过安装 | 升级到镜像仓库稳定版 | 停止并提示，不自动降级 |
+| Docker Compose | `>= 2.20` 且 `< 6.0`，即 v2.20–v5.x | 跳过安装 | 升级到镜像仓库稳定版 | 停止并提示，不自动降级 |
+
+上述上限是安装脚本采用的保守自动部署边界，并不表示更高版本一定不能运行。超出上限时停止，是为了避免安装脚本在未验证的新主版本上修改现有环境。
 
 ## 使用方法
 
 1. 将完整项目目录复制或克隆到 Windows 本地磁盘。
 2. 右键点击“Windows PowerShell”，选择“以管理员身份运行”，进入项目目录。
-3. 如果希望先做只读检测，执行：
+3. 执行唯一的一键脚本：
 
    ```powershell
    Set-ExecutionPolicy -Scope Process Bypass
-   .\install-wsl-docker-cn.ps1 -CheckOnly
-   ```
-
-4. 检测通过后可执行：
-
-   ```powershell
    .\install-wsl-docker-cn.ps1
    ```
 
+4. 脚本先显示系统检测表。检测不合格时自动停止；检测合格时显示“是否继续安装和部署”，选择 `Yes（是）` 继续，选择 `No（否）` 则不做任何安装修改。
+
+如只需要生成检测结果、不显示继续安装提示，可使用同一脚本的可选参数：
+
+```powershell
+.\install-wsl-docker-cn.ps1 -CheckOnly
+```
+
 脚本需要管理员权限；如果从普通 PowerShell 启动，会自动打开管理员窗口。该窗口在检测或安装结束后保持打开，便于查看结果和错误日志，可确认完成后手动关闭。
 
-首次启用 WSL2 时需要重启 Windows。脚本会写入一次性的 `RunOnce` 续跑项；手动重启并登录原管理员账号后，安装会自动继续。全部完成后续跑项会自动清除。
+首次启用 WSL2 时需要重启 Windows。脚本会写入一次性的 `RunOnce` 续跑项；手动重启并登录原管理员账号后，安装会自动继续，且不会重复询问是否安装。全部完成后续跑项会自动清除。
 
 如果希望脚本在启用 WSL2 后自动重启：
 
@@ -129,6 +140,7 @@ Get-NetTCPConnection -LocalPort 5291 -State Listen
 
 - [Microsoft：安装 WSL](https://learn.microsoft.com/zh-cn/windows/wsl/install)
 - [Microsoft：旧版本 WSL 的手动安装步骤与 WSL2 要求](https://learn.microsoft.com/zh-cn/windows/wsl/install-manual)
+- [Microsoft：在 WSL 中使用 systemd（要求 WSL 0.67.6 或更高）](https://learn.microsoft.com/zh-cn/windows/wsl/systemd)
 - [Docker：在 Ubuntu 安装 Docker Engine](https://docs.docker.com/engine/install/ubuntu/)
 - [Docker：安装 Compose 插件](https://docs.docker.com/compose/install/linux/)
 - [清华大学 TUNA：Docker CE 镜像使用帮助](https://mirrors.tuna.tsinghua.edu.cn/help/docker-ce/)
