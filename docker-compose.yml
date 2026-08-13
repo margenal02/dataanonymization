@@ -14,7 +14,8 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$${MYSQL_PASSWORD}\" mysql --protocol=TCP -h 127.0.0.1 -u\"$${MYSQL_USER}\" -D \"$${MYSQL_DATABASE}\" --silent -e 'SELECT 1' >/dev/null"]
+      start_period: 30s
       interval: 5s
       timeout: 5s
       retries: 30
@@ -47,10 +48,11 @@ services:
       db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health/"]
-      interval: 10s
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health/"]
+      start_period: 30s
+      interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 30
 
   frontend:
     build:
