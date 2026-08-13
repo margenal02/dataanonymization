@@ -4,7 +4,8 @@ param(
     [string]$DistroName = 'Ubuntu-24.04',
     [string]$ProjectPath = $PSScriptRoot,
     [switch]$CheckOnly,
-    [switch]$AutoReboot
+    [switch]$AutoReboot,
+    [switch]$ResumeAfterRestart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,6 +15,11 @@ $MinimumMemoryGB = 4
 $RecommendedMemoryGB = 8
 $MinimumDiskGB = 20
 $RecommendedDiskGB = 30
+$MinimumWslVersion = [version]'0.67.6'
+$MinimumDockerVersion = '24.0'
+$MaximumDockerVersion = '30.0'
+$MinimumComposeVersion = '2.20'
+$MaximumComposeVersion = '6.0'
 $ResumeName = 'DataAnonymizationWslInstaller'
 $WslBootstrap = @'
 #!/usr/bin/env bash
@@ -27,6 +33,10 @@ NPM_MIRROR="https://registry.npmmirror.com"
 DOCKER_CE_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/docker-ce"
 DOCKER_HUB_PREFIX="m.daocloud.io/docker.io/library/"
 DOCKER_REGISTRY_MIRROR="https://docker.m.daocloud.io"
+DOCKER_MIN_VERSION="24.0"
+DOCKER_MAX_VERSION="30.0"
+COMPOSE_MIN_VERSION="2.20"
+COMPOSE_MAX_VERSION="6.0"
 
 log() {
     printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -91,23 +101,45 @@ EOF
 install_docker() {
     local docker_version=""
     local compose_version=""
+    local docker_supported=false
+    local compose_supported=false
     if command -v docker >/dev/null 2>&1; then
         docker_version="$(docker --version 2>/dev/null | sed -nE 's/.*version ([0-9]+(\.[0-9]+)+).*/\1/p')"
         compose_version="$(docker compose version --short 2>/dev/null | sed 's/^v//')"
     fi
-    if [[ -n "$docker_version" && -n "$compose_version" ]] \
-        && dpkg --compare-versions "$docker_version" ge 24.0 \
-        && dpkg --compare-versions "$compose_version" ge 2.20; then
-        log "Docker Engine ${docker_version} 与 Compose ${compose_version} 已满足要求"
+    if [[ -n "$docker_version" ]] && dpkg --compare-versions "$docker_version" ge "$DOCKER_MAX_VERSION"; then
+        echo "Docker Engine ${docker_version} 超出支持范围 [${DOCKER_MIN_VERSION}, ${DOCKER_MAX_VERSION})。脚本不会自动降级，请先按部署文档处理。" >&2
+        exit 1
+    fi
+    if [[ -n "$compose_version" ]] && dpkg --compare-versions "$compose_version" ge "$COMPOSE_MAX_VERSION"; then
+        echo "Docker Compose ${compose_version} 超出支持范围 [${COMPOSE_MIN_VERSION}, ${COMPOSE_MAX_VERSION})。脚本不会自动降级，请先按部署文档处理。" >&2
+        exit 1
+    fi
+    if [[ -n "$docker_version" ]] \
+        && dpkg --compare-versions "$docker_version" ge "$DOCKER_MIN_VERSION" \
+        && dpkg --compare-versions "$docker_version" lt "$DOCKER_MAX_VERSION"; then
+        docker_supported=true
+    fi
+    if [[ -n "$compose_version" ]] \
+        && dpkg --compare-versions "$compose_version" ge "$COMPOSE_MIN_VERSION" \
+        && dpkg --compare-versions "$compose_version" lt "$COMPOSE_MAX_VERSION"; then
+        compose_supported=true
+    fi
+    if [[ "$docker_supported" == true && "$compose_supported" == true ]]; then
+        log "Docker Engine ${docker_version} 与 Compose ${compose_version} 位于支持范围，跳过重复安装"
         return
-    elif [[ -n "$docker_version" || -n "$compose_version" ]]; then
-        log "现有 Docker/Compose 版本过旧或不完整，将升级到当前稳定版"
     fi
 
-    log "通过清华大学 Docker CE 镜像仓库安装 Docker Engine"
-    DEBIAN_FRONTEND=noninteractive apt-get remove -y \
-        docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc \
-        >/dev/null 2>&1 || true
+    if [[ "$docker_supported" == true ]]; then
+        log "Docker Engine ${docker_version} 位于支持范围，仅补装/升级 Compose，不重复安装 Engine"
+    else
+        log "Docker Engine 缺失或低于支持范围，将通过清华大学 Docker CE 镜像仓库安装"
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y \
+            docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc \
+            >/dev/null 2>&1 || true
+        # 冲突软件包清理时可能同时移除了由发行版提供的 Compose，统一安装受支持的插件版本。
+        compose_supported=false
+    fi
     install -m 0755 -d /etc/apt/keyrings
     retry curl -fsSL "${DOCKER_CE_MIRROR}/linux/ubuntu/gpg" -o /tmp/docker-ce.asc
     gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg /tmp/docker-ce.asc
@@ -130,8 +162,58 @@ Architectures: $(dpkg --print-architecture)
 Signed-By: /etc/apt/keyrings/docker.gpg
 EOF
     retry apt-get update
-    DEBIAN_FRONTEND=noninteractive retry apt-get install -y \
-        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    local docker_package_version=""
+    local compose_package_version=""
+    local package_version=""
+    local upstream_version=""
+    local packages=()
+    if [[ "$docker_supported" != true ]]; then
+        while IFS= read -r package_version; do
+            package_version="$(printf '%s' "$package_version" | xargs)"
+            upstream_version="${package_version#*:}"
+            upstream_version="${upstream_version%%-*}"
+            if dpkg --compare-versions "$upstream_version" ge "$DOCKER_MIN_VERSION" \
+                && dpkg --compare-versions "$upstream_version" lt "$DOCKER_MAX_VERSION"; then
+                docker_package_version="$package_version"
+                break
+            fi
+        done < <(apt-cache madison docker-ce | awk -F '|' '{print $2}')
+        if [[ -z "$docker_package_version" ]]; then
+            echo "Docker CE 镜像仓库中没有找到项目支持范围内的 Engine 软件包。" >&2
+            exit 1
+        fi
+        packages+=("docker-ce=${docker_package_version}" "docker-ce-cli=${docker_package_version}" containerd.io docker-buildx-plugin)
+    fi
+    if [[ "$compose_supported" != true ]]; then
+        while IFS= read -r package_version; do
+            package_version="$(printf '%s' "$package_version" | xargs)"
+            upstream_version="${package_version#*:}"
+            upstream_version="${upstream_version%%-*}"
+            if dpkg --compare-versions "$upstream_version" ge "$COMPOSE_MIN_VERSION" \
+                && dpkg --compare-versions "$upstream_version" lt "$COMPOSE_MAX_VERSION"; then
+                compose_package_version="$package_version"
+                break
+            fi
+        done < <(apt-cache madison docker-compose-plugin | awk -F '|' '{print $2}')
+        if [[ -z "$compose_package_version" ]]; then
+            echo "Docker CE 镜像仓库中没有找到项目支持范围内的 Compose 软件包。" >&2
+            exit 1
+        fi
+        packages+=("docker-compose-plugin=${compose_package_version}")
+    fi
+    DEBIAN_FRONTEND=noninteractive retry apt-get install -y "${packages[@]}"
+
+    docker_version="$(docker --version 2>/dev/null | sed -nE 's/.*version ([0-9]+(\.[0-9]+)+).*/\1/p')"
+    compose_version="$(docker compose version --short 2>/dev/null | sed 's/^v//')"
+    if [[ -z "$docker_version" || -z "$compose_version" ]] \
+        || ! dpkg --compare-versions "$docker_version" ge "$DOCKER_MIN_VERSION" \
+        || ! dpkg --compare-versions "$docker_version" lt "$DOCKER_MAX_VERSION" \
+        || ! dpkg --compare-versions "$compose_version" ge "$COMPOSE_MIN_VERSION" \
+        || ! dpkg --compare-versions "$compose_version" lt "$COMPOSE_MAX_VERSION"; then
+        echo "安装后的 Docker/Compose 版本不在支持范围：Engine=${docker_version:-未检测到}，Compose=${compose_version:-未检测到}。" >&2
+        exit 1
+    fi
 }
 
 configure_docker_mirror() {
@@ -321,16 +403,96 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-WslRuntimeVersion {
+    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $null }
+    $versionOutput = @(& wsl.exe --version 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $null }
+    foreach ($line in $versionOutput) {
+        $cleanLine = [string]($line -replace "`0", '')
+        if ($cleanLine -match '(\d+\.\d+(?:\.\d+){0,2})') {
+            try { return [version]$Matches[1] } catch { return $null }
+        }
+    }
+    return $null
+}
+
+function Get-InstalledWslDistros {
+    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return @() }
+    return @(& wsl.exe --list --quiet 2>$null | ForEach-Object {
+        ([string]($_ -replace "`0", '')).Trim().TrimStart('*').Trim()
+    } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+
+function Get-WslDistroGeneration([string]$Name) {
+    $lxssPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+    if (Test-Path $lxssPath) {
+        foreach ($key in @(Get-ChildItem -Path $lxssPath -ErrorAction SilentlyContinue)) {
+            $properties = Get-ItemProperty -Path $key.PSPath -ErrorAction SilentlyContinue
+            if ($properties.DistributionName -eq $Name -and [int]$properties.Version -in @(1, 2)) {
+                return [int]$properties.Version
+            }
+        }
+    }
+
+    $escapedName = [regex]::Escape($Name)
+    foreach ($line in @(& wsl.exe --list --verbose 2>$null)) {
+        $cleanLine = [string]($line -replace "`0", '')
+        if ($cleanLine -match "^\s*\*?\s*$escapedName\s+\S+\s+([12])\s*$") {
+            return [int]$Matches[1]
+        }
+    }
+    return $null
+}
+
+function Get-WslDockerVersions([string]$Name, [int]$Generation) {
+    $state = [ordered]@{ Docker = $null; Compose = $null }
+    if ($Generation -ne 2) { return [pscustomobject]$state }
+    $command = 'docker_version=$(docker --version 2>/dev/null | sed -nE "s/.*version ([0-9]+(\.[0-9]+){1,3}).*/\1/p"); compose_version=$(docker compose version --short 2>/dev/null | sed -nE "s/^v?([0-9]+(\.[0-9]+){1,3}).*/\1/p"); printf "%s|%s\n" "$docker_version" "$compose_version"'
+    foreach ($line in @(& wsl.exe --distribution $Name --user root -- bash -lc $command 2>$null)) {
+        $cleanLine = ([string]($line -replace "`0", '')).Trim()
+        if ($cleanLine -match '^([^|]*)\|([^|]*)$') {
+            $state.Docker = if ([string]::IsNullOrWhiteSpace($Matches[1])) { $null } else { $Matches[1] }
+            $state.Compose = if ([string]::IsNullOrWhiteSpace($Matches[2])) { $null } else { $Matches[2] }
+        }
+    }
+    return [pscustomobject]$state
+}
+
+function Test-VersionInRange([string]$Value, [version]$Minimum, [version]$MaximumExclusive) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    try {
+        $version = [version]$Value
+        return $version -ge $Minimum -and $version -lt $MaximumExclusive
+    } catch {
+        return $false
+    }
+}
+
+function Confirm-Installation {
+    $choices = @(
+        (New-Object System.Management.Automation.Host.ChoiceDescription '&Yes（是）', '继续安装 WSL2、Docker 并部署应用'),
+        (New-Object System.Management.Automation.Host.ChoiceDescription '&No（否）', '退出，不修改 WSL 或 Docker')
+    )
+    $selection = $Host.UI.PromptForChoice(
+        '系统检测通过',
+        '系统符合安装要求。是否继续安装和部署？',
+        $choices,
+        1
+    )
+    return $selection -eq 0
+}
+
 function Start-ElevatedCopy {
     $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`""
     if ($CheckOnly) { $arguments += ' -CheckOnly' }
     if ($AutoReboot) { $arguments += ' -AutoReboot' }
+    if ($ResumeAfterRestart) { $arguments += ' -ResumeAfterRestart' }
     # 保留自动提权后的窗口，让用户能够看到检测结果或错误信息。
     Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList "-NoExit $arguments"
 }
 
 function Set-ResumeAfterRestart {
-    $command = "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`""
+    $command = "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -ResumeAfterRestart"
     if ($AutoReboot) { $command += ' -AutoReboot' }
     New-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' `
         -Name $ResumeName -Value $command -PropertyType String -Force | Out-Null
@@ -445,6 +607,58 @@ try {
         Write-Host "`n系统满足最低安装要求；未修改任何 WSL 或 Docker 配置。" -ForegroundColor Green
         return
     }
+    if (-not $ResumeAfterRestart -and -not (Confirm-Installation)) {
+        Write-Host "`n已取消安装；未修改任何 WSL 或 Docker 配置。" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Step '检测主机现有的 WSL、Ubuntu 与 Docker'
+    $wslRuntimeVersion = Get-WslRuntimeVersion
+    $installedDistros = Get-InstalledWslDistros
+    $distroInstalled = $DistroName -in $installedDistros
+    $distroGeneration = if ($distroInstalled) { Get-WslDistroGeneration $DistroName } else { $null }
+    $wslDocker = if ($distroInstalled) {
+        Get-WslDockerVersions $DistroName $distroGeneration
+    } else {
+        [pscustomobject]@{ Docker = $null; Compose = $null }
+    }
+    $dockerInRange = Test-VersionInRange $wslDocker.Docker ([version]$MinimumDockerVersion) ([version]$MaximumDockerVersion)
+    $composeInRange = Test-VersionInRange $wslDocker.Compose ([version]$MinimumComposeVersion) ([version]$MaximumComposeVersion)
+    $installationState = @(
+        [pscustomobject]@{
+            Item = 'WSL Windows 组件'
+            Current = "$($wslFeature.State) / 虚拟机平台 $($vmFeature.State)"
+            Action = if ($wslFeature.State -eq 'Enabled' -and $vmFeature.State -eq 'Enabled') { '已安装，跳过' } else { '启用后重启' }
+        }
+        [pscustomobject]@{
+            Item = 'WSL 运行时'
+            Current = if ($wslRuntimeVersion) { $wslRuntimeVersion.ToString() } else { '未安装或版本不可识别' }
+            Action = if ($wslRuntimeVersion -and $wslRuntimeVersion -ge $MinimumWslVersion) { '满足要求，跳过更新' } else { "更新到 >= $MinimumWslVersion" }
+        }
+        [pscustomobject]@{
+            Item = $DistroName
+            Current = if ($distroInstalled) { if ($distroGeneration) { "已安装 / WSL$distroGeneration" } else { '已安装 / 版本待确认' } } else { '未安装' }
+            Action = if ($distroGeneration -eq 2) { '已是 WSL2，跳过安装' } elseif ($distroInstalled) { '转换为 WSL2' } else { '安装为 WSL2' }
+        }
+        [pscustomobject]@{
+            Item = 'Docker Engine'
+            Current = if ($wslDocker.Docker) { $wslDocker.Docker } else { '未安装' }
+            Action = if ($dockerInRange) { '位于支持范围，跳过安装' } else { "要求 >= $MinimumDockerVersion 且 < $MaximumDockerVersion" }
+        }
+        [pscustomobject]@{
+            Item = 'Docker Compose'
+            Current = if ($wslDocker.Compose) { $wslDocker.Compose } else { '未安装' }
+            Action = if ($composeInRange) { '位于支持范围，跳过安装' } else { "要求 >= $MinimumComposeVersion 且 < $MaximumComposeVersion" }
+        }
+    )
+    $installationState | Format-Table -AutoSize
+
+    if ($wslDocker.Docker -and ([version]$wslDocker.Docker -ge [version]$MaximumDockerVersion)) {
+        throw "Docker Engine $($wslDocker.Docker) 超出支持范围 [${MinimumDockerVersion}, ${MaximumDockerVersion})；脚本不会自动降级。"
+    }
+    if ($wslDocker.Compose -and ([version]$wslDocker.Compose -ge [version]$MaximumComposeVersion)) {
+        throw "Docker Compose $($wslDocker.Compose) 超出支持范围 [${MinimumComposeVersion}, ${MaximumComposeVersion})；脚本不会自动降级。"
+    }
 
     Write-Step '启用 WSL2 所需的 Windows 功能'
     $restartNeeded = $false
@@ -462,16 +676,22 @@ try {
     }
 
     Write-Step "安装并初始化 $DistroName（WSL2）"
-    & wsl.exe --update
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning 'WSL 运行时在线更新未完成，将继续使用当前已安装版本。'
+    if (-not $wslRuntimeVersion -or $wslRuntimeVersion -lt $MinimumWslVersion) {
+        Write-Host "WSL 未安装或低于 $MinimumWslVersion，开始安装/更新……" -ForegroundColor Yellow
+        & wsl.exe --update
+        if ($LASTEXITCODE -ne 0) {
+            throw 'WSL 运行时安装/更新失败。请检查 Microsoft WSL 服务连接后重试。'
+        }
+        $wslRuntimeVersion = Get-WslRuntimeVersion
+        if (-not $wslRuntimeVersion -or $wslRuntimeVersion -lt $MinimumWslVersion) {
+            throw "WSL 更新后仍未达到 systemd 所需的最低版本 $MinimumWslVersion。"
+        }
+    } else {
+        Write-Host "WSL $wslRuntimeVersion 已满足要求，跳过重复安装/更新。" -ForegroundColor Green
     }
     & wsl.exe --set-default-version 2
     if ($LASTEXITCODE -ne 0) { throw '无法把 WSL 默认版本设为 2。请先完成 Windows Update。' }
 
-    $installedDistros = @(& wsl.exe --list --quiet 2>$null | ForEach-Object {
-        ([string]($_ -replace "`0", '')).Trim()
-    } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($DistroName -notin $installedDistros) {
         & wsl.exe --install --distribution $DistroName --no-launch
         if ($LASTEXITCODE -ne 0) {
@@ -479,10 +699,19 @@ try {
             & wsl.exe --install --web-download --distribution $DistroName --no-launch
             if ($LASTEXITCODE -ne 0) { throw "$DistroName 安装失败。" }
         }
+        $installedDistros = Get-InstalledWslDistros
+        if ($DistroName -notin $installedDistros) { throw "$DistroName 安装后未出现在 WSL 发行版列表中。" }
+    } else {
+        Write-Host "$DistroName 已安装，跳过重复安装。" -ForegroundColor Green
     }
 
-    & wsl.exe --set-version $DistroName 2
-    if ($LASTEXITCODE -ne 0) { throw "无法把 $DistroName 转换为 WSL2。" }
+    $distroGeneration = Get-WslDistroGeneration $DistroName
+    if ($distroGeneration -ne 2) {
+        & wsl.exe --set-version $DistroName 2
+        if ($LASTEXITCODE -ne 0) { throw "无法把 $DistroName 转换为 WSL2。" }
+    } else {
+        Write-Host "$DistroName 已是 WSL2，跳过版本转换。" -ForegroundColor Green
+    }
     & wsl.exe --distribution $DistroName --user root -- bash -lc 'true'
     if ($LASTEXITCODE -ne 0) { throw "$DistroName 初始化失败。" }
 

@@ -26,15 +26,14 @@
 
 ## Windows + WSL2 + Docker 部署
 
-Windows 10/11 中国大陆网络环境只需一个 `install-wsl-docker-cn.ps1`，它会按顺序完成系统检测、安装 WSL2、安装 Docker 和启动应用。在管理员 PowerShell 中执行：
+Windows 10/11 中国大陆网络环境只需一个 `install-wsl-docker-cn.ps1`。脚本先检测系统，检测合格后询问是否继续；选择“是”后检查现有 WSL2、Ubuntu、Docker 和 Compose，版本符合要求时自动跳过重复安装。在管理员 PowerShell 中执行：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-.\install-wsl-docker-cn.ps1 -CheckOnly
 .\install-wsl-docker-cn.ps1
 ```
 
-完整要求、国内镜像配置、重启续跑和故障排查参见 [Windows + WSL2 + Docker 中国大陆一键安装说明](docs/WSL_DOCKER_CN_INSTALL.md)。
+如只做检测，可为同一脚本添加 `-CheckOnly`。完整流程、支持版本、国内镜像配置、重启续跑和故障排查参见 [Windows + WSL2 + Docker 中国大陆一键安装说明](docs/WSL_DOCKER_CN_INSTALL.md)。
 
 安装完成后访问 [http://localhost:5291](http://localhost:5291)。日常运维统一进入 WSL2：
 
@@ -51,6 +50,10 @@ docker compose logs -f            # 查看日志
 docker compose down               # 停止服务，保留数据
 docker compose up -d              # 重新启动
 ```
+
+## Linux 主机 + Docker 部署
+
+Linux 服务器无需 WSL，推荐 Ubuntu Server 22.04/24.04 LTS。Docker Engine 支持范围为 `>=24.0 且 <30.0`，Compose 插件为 `>=2.20 且 <6.0`；现有版本符合范围时无需重新安装。安装 Docker、配置中国大陆镜像、安全密钥、防火墙、启动与备份步骤参见 [Linux 主机 Docker 部署说明](docs/LINUX_DOCKER_DEPLOYMENT.md)。
 
 ## 使用流程
 
