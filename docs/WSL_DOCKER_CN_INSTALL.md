@@ -114,6 +114,10 @@ docker compose up -d --build      # 更新并重建
 
 先通过 Windows Update 升级。`wsl --install` 的简化安装流程要求 Windows 10 Build 19041 或更高版本；更早版本不由本自动化脚本支持。
 
+### 读取 WSL 版本时出现 NativeCommandError
+
+请先更新到包含此修复的最新版脚本。旧版 Windows PowerShell 5.1 会把旧 WSL 输出的“请运行 `wsl.exe --update`”状态提示包装成 `NativeCommandError`；新版脚本会按退出码识别为待更新状态，然后继续执行 WSL 更新，不再把该提示误判为脚本异常。
+
 ### 国内 Docker 镜像不可用
 
 公共镜像可用性会变化。编辑 `.env`，把 `MYSQL_IMAGE`、`PYTHON_IMAGE`、`NODE_IMAGE`、`NGINX_IMAGE` 改为可用的组织内部镜像或官方镜像，然后重新执行：

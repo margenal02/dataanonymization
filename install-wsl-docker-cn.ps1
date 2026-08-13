@@ -403,11 +403,47 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [switch]$IgnoreStandardError,
+        [switch]$DisplayOutput
+    )
+
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 会把原生命令的 stderr 包装成 NativeCommandError；
+        # WSL 在返回非零退出码时经常会这样输出可预期的状态提示。
+        $ErrorActionPreference = 'Continue'
+        if ($IgnoreStandardError) {
+            $output = @(& $FilePath @ArgumentList 2>$null)
+        } elseif ($DisplayOutput) {
+            # 合并输出流后逐行显示，长时间的更新/安装过程不会看起来像“卡住”。
+            $output = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object {
+                Write-Host ([string]$_)
+                $_
+            })
+        } else {
+            $output = @(& $FilePath @ArgumentList)
+        }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+
+    return [pscustomobject]@{
+        Output = $output
+        ExitCode = $exitCode
+    }
+}
+
 function Get-WslRuntimeVersion {
     if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $null }
-    $versionOutput = @(& wsl.exe --version 2>$null)
-    if ($LASTEXITCODE -ne 0) { return $null }
-    foreach ($line in $versionOutput) {
+    $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--version') -IgnoreStandardError
+    if ($result.ExitCode -ne 0) { return $null }
+    foreach ($line in $result.Output) {
         $cleanLine = [string]($line -replace "`0", '')
         if ($cleanLine -match '(\d+\.\d+(?:\.\d+){0,2})') {
             try { return [version]$Matches[1] } catch { return $null }
@@ -418,7 +454,9 @@ function Get-WslRuntimeVersion {
 
 function Get-InstalledWslDistros {
     if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return @() }
-    return @(& wsl.exe --list --quiet 2>$null | ForEach-Object {
+    $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--list', '--quiet') -IgnoreStandardError
+    if ($result.ExitCode -ne 0) { return @() }
+    return @($result.Output | ForEach-Object {
         ([string]($_ -replace "`0", '')).Trim().TrimStart('*').Trim()
     } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
@@ -435,7 +473,8 @@ function Get-WslDistroGeneration([string]$Name) {
     }
 
     $escapedName = [regex]::Escape($Name)
-    foreach ($line in @(& wsl.exe --list --verbose 2>$null)) {
+    $result = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--list', '--verbose') -IgnoreStandardError
+    foreach ($line in $result.Output) {
         $cleanLine = [string]($line -replace "`0", '')
         if ($cleanLine -match "^\s*\*?\s*$escapedName\s+\S+\s+([12])\s*$") {
             return [int]$Matches[1]
@@ -448,7 +487,10 @@ function Get-WslDockerVersions([string]$Name, [int]$Generation) {
     $state = [ordered]@{ Docker = $null; Compose = $null }
     if ($Generation -ne 2) { return [pscustomobject]$state }
     $command = 'docker_version=$(docker --version 2>/dev/null | sed -nE "s/.*version ([0-9]+(\.[0-9]+){1,3}).*/\1/p"); compose_version=$(docker compose version --short 2>/dev/null | sed -nE "s/^v?([0-9]+(\.[0-9]+){1,3}).*/\1/p"); printf "%s|%s\n" "$docker_version" "$compose_version"'
-    foreach ($line in @(& wsl.exe --distribution $Name --user root -- bash -lc $command 2>$null)) {
+    $result = Invoke-NativeCommand -FilePath 'wsl.exe' `
+        -ArgumentList @('--distribution', $Name, '--user', 'root', '--', 'bash', '-lc', $command) `
+        -IgnoreStandardError
+    foreach ($line in $result.Output) {
         $cleanLine = ([string]($line -replace "`0", '')).Trim()
         if ($cleanLine -match '^([^|]*)\|([^|]*)$') {
             $state.Docker = if ([string]::IsNullOrWhiteSpace($Matches[1])) { $null } else { $Matches[1] }
@@ -678,8 +720,8 @@ try {
     Write-Step "安装并初始化 $DistroName（WSL2）"
     if (-not $wslRuntimeVersion -or $wslRuntimeVersion -lt $MinimumWslVersion) {
         Write-Host "WSL 未安装或低于 $MinimumWslVersion，开始安装/更新……" -ForegroundColor Yellow
-        & wsl.exe --update
-        if ($LASTEXITCODE -ne 0) {
+        $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--update') -DisplayOutput
+        if ($wslResult.ExitCode -ne 0) {
             throw 'WSL 运行时安装/更新失败。请检查 Microsoft WSL 服务连接后重试。'
         }
         $wslRuntimeVersion = Get-WslRuntimeVersion
@@ -689,15 +731,17 @@ try {
     } else {
         Write-Host "WSL $wslRuntimeVersion 已满足要求，跳过重复安装/更新。" -ForegroundColor Green
     }
-    & wsl.exe --set-default-version 2
-    if ($LASTEXITCODE -ne 0) { throw '无法把 WSL 默认版本设为 2。请先完成 Windows Update。' }
+    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-default-version', '2') -DisplayOutput
+    if ($wslResult.ExitCode -ne 0) { throw '无法把 WSL 默认版本设为 2。请先完成 Windows Update。' }
 
     if ($DistroName -notin $installedDistros) {
-        & wsl.exe --install --distribution $DistroName --no-launch
-        if ($LASTEXITCODE -ne 0) {
+        $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
+            -ArgumentList @('--install', '--distribution', $DistroName, '--no-launch') -DisplayOutput
+        if ($wslResult.ExitCode -ne 0) {
             Write-Warning '常规 WSL 下载失败，改用 Microsoft Web Download 通道重试。'
-            & wsl.exe --install --web-download --distribution $DistroName --no-launch
-            if ($LASTEXITCODE -ne 0) { throw "$DistroName 安装失败。" }
+            $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
+                -ArgumentList @('--install', '--web-download', '--distribution', $DistroName, '--no-launch') -DisplayOutput
+            if ($wslResult.ExitCode -ne 0) { throw "$DistroName 安装失败。" }
         }
         $installedDistros = Get-InstalledWslDistros
         if ($DistroName -notin $installedDistros) { throw "$DistroName 安装后未出现在 WSL 发行版列表中。" }
@@ -707,29 +751,36 @@ try {
 
     $distroGeneration = Get-WslDistroGeneration $DistroName
     if ($distroGeneration -ne 2) {
-        & wsl.exe --set-version $DistroName 2
-        if ($LASTEXITCODE -ne 0) { throw "无法把 $DistroName 转换为 WSL2。" }
+        $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-version', $DistroName, '2') -DisplayOutput
+        if ($wslResult.ExitCode -ne 0) { throw "无法把 $DistroName 转换为 WSL2。" }
     } else {
         Write-Host "$DistroName 已是 WSL2，跳过版本转换。" -ForegroundColor Green
     }
-    & wsl.exe --distribution $DistroName --user root -- bash -lc 'true'
-    if ($LASTEXITCODE -ne 0) { throw "$DistroName 初始化失败。" }
+    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
+        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'bash', '-lc', 'true') -DisplayOutput
+    if ($wslResult.ExitCode -ne 0) { throw "$DistroName 初始化失败。" }
 
-    $linuxProjectOutput = & wsl.exe --distribution $DistroName --user root -- wslpath -a $resolvedProject | Select-Object -Last 1
-    $linuxProject = ([string]$linuxProjectOutput).Trim()
+    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
+        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'wslpath', '-a', $resolvedProject) `
+        -IgnoreStandardError
+    $linuxProject = ([string]($wslResult.Output | Select-Object -Last 1)).Trim()
     if ([string]::IsNullOrWhiteSpace($linuxProject)) { throw '无法把 Windows 项目目录转换为 WSL 路径。' }
     $bootstrapPath = Join-Path $runtimeDirectory 'wsl-bootstrap.sh'
     Write-WslBootstrap $bootstrapPath
-    $linuxInstallerOutput = & wsl.exe --distribution $DistroName --user root -- wslpath -a $bootstrapPath | Select-Object -Last 1
-    $linuxInstaller = ([string]$linuxInstallerOutput).Trim()
+    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
+        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'wslpath', '-a', $bootstrapPath) `
+        -IgnoreStandardError
+    $linuxInstaller = ([string]($wslResult.Output | Select-Object -Last 1)).Trim()
     if ([string]::IsNullOrWhiteSpace($linuxInstaller)) { throw '无法创建内嵌的 WSL 安装流程。' }
 
     Write-Step '在 WSL 中配置国内镜像并安装 Docker Engine'
-    & wsl.exe --distribution $DistroName --user root -- bash $linuxInstaller prepare $linuxProject
-    if ($LASTEXITCODE -ne 0) { throw 'WSL 内的 Docker 安装或镜像配置失败。' }
+    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
+        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'bash', $linuxInstaller, 'prepare', $linuxProject) -DisplayOutput
+    if ($wslResult.ExitCode -ne 0) { throw 'WSL 内的 Docker 安装或镜像配置失败。' }
 
     Write-Step '重启 WSL，使 systemd 与 Docker 服务生效'
-    & wsl.exe --shutdown
+    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--shutdown') -DisplayOutput
+    if ($wslResult.ExitCode -ne 0) { throw 'WSL 重启失败。' }
     Start-Sleep -Seconds 3
 
     $hostAddresses = @('localhost', '127.0.0.1')
@@ -739,8 +790,9 @@ try {
     $allowedHosts = ($hostAddresses | Select-Object -Unique) -join ','
 
     Write-Step '生成安全配置、构建容器并启动应用'
-    & wsl.exe --distribution $DistroName --user root -- env "APP_ALLOWED_HOSTS=$allowedHosts" bash $linuxInstaller deploy $linuxProject
-    if ($LASTEXITCODE -ne 0) { throw 'Docker 容器部署失败。' }
+    $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
+        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'env', "APP_ALLOWED_HOSTS=$allowedHosts", 'bash', $linuxInstaller, 'deploy', $linuxProject) -DisplayOutput
+    if ($wslResult.ExitCode -ne 0) { throw 'Docker 容器部署失败。' }
 
     $envPath = Join-Path $resolvedProject '.env'
     if (Test-Path -LiteralPath $envPath) {
