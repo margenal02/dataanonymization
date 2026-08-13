@@ -283,6 +283,32 @@ function Write-Step([string]$Message) {
     Write-Host "`n==> $Message" -ForegroundColor Cyan
 }
 
+function Get-WindowsArchitecture($ComputerSystem, $OperatingSystem) {
+    $candidates = @(
+        $env:PROCESSOR_ARCHITEW6432,
+        $env:PROCESSOR_ARCHITECTURE,
+        $ComputerSystem.SystemType,
+        $OperatingSystem.OSArchitecture
+    )
+    foreach ($candidate in $candidates) {
+        $value = [string]$candidate
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        if ($value -match '(?i)(ARM64|ARM-based)') { return 'Arm64' }
+        if ($value -match '(?i)(AMD64|x64|x86-based PC)') { return 'X64' }
+    }
+    return 'Unknown'
+}
+
+function Get-ProjectDiskInfo([string]$ResolvedPath) {
+    $root = [IO.Path]::GetPathRoot($ResolvedPath)
+    if ([string]::IsNullOrWhiteSpace($root) -or $root.Length -lt 2) {
+        return $null
+    }
+    $deviceId = $root.Substring(0, 2)
+    return Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$deviceId'" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+}
+
 function Write-WslBootstrap([string]$TargetPath) {
     $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
     $linuxText = $WslBootstrap -replace "`r`n", "`n"
@@ -343,12 +369,14 @@ try {
     $os = Get-CimInstance Win32_OperatingSystem
     $computer = Get-CimInstance Win32_ComputerSystem
     $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    if (-not $os) { throw '无法读取 Win32_OperatingSystem 系统信息。请确认 WMI/CIM 服务正在运行。' }
+    if (-not $computer) { throw '无法读取 Win32_ComputerSystem 硬件信息。请确认 WMI/CIM 服务正在运行。' }
+    if (-not $cpu) { throw '无法读取 Win32_Processor 处理器信息。请确认 WMI/CIM 服务正在运行。' }
     $build = [int]$os.BuildNumber
     $memoryGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 1)
-    $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-    $projectDrive = Split-Path -Qualifier $resolvedProject
-    $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($projectDrive.TrimEnd('\'))'"
-    $diskFreeGB = if ($disk) { [math]::Round($disk.FreeSpace / 1GB, 1) } else { 0 }
+    $architecture = Get-WindowsArchitecture $computer $os
+    $disk = Get-ProjectDiskInfo $resolvedProject
+    $diskFreeGB = if ($disk -and $null -ne $disk.FreeSpace) { [math]::Round($disk.FreeSpace / 1GB, 1) } else { 0 }
     $virtualization = [bool]$computer.HypervisorPresent -or [bool]$cpu.VirtualizationFirmwareEnabled
     $portOwner = Get-NetTCPConnection -State Listen -LocalPort 5291 -ErrorAction SilentlyContinue | Select-Object -First 1
 
@@ -439,7 +467,9 @@ try {
     & wsl.exe --set-default-version 2
     if ($LASTEXITCODE -ne 0) { throw '无法把 WSL 默认版本设为 2。请先完成 Windows Update。' }
 
-    $installedDistros = @(& wsl.exe --list --quiet 2>$null | ForEach-Object { ($_ -replace "`0", '').Trim() } | Where-Object { $_ })
+    $installedDistros = @(& wsl.exe --list --quiet 2>$null | ForEach-Object {
+        ([string]($_ -replace "`0", '')).Trim()
+    } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($DistroName -notin $installedDistros) {
         & wsl.exe --install --distribution $DistroName --no-launch
         if ($LASTEXITCODE -ne 0) {
@@ -454,12 +484,14 @@ try {
     & wsl.exe --distribution $DistroName --user root -- bash -lc 'true'
     if ($LASTEXITCODE -ne 0) { throw "$DistroName 初始化失败。" }
 
-    $linuxProject = (& wsl.exe --distribution $DistroName --user root -- wslpath -a $resolvedProject | Select-Object -Last 1).Trim()
-    if (-not $linuxProject) { throw '无法把 Windows 项目目录转换为 WSL 路径。' }
+    $linuxProjectOutput = & wsl.exe --distribution $DistroName --user root -- wslpath -a $resolvedProject | Select-Object -Last 1
+    $linuxProject = ([string]$linuxProjectOutput).Trim()
+    if ([string]::IsNullOrWhiteSpace($linuxProject)) { throw '无法把 Windows 项目目录转换为 WSL 路径。' }
     $bootstrapPath = Join-Path $runtimeDirectory 'wsl-bootstrap.sh'
     Write-WslBootstrap $bootstrapPath
-    $linuxInstaller = (& wsl.exe --distribution $DistroName --user root -- wslpath -a $bootstrapPath | Select-Object -Last 1).Trim()
-    if (-not $linuxInstaller) { throw '无法创建内嵌的 WSL 安装流程。' }
+    $linuxInstallerOutput = & wsl.exe --distribution $DistroName --user root -- wslpath -a $bootstrapPath | Select-Object -Last 1
+    $linuxInstaller = ([string]$linuxInstallerOutput).Trim()
+    if ([string]::IsNullOrWhiteSpace($linuxInstaller)) { throw '无法创建内嵌的 WSL 安装流程。' }
 
     Write-Step '在 WSL 中配置国内镜像并安装 Docker Engine'
     & wsl.exe --distribution $DistroName --user root -- bash $linuxInstaller prepare $linuxProject
@@ -508,6 +540,12 @@ try {
 }
 catch {
     Write-Host "`n安装失败：$($_.Exception.Message)" -ForegroundColor Red
+    if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+        Write-Host "错误位置：$($_.InvocationInfo.PositionMessage)" -ForegroundColor Red
+    }
+    if ($_.ScriptStackTrace) {
+        Write-Host "调用栈：$($_.ScriptStackTrace)" -ForegroundColor DarkRed
+    }
     Write-Host "日志位置：$logPath" -ForegroundColor Yellow
     exit 1
 }
