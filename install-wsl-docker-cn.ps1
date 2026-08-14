@@ -1893,6 +1893,7 @@ try {
             Name = '清华大学 TUNA'; AptMirror = 'https://mirrors.tuna.tsinghua.edu.cn'
             DockerCeMirror = 'https://mirrors.tuna.tsinghua.edu.cn/docker-ce'
             PypiMirror = 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple'
+            AptProbe = 'https://mirrors.tuna.tsinghua.edu.cn/ubuntu/dists/noble/InRelease'
             DockerProbe = 'https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/ubuntu/gpg'
             PypiProbe = 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/django/'
         }
@@ -1900,6 +1901,7 @@ try {
             Name = '阿里云'; AptMirror = 'https://mirrors.aliyun.com'
             DockerCeMirror = 'https://mirrors.aliyun.com/docker-ce'
             PypiMirror = 'https://mirrors.aliyun.com/pypi/simple'
+            AptProbe = 'https://mirrors.aliyun.com/ubuntu/dists/noble/InRelease'
             DockerProbe = 'https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg'
             PypiProbe = 'https://mirrors.aliyun.com/pypi/simple/django/'
         }
@@ -1907,68 +1909,155 @@ try {
             Name = '中国科学技术大学 USTC'; AptMirror = 'https://mirrors.ustc.edu.cn'
             DockerCeMirror = 'https://mirrors.ustc.edu.cn/docker-ce'
             PypiMirror = 'https://mirrors.ustc.edu.cn/pypi/simple'
+            AptProbe = 'https://mirrors.ustc.edu.cn/ubuntu/dists/noble/InRelease'
             DockerProbe = 'https://mirrors.ustc.edu.cn/docker-ce/linux/ubuntu/gpg'
             PypiProbe = 'https://mirrors.ustc.edu.cn/pypi/simple/django/'
         }
+        [pscustomobject]@{
+            Name = '华为云'; AptMirror = 'https://mirrors.huaweicloud.com'
+            DockerCeMirror = 'https://mirrors.huaweicloud.com/docker-ce'
+            PypiMirror = 'https://mirrors.huaweicloud.com/repository/pypi/simple'
+            AptProbe = 'https://mirrors.huaweicloud.com/ubuntu/dists/noble/InRelease'
+            DockerProbe = 'https://mirrors.huaweicloud.com/docker-ce/linux/ubuntu/gpg'
+            PypiProbe = 'https://mirrors.huaweicloud.com/repository/pypi/simple/django/'
+        }
+        [pscustomobject]@{
+            Name = '腾讯云'; AptMirror = 'https://mirrors.cloud.tencent.com'
+            DockerCeMirror = 'https://mirrors.cloud.tencent.com/docker-ce'
+            PypiMirror = 'https://mirrors.cloud.tencent.com/pypi/simple'
+            AptProbe = 'https://mirrors.cloud.tencent.com/ubuntu/dists/noble/InRelease'
+            DockerProbe = 'https://mirrors.cloud.tencent.com/docker-ce/linux/ubuntu/gpg'
+            PypiProbe = 'https://mirrors.cloud.tencent.com/pypi/simple/django/'
+        }
+        [pscustomobject]@{
+            Name = '北京外国语大学 BFSU'; AptMirror = 'https://mirrors.bfsu.edu.cn'
+            DockerCeMirror = 'https://mirrors.bfsu.edu.cn/docker-ce'
+            PypiMirror = 'https://mirrors.bfsu.edu.cn/pypi/web/simple'
+            AptProbe = 'https://mirrors.bfsu.edu.cn/ubuntu/dists/noble/InRelease'
+            DockerProbe = 'https://mirrors.bfsu.edu.cn/docker-ce/linux/ubuntu/gpg'
+            PypiProbe = 'https://mirrors.bfsu.edu.cn/pypi/web/simple/django/'
+        }
+        [pscustomobject]@{
+            Name = '南京大学 NJU'; AptMirror = 'https://mirror.nju.edu.cn'
+            DockerCeMirror = 'https://mirror.nju.edu.cn/docker-ce'
+            PypiMirror = 'https://mirror.nju.edu.cn/pypi/web/simple'
+            AptProbe = 'https://mirror.nju.edu.cn/ubuntu/dists/noble/InRelease'
+            DockerProbe = 'https://mirror.nju.edu.cn/docker-ce/linux/ubuntu/gpg'
+            PypiProbe = 'https://mirror.nju.edu.cn/pypi/web/simple/django/'
+        }
     )
     $selectedPackageMirror = $null
+    $selectedPackageMirrorLatency = $null
+    $availablePackageMirrors = @()
     foreach ($candidate in $packageMirrorCandidates) {
         try {
             $candidateResult = Invoke-SystemProbeWithTimeout -Name "选择软件源：$($candidate.Name)" `
-                -StepNumber 8 -StepCount $probeStepCount -ProgressPercent 8 -TimeoutSeconds 14 `
-                -ArgumentList @([string]$candidate.DockerProbe, [string]$candidate.PypiProbe) `
+                -StepNumber 8 -StepCount $probeStepCount -ProgressPercent 8 -TimeoutSeconds 12 `
+                -ArgumentList @([string]$candidate.AptProbe, [string]$candidate.DockerProbe, `
+                    [string]$candidate.PypiProbe) `
                 -ScriptBlock {
-                    param($dockerProbe, $pypiProbe)
-                    $ProgressPreference = 'SilentlyContinue'
-                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                    foreach ($probeUrl in @($dockerProbe, $pypiProbe)) {
-                        try {
-                            $null = Invoke-WebRequest -UseBasicParsing -Method Head -Uri $probeUrl `
-                                -TimeoutSec 6 -ErrorAction Stop
-                        } catch {
-                            return $false
-                        }
+                    param($aptProbe, $dockerProbe, $pypiProbe)
+                    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+                    if (-not $curl) { return -1.0 }
+                    $totalSeconds = 0.0
+                    foreach ($probeUrl in @($aptProbe, $dockerProbe, $pypiProbe)) {
+                        $timingText = & $curl.Source --location --silent --fail --connect-timeout 4 `
+                            --max-time 7 --max-filesize 1048576 --range '0-1023' --output NUL `
+                            --write-out '%{time_total}' -- $probeUrl 2>$null
+                        if ($LASTEXITCODE -ne 0) { return -1.0 }
+                        $seconds = 0.0
+                        $parsed = [double]::TryParse(
+                            ([string]$timingText).Trim(),
+                            [Globalization.NumberStyles]::Float,
+                            [Globalization.CultureInfo]::InvariantCulture,
+                            [ref]$seconds
+                        )
+                        if (-not $parsed) { return -1.0 }
+                        $totalSeconds += $seconds
                     }
-                    return $true
+                    return $totalSeconds
                 }
-            if ([bool]($candidateResult | Select-Object -First 1)) {
-                $selectedPackageMirror = $candidate
-                break
+            $latency = [double]($candidateResult | Select-Object -First 1)
+            if ($latency -ge 0) {
+                $availablePackageMirrors += [pscustomobject]@{
+                    Candidate = $candidate
+                    LatencySeconds = $latency
+                }
+                Write-Host ("  可用：{0}，三项检测共 {1:N2} 秒" -f $candidate.Name, $latency) `
+                    -ForegroundColor DarkGreen
+                continue
             }
             Write-Warning "$($candidate.Name) 软件源不可访问，自动尝试下一个候选。"
         } catch {
-            Write-Warning "$($candidate.Name) 软件源检测超时，自动尝试下一个候选。"
+            Write-Warning "$($candidate.Name) 软件源检测失败或超时，自动尝试下一个候选。"
         }
+    }
+    if ($availablePackageMirrors.Count -gt 0) {
+        $fastestPackageMirror = $availablePackageMirrors |
+            Sort-Object LatencySeconds | Select-Object -First 1
+        $selectedPackageMirror = $fastestPackageMirror.Candidate
+        $selectedPackageMirrorLatency = [double]$fastestPackageMirror.LatencySeconds
     }
 
     $npmCandidates = @(
-        [pscustomobject]@{ Name = 'npmmirror'; Registry = 'https://registry.npmmirror.com'; Probe = 'https://registry.npmmirror.com/vue'; IsOfficialFallback = $false }
-        [pscustomobject]@{ Name = 'npm 官方源'; Registry = 'https://registry.npmjs.org'; Probe = 'https://registry.npmjs.org/vue'; IsOfficialFallback = $true }
+        [pscustomobject]@{ Name = 'npmmirror'; Registry = 'https://registry.npmmirror.com'; Probe = 'https://registry.npmmirror.com/-/ping'; IsOfficialFallback = $false }
+        [pscustomobject]@{ Name = '华为云 npm'; Registry = 'https://mirrors.huaweicloud.com/repository/npm/'; Probe = 'https://mirrors.huaweicloud.com/repository/npm/-/ping'; IsOfficialFallback = $false }
+        [pscustomobject]@{ Name = '腾讯云 npm'; Registry = 'https://mirrors.cloud.tencent.com/npm'; Probe = 'https://mirrors.cloud.tencent.com/npm/-/ping'; IsOfficialFallback = $false }
+        [pscustomobject]@{ Name = 'npm 官方源'; Registry = 'https://registry.npmjs.org'; Probe = 'https://registry.npmjs.org/-/ping'; IsOfficialFallback = $true }
     )
     $selectedNpmMirror = $null
+    $selectedNpmMirrorLatency = $null
+    $availableNpmMirrors = @()
     foreach ($candidate in $npmCandidates) {
         try {
             $candidateResult = Invoke-SystemProbeWithTimeout -Name "选择 npm 源：$($candidate.Name)" `
-                -StepNumber 9 -StepCount $probeStepCount -ProgressPercent 9 -TimeoutSeconds 10 `
+                -StepNumber 9 -StepCount $probeStepCount -ProgressPercent 9 -TimeoutSeconds 9 `
                 -ArgumentList @([string]$candidate.Probe) -ScriptBlock {
                     param($probeUrl)
-                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                    try {
-                        $null = Invoke-WebRequest -UseBasicParsing -Method Head -Uri $probeUrl `
-                            -TimeoutSec 6 -ErrorAction Stop
-                        return $true
-                    } catch {
-                        return $false
-                    }
+                    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+                    if (-not $curl) { return -1.0 }
+                    $timingText = & $curl.Source --location --silent --fail --connect-timeout 4 `
+                        --max-time 7 --max-filesize 1048576 --range '0-1023' --output NUL `
+                        --write-out '%{time_total}' -- $probeUrl 2>$null
+                    if ($LASTEXITCODE -ne 0) { return -1.0 }
+                    $seconds = 0.0
+                    $parsed = [double]::TryParse(
+                        ([string]$timingText).Trim(),
+                        [Globalization.NumberStyles]::Float,
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [ref]$seconds
+                    )
+                    if (-not $parsed) { return -1.0 }
+                    return $seconds
                 }
-            if ([bool]($candidateResult | Select-Object -First 1)) {
-                $selectedNpmMirror = $candidate
-                break
+            $latency = [double]($candidateResult | Select-Object -First 1)
+            if ($latency -ge 0) {
+                $availableNpmMirrors += [pscustomobject]@{
+                    Candidate = $candidate
+                    LatencySeconds = $latency
+                }
+                Write-Host ("  可用：{0}，检测用时 {1:N2} 秒" -f $candidate.Name, $latency) `
+                    -ForegroundColor DarkGreen
+                continue
             }
             Write-Warning "$($candidate.Name) 不可访问，自动尝试下一个候选。"
         } catch {
-            Write-Warning "$($candidate.Name) 检测超时，自动尝试下一个候选。"
+            Write-Warning "$($candidate.Name) 检测失败或超时，自动尝试下一个候选。"
         }
+    }
+    if ($availableNpmMirrors.Count -gt 0) {
+        $preferredNpmMirrors = @($availableNpmMirrors | Where-Object {
+                -not $_.Candidate.IsOfficialFallback
+            })
+        $npmSelectionPool = if ($preferredNpmMirrors.Count -gt 0) {
+            $preferredNpmMirrors
+        } else {
+            $availableNpmMirrors
+        }
+        $fastestNpmMirror = $npmSelectionPool |
+            Sort-Object LatencySeconds | Select-Object -First 1
+        $selectedNpmMirror = $fastestNpmMirror.Candidate
+        $selectedNpmMirrorLatency = [double]$fastestNpmMirror.LatencySeconds
     }
 
     $containerMirrorCandidates = @(
@@ -2039,8 +2128,12 @@ try {
     if ($memoryGB -lt $MinimumMemoryGB) { $blocking.Add("内存不足 $MinimumMemoryGB GB。") }
     if ($diskFreeGB -lt $MinimumDiskGB) { $blocking.Add("项目所在磁盘可用空间不足 $MinimumDiskGB GB。") }
     if (-not (Test-Path (Join-Path $resolvedProject 'docker-compose.yml'))) { $blocking.Add('项目目录缺少 docker-compose.yml。') }
-    if (-not $selectedPackageMirror) { $blocking.Add('清华、阿里云和 USTC 软件源均不可访问。') }
-    if (-not $selectedNpmMirror) { $blocking.Add('npmmirror 和 npm 官方源均不可访问。') }
+    if (-not $selectedPackageMirror) {
+        $blocking.Add("以下软件源均不可访问：$(($packageMirrorCandidates.Name) -join '、')。")
+    }
+    if (-not $selectedNpmMirror) {
+        $blocking.Add("以下 npm 源均不可访问：$(($npmCandidates.Name) -join '、')。")
+    }
     if (-not $selectedContainerMirror) { $blocking.Add('DaoCloud 和 Docker Hub 官方地址均不可访问。') }
 
     if ($memoryGB -lt $RecommendedMemoryGB -and $memoryGB -ge $MinimumMemoryGB) {
@@ -2052,9 +2145,13 @@ try {
     if ($portOwner) {
         Write-Warning "端口 5291 当前由 PID $($portOwner.OwningProcess) 监听；若不是本项目，部署会失败。"
     }
-    if ($selectedPackageMirror) { Write-Host "已选择软件源：$($selectedPackageMirror.Name)" -ForegroundColor Green }
+    if ($selectedPackageMirror) {
+        Write-Host ("已选择最快软件源：{0}（检测 {1:N2} 秒）" -f `
+                $selectedPackageMirror.Name, $selectedPackageMirrorLatency) -ForegroundColor Green
+    }
     if ($selectedNpmMirror) {
-        Write-Host "已选择 npm 源：$($selectedNpmMirror.Name)" -ForegroundColor Green
+        Write-Host ("已选择最快 npm 源：{0}（检测 {1:N2} 秒）" -f `
+                $selectedNpmMirror.Name, $selectedNpmMirrorLatency) -ForegroundColor Green
         if ($selectedNpmMirror.IsOfficialFallback) { Write-Warning '国内 npm 镜像不可用，本次将使用 npm 官方源。' }
     }
     if ($selectedContainerMirror) {
