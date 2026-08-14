@@ -279,6 +279,25 @@ class MappingBuilder:
         self.token_categories[token] = category
         return token
 
+    def register_detected(self, original, category):
+        """Register a model-detected span after conservative type validation."""
+        value = re.sub(r"\s+", " ", str(original or "")).strip(" ，,；;。.!！、/：:")
+        if category not in self.enabled or category not in DEFAULT_CATEGORIES:
+            return None
+        if category == "person":
+            compact = value.replace(" ", "")
+            if not 2 <= len(compact) <= 20 or compact in _PERSON_STOPWORDS:
+                return None
+            if not re.fullmatch(r"[\u4e00-\u9fff·A-Za-z]{2,20}", compact):
+                return None
+        elif category == "organization":
+            if not 2 <= len(value) <= 100:
+                return None
+        elif category == "address":
+            if not 4 <= len(value) <= 120:
+                return None
+        return self.register(value, category)
+
     def _pattern_candidates(self, text):
         candidates = []
         seen = set()

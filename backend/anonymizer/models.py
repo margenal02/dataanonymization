@@ -54,3 +54,51 @@ class AnonymizationTask(models.Model):
 
     def __str__(self):
         return f"{self.code} {self.task_name}"
+
+
+class RecognitionLabel(models.Model):
+    CATEGORY_CHOICES = [
+        ("organization", "单位"),
+        ("person", "人名"),
+        ("phone", "电话"),
+        ("id_card", "证件"),
+        ("email", "邮箱"),
+        ("address", "地址"),
+        ("custom", "敏感项"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    category = models.CharField(max_length=24, choices=CATEGORY_CHOICES)
+    text_ciphertext = models.TextField()
+    fingerprint = models.CharField(max_length=64)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["category", "created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["category", "fingerprint"], name="unique_recognition_label"),
+        ]
+        verbose_name = "本地识别标签"
+        verbose_name_plural = "本地识别标签"
+
+
+class TrainingExample(models.Model):
+    ACTION_CHOICES = [
+        ("created", "新增"),
+        ("updated", "修改"),
+        ("deleted", "停用"),
+        ("task_custom", "任务新增"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    label = models.ForeignKey(RecognitionLabel, null=True, blank=True, on_delete=models.SET_NULL)
+    action = models.CharField(max_length=24, choices=ACTION_CHOICES)
+    payload_ciphertext = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "模型训练样本"
+        verbose_name_plural = "模型训练样本"

@@ -24,7 +24,7 @@ services:
     build:
       context: ./backend
       args:
-        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.13-slim}
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
     restart: unless-stopped
@@ -40,6 +40,15 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-anonymizer-local-password}
       MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-50}
       DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-30}
+      UIE_ENABLED: ${UIE_ENABLED:-1}
+      UIE_MODEL: ${UIE_MODEL:-uie-micro}
+      UIE_MANAGER_URL: http://127.0.0.1:8765
+      UIE_POSITION_PROB: ${UIE_POSITION_PROB:-0.45}
+      UIE_BATCH_SIZE: ${UIE_BATCH_SIZE:-2}
+      UIE_MAX_SEQ_LEN: ${UIE_MAX_SEQ_LEN:-512}
+      UIE_MAX_TOTAL_CHARS: ${UIE_MAX_TOTAL_CHARS:-500000}
+      UIE_START_TIMEOUT_SECONDS: ${UIE_START_TIMEOUT_SECONDS:-180}
+      UIE_REQUEST_TIMEOUT_SECONDS: ${UIE_REQUEST_TIMEOUT_SECONDS:-600}
       TZ: Asia/Shanghai
     volumes:
       - media_data:/app/media

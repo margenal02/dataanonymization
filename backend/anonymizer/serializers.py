@@ -8,6 +8,8 @@ class TaskSerializer(serializers.ModelSerializer):
     anonymized_download_url = serializers.SerializerMethodField()
     restored_download_url = serializers.SerializerMethodField()
     stored_files = serializers.SerializerMethodField()
+    recognition_mode = serializers.SerializerMethodField()
+    uie_detected_count = serializers.SerializerMethodField()
 
     class Meta:
         model = AnonymizationTask
@@ -15,6 +17,7 @@ class TaskSerializer(serializers.ModelSerializer):
             "id", "code", "task_name", "original_name", "display_name", "file_type", "file_size", "status",
             "entity_counts", "error_message", "created_at", "updated_at",
             "anonymized_download_url", "restored_download_url", "stored_files",
+            "recognition_mode", "uie_detected_count",
         ]
 
     def _url(self, task, kind):
@@ -32,6 +35,12 @@ class TaskSerializer(serializers.ModelSerializer):
     def get_display_name(self, task):
         field = task.restored_file if task.status == task.Status.RESTORED else task.anonymized_file
         return field.name.rsplit("/", 1)[-1] if field else task.original_name
+
+    def get_recognition_mode(self, task):
+        return (task.options or {}).get("uie_mode", "rules_only")
+
+    def get_uie_detected_count(self, task):
+        return int((task.options or {}).get("uie_detected_count", 0))
 
     def get_stored_files(self, task):
         return {

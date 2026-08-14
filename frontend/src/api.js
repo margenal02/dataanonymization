@@ -19,11 +19,30 @@ async function request(path, options = {}) {
 export const api = {
   listTasks: () => request('/tasks/'),
   getStats: () => request('/stats/'),
-  anonymize(file, categories, customEntities) {
+  getModelRuntime: () => request('/model/runtime/'),
+  setModelRuntime: mode => request('/model/runtime/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode })
+  }),
+  listLabels: () => request('/labels/'),
+  createLabel: label => request('/labels/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(label)
+  }),
+  updateLabel: (labelId, label) => request(`/labels/${labelId}/`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(label)
+  }),
+  deleteLabel: labelId => request(`/labels/${labelId}/`, { method: 'DELETE' }),
+  anonymize(file, categories, customEntities, uieMode) {
     const form = new FormData()
     form.append('file', file)
     form.append('categories', JSON.stringify(categories))
     form.append('custom_entities', customEntities)
+    form.append('uie_mode', uieMode)
     return request('/tasks/', { method: 'POST', body: form })
   },
   restore(taskId, file) {
