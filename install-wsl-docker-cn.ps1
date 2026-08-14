@@ -2027,21 +2027,49 @@ function Start-ElevatedCopy {
 function Set-ResumeAfterRestart {
     $command = "powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -DistroName `"$DistroName`" -ProjectPath `"$ProjectPath`" -WslDownloadChannel $WslDownloadChannel -WslNoProgressTimeoutSeconds $WslNoProgressTimeoutSeconds -ResumeAfterRestart"
     if ($AutoReboot) { $command += ' -AutoReboot' }
-    New-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' `
-        -Name $ResumeName -Value $command -PropertyType String -Force | Out-Null
+    $resumeLocations = @(
+        @{ Path = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce'; Scope = '系统级' },
+        @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'; Scope = '当前用户级' }
+    )
+    foreach ($location in $resumeLocations) {
+        try {
+            New-ItemProperty -Path $location.Path -Name $ResumeName -Value $command `
+                -PropertyType String -Force -ErrorAction Stop | Out-Null
+            Write-Host "已登记$($location.Scope)重启续跑项。" -ForegroundColor Green
+            return $true
+        } catch {
+            Write-Warning "$($location.Scope)重启续跑项登记失败：$($_.Exception.Message)"
+        }
+    }
+    Write-Warning '系统策略禁止登记自动续跑；这不会影响已经启用的 WSL2 功能。'
+    return $false
 }
 
 function Clear-ResumeAfterRestart {
-    Remove-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' `
-        -Name $ResumeName -ErrorAction SilentlyContinue
+    foreach ($resumePath in @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce',
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+    )) {
+        try {
+            Remove-ItemProperty -Path $resumePath -Name $ResumeName -ErrorAction SilentlyContinue
+        } catch {
+            Write-Warning "无法清理重启续跑项 $resumePath；可忽略，不影响应用运行。"
+        }
+    }
 }
 
 function Stop-ForRestart {
-    Set-ResumeAfterRestart
-    Write-Warning 'WSL2 系统组件已启用，需要重启 Windows。登录后安装脚本会自动继续。'
+    $resumeRegistered = Set-ResumeAfterRestart
+    if ($resumeRegistered) {
+        Write-Warning 'WSL2 系统组件已启用，需要重启 Windows。登录后安装脚本会自动继续。'
+    } else {
+        Write-Warning 'WSL2 系统组件已启用，需要重启 Windows。重启后请在项目目录重新运行本脚本；已完成步骤会自动跳过。'
+    }
     if ($AutoReboot) {
         Write-Warning '15 秒后自动重启。若要取消，请立即运行：shutdown /a'
         shutdown.exe /r /t 15 /c '继续安装数据脱敏应用所需的 WSL2'
+    } elseif (-not $resumeRegistered) {
+        Write-Host '请保存工作并手动重启 Windows；重启后以管理员身份重新运行 .\install-wsl-docker-cn.ps1。' -ForegroundColor Yellow
     } else {
         Write-Host '请保存工作并手动重启 Windows；下次登录时脚本会自动续跑。' -ForegroundColor Yellow
     }
