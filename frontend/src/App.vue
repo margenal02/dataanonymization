@@ -304,7 +304,7 @@ onMounted(refreshData)
               <p>{{ result.code }} · {{ result.task_name }}</p>
               <div v-if="result.status !== 'restored'" class="entity-tags">
                 <span v-for="(count, label) in result.entity_counts" :key="label">{{ label }} {{ count }}</span>
-                <span v-if="!Object.keys(result.entity_counts || {}).length">未发现自动识别项</span>
+                <span v-if="!Object.keys(result.entity_counts || {}).length">未发现自动识别项，请确认文件不是扫描图片，或补充“指定敏感词”</span>
               </div>
             </div>
             <button class="btn download-btn" @click="openDownload(result.status === 'restored' ? result.restored_download_url : result.anonymized_download_url)">

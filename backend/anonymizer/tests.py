@@ -10,6 +10,8 @@ import xlwt
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from docx import Document
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
@@ -30,6 +32,54 @@ class MappingBuilderTests(TestCase):
         self.assertNotIn("13800138000", anonymized)
         self.assertIn("【单位_ABCD_001】", anonymized)
         self.assertEqual(restore_text(anonymized, builder.export()), source)
+
+    def test_detects_entities_in_real_tobacco_document_language(self):
+        source = (
+            "云南中烟工业有限责任公司与红云红河烟草（集团）有限责任公司签订采购合同，"
+            "项目负责人王建国，李娜负责复核，送货至云南省昆明市五华区红锦路123号，"
+            "联系电话0871-63568888。"
+        )
+        builder = MappingBuilder("real1234")
+        anonymized = builder.anonymize(source)
+
+        for sensitive_value in (
+            "云南中烟工业有限责任公司",
+            "红云红河烟草（集团）有限责任公司",
+            "王建国",
+            "李娜",
+            "云南省昆明市五华区红锦路123号",
+            "0871-63568888",
+        ):
+            self.assertNotIn(sensitive_value, anonymized)
+        self.assertEqual(builder.counts(), {"单位": 2, "人名": 2, "地址": 1, "电话": 1})
+        self.assertEqual(restore_text(anonymized, builder.export()), source)
+
+    def test_detects_names_on_standalone_table_like_lines_and_name_lists(self):
+        source = "人员名单：张三、李四、王五\n\n欧阳娜\n部门：财务部"
+        builder = MappingBuilder("table123")
+        anonymized = builder.anonymize(source)
+
+        for sensitive_value in ("张三", "李四", "王五", "欧阳娜", "财务部"):
+            self.assertNotIn(sensitive_value, anonymized)
+        self.assertEqual(builder.counts(), {"人名": 4, "单位": 1})
+        self.assertEqual(restore_text(anonymized, builder.export()), source)
+
+    def test_detects_pdf_style_spaces_inside_entities(self):
+        source = "单 位：中 国 烟 草 总 公 司\n联 系 人：张 三\n138 0013 8000"
+        builder = MappingBuilder("space123")
+        anonymized = builder.anonymize(source)
+
+        self.assertNotIn("中 国 烟 草 总 公 司", anonymized)
+        self.assertNotIn("张 三", anonymized)
+        self.assertNotIn("138 0013 8000", anonymized)
+        self.assertEqual(builder.counts(), {"单位": 1, "人名": 1, "电话": 1})
+        self.assertEqual(restore_text(anonymized, builder.export()), source)
+
+    def test_does_not_treat_common_status_words_as_people(self):
+        source = "审核状态：合格\n审批意见：同意\n项目\n方案\n申请\n费用\n单价\n说明\n文件\n安全\n管理"
+        builder = MappingBuilder("safe1234", ["person"])
+        self.assertEqual(builder.anonymize(source), source)
+        self.assertEqual(builder.counts(), {})
 
 
 class FileProcessorTests(TestCase):
@@ -65,6 +115,29 @@ class FileProcessorTests(TestCase):
         self.assertNotIn("张三", "\n".join(p.text for p in Document(anonymized).paragraphs))
         self.assertIn("张三", "\n".join(p.text for p in Document(restored).paragraphs))
 
+    def test_docx_text_box_content_is_processed(self):
+        source = self.directory / "textbox.docx"
+        document = Document()
+        text_box = parse_xml(
+            f'<w:txbxContent {nsdecls("w")}>'
+            '<w:p><w:r><w:t>项目负责人王建国，单位：中国烟草总公司</w:t></w:r></w:p>'
+            '</w:txbxContent>'
+        )
+        document._element.body.append(text_box)
+        document.save(source)
+
+        anonymized, restored = self._roundtrip(source, ".docx")
+        anonymized_text = "".join(
+            node.text or "" for node in Document(anonymized)._element.xpath(".//w:txbxContent//w:t")
+        )
+        restored_text = "".join(
+            node.text or "" for node in Document(restored)._element.xpath(".//w:txbxContent//w:t")
+        )
+        self.assertNotIn("王建国", anonymized_text)
+        self.assertNotIn("中国烟草总公司", anonymized_text)
+        self.assertIn("王建国", restored_text)
+        self.assertIn("中国烟草总公司", restored_text)
+
     def test_xls_roundtrip(self):
         source = self.directory / "sample.xls"
         book = xlwt.Workbook()
@@ -84,6 +157,26 @@ class FileProcessorTests(TestCase):
             self.assertNotIn("张三", archive.read("OFD.xml").decode())
         with zipfile.ZipFile(restored) as archive:
             self.assertIn("张三", archive.read("OFD.xml").decode())
+
+    def test_ofd_split_text_code_nodes_are_processed(self):
+        source = self.directory / "split-text.ofd"
+        xml = (
+            "<ofd:OFD xmlns:ofd='urn:ofd:test'><!-- vendor comment --><ofd:TextObject>"
+            "<ofd:TextCode>联</ofd:TextCode><ofd:TextCode>系人：</ofd:TextCode>"
+            "<ofd:TextCode>张</ofd:TextCode><ofd:TextCode>三</ofd:TextCode>"
+            "</ofd:TextObject></ofd:OFD>"
+        )
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("OFD.xml", xml)
+
+        anonymized, restored = self._roundtrip(source, ".ofd")
+        with zipfile.ZipFile(anonymized) as archive:
+            anonymized_xml = archive.read("OFD.xml").decode()
+        with zipfile.ZipFile(restored) as archive:
+            restored_xml = archive.read("OFD.xml").decode()
+        self.assertNotIn("张三", anonymized_xml)
+        self.assertIn("【人名_1234_001】", anonymized_xml)
+        self.assertIn("张三", restored_xml)
 
     def test_pdf_roundtrip(self):
         source = self.directory / "sample.pdf"
@@ -132,6 +225,26 @@ class TaskApiTests(TestCase):
         self.assertIn("中国烟草总公司", restored)
         self.assertIn("张三", restored)
         self.assertIn("AI补充内容", restored)
+
+    def test_api_returns_counts_for_realistic_unlabeled_content(self):
+        source = (
+            "云南中烟工业有限责任公司与红云红河烟草（集团）有限责任公司签订合同，"
+            "项目负责人王建国，李娜负责复核，联系电话0871-63568888。"
+        )
+        upload = SimpleUploadedFile("真实公文语句.txt", source.encode("utf-8"), content_type="text/plain")
+        response = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["organization", "person", "phone"]),
+            "custom_entities": "",
+        })
+
+        self.assertEqual(response.status_code, 201, response.content)
+        task = response.json()
+        self.assertEqual(task["entity_counts"], {"单位": 2, "人名": 2, "电话": 1})
+        download = self.client.get(task["anonymized_download_url"])
+        anonymized = b"".join(download.streaming_content).decode("utf-8")
+        for sensitive_value in ("云南中烟工业有限责任公司", "红云红河烟草（集团）有限责任公司", "王建国", "李娜"):
+            self.assertNotIn(sensitive_value, anonymized)
 
     def test_delete_requires_confirmation_and_removes_files(self):
         upload = SimpleUploadedFile("采购方案_匿名.txt", "联系人：张三".encode("utf-8"), content_type="text/plain")
