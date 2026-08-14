@@ -14,7 +14,7 @@
 | 网络 | 能访问 Microsoft WSL 服务及所配置国内镜像 | 稳定宽带 |
 | 端口 | TCP 5291 未被其他程序占用 | 仅向可信内网开放 |
 
-Windows 10 家庭版、专业版、企业版和教育版只要达到上述版本并支持 WSL2，均可使用。WSL 本身是 Windows 签名系统组件，仍从 Microsoft 官方服务安装；Ubuntu APT、Docker CE 和 PyPI 会在清华、阿里云与 USTC 之间选择，npm 和应用基础容器则优先使用中国大陆镜像，国内候选不可用时再尝试对应官方源。
+Windows 10 家庭版、专业版、企业版和教育版只要达到上述版本并支持 WSL2，均可使用。WSL 本身是 Windows 签名系统组件，仍从 Microsoft 官方服务安装；Ubuntu APT、Docker CE 和 PyPI 会在清华、阿里云、USTC、华为云、腾讯云、北外 BFSU 与南京大学 NJU 之间实测并选择最快可用源。npm 会在 npmmirror、华为云和腾讯云中选择最快候选，国内候选全部不可用时再回退官方源；应用基础容器也优先使用中国大陆镜像。
 
 脚本默认部署 Ubuntu 24.04、Python 3.13、Django 5.2、MySQL 8.4、Node.js 22 和 Nginx 1.27。组件兼容范围如下：
 
@@ -99,8 +99,8 @@ Web 直连的进度由 HTTP 响应中的总大小和实际写入磁盘的字节�
 
 | 依赖 | 自动选择顺序 |
 |---|---|
-| Ubuntu APT、Docker CE、Python / Django | 清华大学 TUNA → 阿里云 → USTC |
-| npm 包 | npmmirror → npm 官方源 |
+| Ubuntu APT、Docker CE、Python / Django | 清华大学 TUNA、阿里云、USTC、华为云、腾讯云、北外 BFSU、南京大学 NJU：用 `curl.exe` 小流量实测，选择最快可用源 |
+| npm 包 | npmmirror、华为云、腾讯云：选择最快可用国内源；全部不可用时回退 npm 官方源 |
 | Python、MySQL、Node、Nginx 容器 | DaoCloud 公共镜像代理 → Docker Hub 官方地址 |
 | Docker Hub 加速 | 选择 DaoCloud 时启用；回退官方地址时不写入无效加速项 |
 
@@ -173,7 +173,7 @@ docker compose up -d --build      # 更新并重建
 
 ### 国内 Docker 镜像不可用
 
-最新版脚本会自动尝试清华、阿里云、USTC、npmmirror、DaoCloud 以及必要的官方回退地址。只有同一类别的所有候选均不可用时才停止。此时可编辑 `.env`，把 `MYSQL_IMAGE`、`PYTHON_IMAGE`、`NODE_IMAGE`、`NGINX_IMAGE` 改为可用的组织内部镜像或官方镜像，然后重新执行：
+最新版脚本会自动尝试清华、阿里云、USTC、华为云、腾讯云、北外 BFSU、南京大学 NJU、npmmirror、DaoCloud 以及必要的官方回退地址。软件包和 npm 检测使用 Windows 自带 `curl.exe`，会记录每个可用候选的响应时间并选择最快者；只有同一类别的所有候选均不可用时才停止。此时可编辑 `.env`，把 `MYSQL_IMAGE`、`PYTHON_IMAGE`、`NODE_IMAGE`、`NGINX_IMAGE` 改为可用的组织内部镜像或官方镜像，然后重新执行：
 
 ```powershell
 .\install-wsl-docker-cn.ps1
@@ -214,3 +214,9 @@ Get-NetTCPConnection -LocalPort 5291 -State Listen
 - [阿里云：PyPI 镜像](https://developer.aliyun.com/mirror/pypi)
 - [中国科学技术大学 USTC：Docker CE 镜像](https://mirrors.ustc.edu.cn/help/docker-ce.html)
 - [中国科学技术大学 USTC：PyPI 镜像](https://mirrors.ustc.edu.cn/help/pypi.html)
+- [华为云开源镜像站](https://mirrors.huaweicloud.com/)
+- [腾讯云软件源](https://mirrors.cloud.tencent.com/)
+- [北京外国语大学 BFSU：Ubuntu 镜像](https://mirrors.bfsu.edu.cn/help/ubuntu/)
+- [北京外国语大学 BFSU：Docker CE 镜像](https://mirrors.bfsu.edu.cn/help/docker-ce/)
+- [北京外国语大学 BFSU：PyPI 镜像](https://mirrors.bfsu.edu.cn/help/pypi/)
+- [南京大学开源镜像站](https://mirror.nju.edu.cn/)
