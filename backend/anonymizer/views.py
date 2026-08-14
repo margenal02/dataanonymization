@@ -25,9 +25,16 @@ def _safe_name(name):
     return re.sub(r"[\\/:*?\"<>|]", "_", clean)
 
 
-def _output_name(original, suffix):
+def _output_name(original, suffix, stem=None):
     path = Path(original)
-    return f"{path.stem}_{suffix}{path.suffix.lower()}"
+    output_stem = path.stem if stem is None else stem
+    output_stem = re.sub(
+        r"(?:[\s_-]*(?:已脱敏|脱敏|匿名|AI处理稿|AI处理|正式版))+$",
+        "",
+        output_stem,
+        flags=re.I,
+    ).strip(" _-")
+    return f"{output_stem or '数据文件'}_{suffix}{path.suffix.lower()}"
 
 
 def _task_name(filename):
@@ -120,13 +127,15 @@ def task_collection(request):
 
     try:
         builder = MappingBuilder(str(task.id), categories, custom)
-        output_name = _output_name(original_name, "已脱敏")
+        anonymized_stem = builder.anonymize_filename_stem(Path(original_name).stem)
+        output_name = _output_name(original_name, "已脱敏", anonymized_stem)
         output_path = Path(settings.MEDIA_ROOT) / "processing" / str(task.id) / output_name
         process_file(task.input_file.path, output_path, builder.anonymize)
         with output_path.open("rb") as handle:
             task.anonymized_file.save(output_name, File(handle), save=False)
         task.mapping_ciphertext = encrypt_mapping(builder.export())
         task.entity_counts = builder.counts()
+        task.task_name = _task_name(anonymized_stem)
         task.status = AnonymizationTask.Status.COMPLETED
         task.save()
         output_path.unlink(missing_ok=True)
@@ -167,7 +176,8 @@ def restore_task(request, task_id):
     task.restore_input_file.save(upload_name, upload, save=True)
     try:
         mapping = decrypt_mapping(task.mapping_ciphertext)
-        output_name = _output_name(upload_name, "正式版")
+        restored_upload_name = restore_text(upload_name, mapping)
+        output_name = _output_name(restored_upload_name, "正式版")
         output_path = Path(settings.MEDIA_ROOT) / "processing" / str(task.id) / output_name
         process_file(task.restore_input_file.path, output_path, lambda text: restore_text(text, mapping))
         if task.restored_file:
@@ -191,7 +201,7 @@ def download_task(request, task_id, kind):
     task = get_object_or_404(AnonymizationTask, id=task_id)
     if kind == "anonymized":
         field = task.anonymized_file
-        filename = _output_name(task.original_name, "已脱敏")
+        filename = Path(field.name).name if field else ""
     elif kind == "restored":
         field = task.restored_file
         filename = Path(field.name).name if field else ""

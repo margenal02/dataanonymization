@@ -326,7 +326,7 @@ onMounted(refreshData)
                 <thead><tr><th>任务 / 文件</th><th>格式</th><th>敏感项</th><th>状态</th><th>处理时间</th><th class="text-end">操作</th></tr></thead>
                 <tbody>
                   <tr v-for="task in tasks" :key="task.id">
-                    <td><strong>{{ task.task_name }}</strong><small>{{ task.code }} · {{ task.original_name }} · {{ formatBytes(task.file_size) }}</small></td>
+                    <td><strong>{{ task.task_name }}</strong><small>{{ task.code }} · {{ task.display_name || task.original_name }} · {{ formatBytes(task.file_size) }}</small></td>
                     <td><span class="file-type">{{ task.file_type.toUpperCase() }}</span></td>
                     <td>{{ Object.values(task.entity_counts || {}).reduce((a, b) => a + b, 0) }} 项</td>
                     <td><span class="status-pill" :class="statusMeta(task.status)[1]"><i></i>{{ statusMeta(task.status)[0] }}</span></td>

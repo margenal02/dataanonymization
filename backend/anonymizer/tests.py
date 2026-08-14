@@ -64,6 +64,30 @@ class MappingBuilderTests(TestCase):
         self.assertEqual(builder.counts(), {"人名": 4, "单位": 1})
         self.assertEqual(restore_text(anonymized, builder.export()), source)
 
+    def test_detects_group_leader_and_member_names_without_masking_role_phrases(self):
+        source = (
+            "组长：潘富昆。负责整个技能竞赛的宏观指导与活动协调。\n"
+            "成员：赵英桥、李作英。负责跟进各项活动的具体实施。\n"
+            "参加活动人员：厂领导、【单位_FCA2_002】及生产加工车间参赛人员。"
+        )
+        builder = MappingBuilder("fca2002", ["person"])
+        anonymized = builder.anonymize(source)
+
+        for sensitive_value in ("潘富昆", "赵英桥", "李作英"):
+            self.assertNotIn(sensitive_value, anonymized)
+        self.assertIn("厂领导", anonymized)
+        self.assertIn("生产加工车间参赛人员", anonymized)
+        self.assertEqual(builder.counts(), {"人名": 3})
+        self.assertEqual(restore_text(anonymized, builder.export()), source)
+
+    def test_anonymizes_person_in_filename_stem_and_restores_with_same_mapping(self):
+        builder = MappingBuilder("file1234", ["person"])
+        anonymized_stem = builder.anonymize_filename_stem("潘富昆技能竞赛活动方案")
+
+        self.assertNotIn("潘富昆", anonymized_stem)
+        self.assertIn("ANON_人名_FILE_001", anonymized_stem)
+        self.assertEqual(restore_text(anonymized_stem, builder.export()), "潘富昆技能竞赛活动方案")
+
     def test_detects_pdf_style_spaces_inside_entities(self):
         source = "单 位：中 国 烟 草 总 公 司\n联 系 人：张 三\n138 0013 8000"
         builder = MappingBuilder("space123")
@@ -245,6 +269,39 @@ class TaskApiTests(TestCase):
         anonymized = b"".join(download.streaming_content).decode("utf-8")
         for sensitive_value in ("云南中烟工业有限责任公司", "红云红河烟草（集团）有限责任公司", "王建国", "李娜"):
             self.assertNotIn(sensitive_value, anonymized)
+
+    def test_anonymizes_download_filename_and_restores_formal_filename(self):
+        source = "组长：潘富昆。\n成员：赵英桥、李作英。"
+        upload = SimpleUploadedFile(
+            "潘富昆技能竞赛活动方案.txt",
+            source.encode("utf-8"),
+            content_type="text/plain",
+        )
+        response = self.client.post(
+            "/api/tasks/",
+            {"file": upload, "categories": json.dumps(["person"]), "custom_entities": ""},
+        )
+
+        self.assertEqual(response.status_code, 201, response.content)
+        task_data = response.json()
+        task = AnonymizationTask.objects.get(id=task_data["id"])
+        anonymized_name = Path(task.anonymized_file.name).name
+        self.assertNotIn("潘富昆", anonymized_name)
+        self.assertIn("ANON_人名_", anonymized_name)
+        self.assertEqual(task_data["display_name"], anonymized_name)
+        self.assertNotIn("潘富昆", task_data["task_name"])
+
+        download = self.client.get(task_data["anonymized_download_url"])
+        anonymized_content = b"".join(download.streaming_content)
+        self.assertNotIn("潘富昆", download.headers["Content-Disposition"])
+
+        restore_upload = SimpleUploadedFile(anonymized_name, anonymized_content, content_type="text/plain")
+        response = self.client.post(f"/api/tasks/{task.id}/restore/", {"file": restore_upload})
+        self.assertEqual(response.status_code, 200, response.content)
+        task.refresh_from_db()
+        restored_name = Path(task.restored_file.name).name
+        self.assertEqual(restored_name, "潘富昆技能竞赛活动方案_正式版.txt")
+        self.assertEqual(response.json()["display_name"], restored_name)
 
     def test_delete_requires_confirmation_and_removes_files(self):
         upload = SimpleUploadedFile("采购方案_匿名.txt", "联系人：张三".encode("utf-8"), content_type="text/plain")

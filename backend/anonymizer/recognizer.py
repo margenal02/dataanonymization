@@ -48,7 +48,25 @@ _PERSON_STOPWORDS = {
     "合同", "采购", "招标", "中标", "烟草", "公司", "地址", "手机", "电话", "邮箱",
     "传真", "附件", "正文", "标题", "序号", "说明", "管理", "支持", "记录", "文件",
     "网络", "系统", "环境", "安全", "处理", "完成",
+    "组长", "副组长", "组员", "成员", "主任", "副主任", "经理", "副经理",
+    "部长", "副部长", "科长", "副科长", "处长", "副处长", "书记", "副书记",
+    "领队", "教练", "裁判", "评委", "专家", "讲师", "主持人", "记录人",
+    "工作人员", "参赛人员", "活动人员", "厂领导", "车间主任",
 }
+
+_PERSON_ROLE = (
+    r"项目负责人|法定代表人|联系人|经办人|负责人|审核人|审批人|复核人|申请人|"
+    r"填报人|制表人|签字人|承办人|主办人|验收人|组长|副组长|主任|副主任|"
+    r"经理|副经理|部长|副部长|科长|副科长|处长|副处长|书记|副书记|领队|"
+    r"教练|裁判|评委|专家|讲师|培训师|主持人|记录人|监考人|监督员|安全员|姓名"
+)
+
+_PERSON_LIST_LABEL = (
+    r"参加活动人员|活动人员|参与人员|参加人员|参赛人员|培训人员|工作人员|"
+    r"参会人员|人员名单|人员名册|联系人名单|经办人员|审核人员|审批人员|"
+    r"项目成员|工作组成员|领导小组成员|筹备小组成员|小组成员|成员|组员|"
+    r"评审专家|专家名单|评委名单"
+)
 
 _ORG_SUFFIX = (
     r"烟草专卖局|烟草公司|卷烟厂|烟叶复烤厂|复烤厂|有限责任公司|股份有限公司|"
@@ -91,8 +109,7 @@ PATTERNS = {
     ],
     "person": [
         re.compile(
-            rf"(?:项目负责人|法定代表人|联系人|经办人|负责人|审核人|审批人|复核人|"
-            rf"申请人|填报人|制表人|签字人|姓名)\s*(?:[：:]|为|是)?\s*({_PERSON_NAME})"
+            rf"(?:{_PERSON_ROLE})\s*(?:[：:]|为|是)?\s*({_PERSON_NAME})"
             rf"(?=[ \t]*(?:[\r\n，,；;。.!！、/（）()]|$|电话|手机|负责|经办|审核|审批|复核|签字|填报))"
         ),
         re.compile(
@@ -129,12 +146,26 @@ PATTERNS = {
     ],
 }
 
-_PERSON_LIST = re.compile(
-    r"(?:参会人员|人员名单|项目成员|联系人名单|经办人员|审核人员|审批人员)\s*[：:]\s*([^\n\r；;。]{2,120})"
-)
-_PERSON_NAME_RE = re.compile(_PERSON_NAME)
+_PERSON_LIST = re.compile(rf"(?:{_PERSON_LIST_LABEL})\s*[：:]\s*([^\n\r；;。]{{2,120}})")
 _PERSON_WHOLE_RE = re.compile(rf"^{_PERSON_NAME}$")
 _PERSON_LINE_RE = re.compile(rf"(?m)^[ \t]*({_PERSON_NAME})[ \t]*$")
+_PERSON_LIST_ITEM_RE = re.compile(
+    rf"^({_PERSON_NAME})(?:同志)?(?:[（(][^）)]{{1,20}}[）)])?(?:等\d*人)?$"
+)
+_FILENAME_PERSON_BOUNDARY_RE = re.compile(
+    rf"(?:^|[_\-—\s、，,；;（）()【】])({_PERSON_NAME})"
+    rf"(?=$|[_\-—\s、，,；;（）()【】]|同志)"
+)
+_FILENAME_DOCUMENT_WORDS = (
+    r"(?:(?:个人|员工|职工|干部|岗位|年度|先进|优秀|获奖|培训|技能|劳动|活动|工作|项目|"
+    r"竞赛|考核|任免|述职|履职|参赛|评选|报名|签到|成绩|事迹|信息)*)"
+    r"(?:名单|名册|简历|履历|档案|方案|总结|报告|材料|通知|发言稿|申请表|审批表|"
+    r"登记表|信息表|考核表|签到表|评分表|成绩表|合同|协议)"
+)
+_FILENAME_PERSON_TITLE_RE = re.compile(
+    rf"(?:^|关于|表彰|推荐|任命|聘任|选派|申报|[_\-—\s、，,；;（）()【】])"
+    rf"({_PERSON_NAME})(?:同志)?(?={_FILENAME_DOCUMENT_WORDS}(?:$|[_\-—\s、，,；;（）()【】]))"
+)
 _ORG_LEADING_NOISE = re.compile(
     r"^(?:(?:本项目|该项目|本合同|该合同|项目|合同|协议|我司|本公司|本单位|贵公司)?"
     r"(?:由|与|同|向|为|在|经|委托|交由)|"
@@ -208,6 +239,17 @@ def _is_likely_person_name(value):
     return not re.search(r"(?:公司|集团|中心|单位|部门|项目|系统|地址|电话|人员)$", compact)
 
 
+def _person_names_from_list(value):
+    """Return complete list items only, avoiding role phrases that merely contain a surname."""
+    for item in re.split(r"[、,，；;/\s]+|(?:以及|和|及)", value):
+        item = item.strip(" ：:。.!！")
+        if not item:
+            continue
+        match = _PERSON_LIST_ITEM_RE.fullmatch(item)
+        if match and _is_likely_person_name(match.group(1)):
+            yield match.group(1)
+
+
 class MappingBuilder:
     def __init__(self, task_salt, enabled_categories=None, custom_entities=None):
         self.task_salt = task_salt.upper()[:4]
@@ -267,9 +309,10 @@ class MappingBuilder:
 
             if "person" in self.enabled:
                 for list_match in _PERSON_LIST.finditer(view):
-                    for name_match in _PERSON_NAME_RE.finditer(list_match.group(1)):
-                        start_in_view = list_match.start(1) + name_match.start()
-                        end_in_view = list_match.start(1) + name_match.end()
+                    for name in _person_names_from_list(list_match.group(1)):
+                        name_start = list_match.group(1).find(name)
+                        start_in_view = list_match.start(1) + name_start
+                        end_in_view = start_in_view + len(name)
                         span = _source_span(text, indexes, start_in_view, end_in_view)
                         if span and _is_likely_person_name(span[2]):
                             key = (span[0], span[1], "person", span[2])
@@ -315,6 +358,27 @@ class MappingBuilder:
         result = text
         for original in sorted(self.original_to_token, key=len, reverse=True):
             result = result.replace(original, self.original_to_token[original])
+        return result
+
+    def anonymize_filename_stem(self, stem):
+        """Anonymize a filename stem while reusing the document's reversible mapping."""
+        if not stem:
+            return stem
+        self.discover(stem)
+        if "person" in self.enabled:
+            for pattern in (_FILENAME_PERSON_BOUNDARY_RE, _FILENAME_PERSON_TITLE_RE):
+                for match in pattern.finditer(stem):
+                    value = match.group(1)
+                    if _is_likely_person_name(value):
+                        self.register(value, "person")
+        result = stem
+        for original in sorted(self.original_to_token, key=len, reverse=True):
+            content_token = self.original_to_token[original]
+            filename_token = f"ANON_{content_token[1:-1]}"
+            result = result.replace(original, filename_token)
+            if filename_token in result:
+                self.token_to_original[filename_token] = original
+                self.token_categories[filename_token] = self.token_categories[content_token]
         return result
 
     def export(self):
