@@ -32,6 +32,7 @@ $MaximumDockerVersion = '30.0'
 $MinimumComposeVersion = '2.20'
 $MaximumComposeVersion = '6.0'
 $ResumeName = 'DataAnonymizationWslInstaller'
+$KeepAliveTaskName = 'DataAnonymizationWslKeepAlive'
 $WslBootstrap = @'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -668,6 +669,110 @@ function ConvertTo-NativeArgument([AllowEmptyString()][string]$Value) {
     $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
     $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
     return '"' + $escaped + '"'
+}
+
+function ConvertTo-BashSingleQuotedArgument([AllowEmptyString()][string]$Value) {
+    if ($null -eq $Value) { $Value = '' }
+    return "'" + $Value.Replace("'", "'`"'`"'") + "'"
+}
+
+function Register-WslKeepAliveTask {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Distribution,
+        [Parameter(Mandatory = $true)]
+        [string]$LinuxProjectPath
+    )
+
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if ([string]::IsNullOrWhiteSpace($currentIdentity)) {
+        throw '无法识别当前 Windows 登录账号，不能创建 WSL 常驻任务。'
+    }
+
+    $linuxProjectArgument = ConvertTo-BashSingleQuotedArgument $LinuxProjectPath
+    $keepAliveCommand = "set -Eeuo pipefail; systemctl start docker; cd $linuxProjectArgument; docker compose up -d; exec /bin/sleep infinity"
+    $taskArguments = (@(
+        '--distribution', $Distribution,
+        '--user', 'root',
+        '--', 'bash', '-lc', $keepAliveCommand
+    ) | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' '
+
+    $existingTask = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+    if ($existingTask) {
+        Stop-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $KeepAliveTaskName -Confirm:$false -ErrorAction Stop
+    }
+
+    $wslExecutable = Join-Path $env:SystemRoot 'System32\wsl.exe'
+    $action = New-ScheduledTaskAction -Execute $wslExecutable -Argument $taskArguments
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentIdentity
+    $principal = New-ScheduledTaskPrincipal -UserId $currentIdentity -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) -Hidden -MultipleInstances IgnoreNew `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+    Register-ScheduledTask -TaskName $KeepAliveTaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings `
+        -Description '保持数据脱敏应用的 WSL2 与 Docker 容器运行，并在登录 Windows 后自动恢复。' `
+        -Force | Out-Null
+    Start-ScheduledTask -TaskName $KeepAliveTaskName
+
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        Start-Sleep -Milliseconds 500
+        $task = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+        if ($task -and $task.State -eq 'Running') { return }
+        if ($task -and $task.State -in @('Disabled', 'Ready')) { break }
+    }
+
+    $taskInfo = Get-ScheduledTaskInfo -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+    $lastResult = if ($taskInfo) { [string]$taskInfo.LastTaskResult } else { '未知' }
+    throw "WSL 常驻任务未能保持运行（上次结果：$lastResult）。"
+}
+
+function Wait-WindowsApplicationStable {
+    param(
+        [int]$RequiredConsecutiveSuccesses = 6,
+        [int]$MaximumAttempts = 30
+    )
+
+    $addresses = @('http://127.0.0.1:5291/api/health/', 'http://localhost:5291/api/health/')
+    $consecutiveSuccesses = 0
+    $workingAddress = $null
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        $healthyThisAttempt = $false
+        foreach ($address in $addresses) {
+            try {
+                $response = Invoke-WebRequest -UseBasicParsing -Uri $address -TimeoutSec 5
+                if ($response.StatusCode -eq 200) {
+                    $healthyThisAttempt = $true
+                    $workingAddress = $address
+                    break
+                }
+            } catch { }
+        }
+
+        if ($healthyThisAttempt) {
+            $consecutiveSuccesses++
+        } else {
+            $consecutiveSuccesses = 0
+        }
+        Write-InstallProgress -Percent (95 + [math]::Min(4, $consecutiveSuccesses)) `
+            -Activity '验证 Windows 端持续可访问' `
+            -Status "稳定检查 $consecutiveSuccesses/$RequiredConsecutiveSuccesses（总检查 $attempt/$MaximumAttempts）"
+        if ($consecutiveSuccesses -ge $RequiredConsecutiveSuccesses) {
+            Clear-InstallProgressLine
+            return [pscustomobject]@{
+                Healthy = $true
+                Address = $workingAddress
+            }
+        }
+        Start-Sleep -Seconds 3
+    }
+
+    Clear-InstallProgressLine
+    return [pscustomobject]@{
+        Healthy = $false
+        Address = $null
+    }
 }
 
 function Write-InstallProgress {
@@ -2462,23 +2567,30 @@ try {
         }
     }
 
-    Write-Step '从 Windows 检查应用端口与健康状态'
-    $healthy = $false
-    for ($attempt = 1; $attempt -le 20; $attempt++) {
-        try {
-            $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://localhost:5291/api/health/' -TimeoutSec 5
-            if ($response.StatusCode -eq 200) { $healthy = $true; break }
-        } catch {
-            Start-Sleep -Seconds 3
-        }
+    Write-Step '创建 WSL 常驻与 Windows 登录自动启动任务'
+    Register-WslKeepAliveTask -Distribution $DistroName -LinuxProjectPath $linuxProject
+    Write-InstallProgress -Percent 95 -Activity 'WSL 常驻任务' -Status "已启动：$KeepAliveTaskName" -CompleteLine
+
+    Write-Step '从 Windows 持续检查应用端口与健康状态'
+    $stabilityResult = Wait-WindowsApplicationStable
+    if (-not $stabilityResult.Healthy) {
+        $task = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+        $taskState = if ($task) { [string]$task.State } else { '不存在' }
+        throw "WSL 常驻任务状态为 $taskState，且 Windows 无法持续访问 http://127.0.0.1:5291/api/health/ 或 http://localhost:5291/api/health/。"
     }
-    if (-not $healthy) { throw '容器已启动，但 Windows 无法访问 http://localhost:5291/api/health/。' }
+    $keepAliveTask = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+    if (-not $keepAliveTask -or $keepAliveTask.State -ne 'Running') {
+        $taskState = if ($keepAliveTask) { [string]$keepAliveTask.State } else { '不存在' }
+        throw "网站健康检查通过，但 WSL 常驻任务状态为 $taskState，不能保证安装窗口关闭后继续运行。"
+    }
     Write-InstallProgress -Percent 100 -Activity '应用健康检查' -Status '安装部署完成' -CompleteLine
     Clear-InstallProgressLine
 
     Clear-ResumeAfterRestart
     Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
-    Write-Host "`n安装和部署全部完成：http://localhost:5291" -ForegroundColor Green
+    Write-Host "`n安装和部署全部完成：http://127.0.0.1:5291" -ForegroundColor Green
+    Write-Host "备用地址：http://localhost:5291"
+    Write-Host "WSL 常驻任务：$KeepAliveTaskName（Windows 登录后自动恢复应用）"
     Write-Host "支持日志（可直接发送给维护人员）：$logPath"
     Write-Host "本次日志归档：$archiveLogPath"
 }

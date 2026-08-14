@@ -1,6 +1,6 @@
 # Windows + WSL2 + Docker 中国大陆一键安装说明
 
-本项目只需一个 Windows PowerShell 脚本 `install-wsl-docker-cn.ps1`，检测与安装已合并。直接运行后，脚本先执行只读系统检测；只有检测合格才询问是否继续。选择“是”后，它会继续检查现有 WSL、Ubuntu、Docker Engine 与 Compose，符合版本范围的组件会明确显示“跳过安装”，只补装或升级缺失、过旧的组件，最后完成国内镜像配置、安全密钥生成、容器部署和健康检查。脚本执行时会在已忽略的 `.runtime` 目录临时展开 WSL 命令，成功后自动删除，不需要附带第二个安装脚本。
+本项目只需一个 Windows PowerShell 脚本 `install-wsl-docker-cn.ps1`，检测与安装已合并。直接运行后，脚本先执行只读系统检测；只有检测合格才询问是否继续。选择“是”后，它会继续检查现有 WSL、Ubuntu、Docker Engine 与 Compose，符合版本范围的组件会明确显示“跳过安装”，只补装或升级缺失、过旧的组件，最后完成国内镜像配置、安全密钥生成、容器部署、WSL 常驻任务和持续健康检查。脚本执行时会在已忽略的 `.runtime` 目录临时展开 WSL 命令，成功后自动删除，不需要附带第二个安装脚本。
 
 ## 系统要求
 
@@ -50,7 +50,7 @@ Windows 10 家庭版、专业版、企业版和教育版只要达到上述版本
 .\install-wsl-docker-cn.ps1 -CheckOnly
 ```
 
-脚本需要管理员权限；如果从普通 PowerShell 启动，会自动打开管理员窗口。该窗口在检测或安装结束后保持打开，便于查看结果和错误日志，可确认完成后手动关闭。
+脚本需要管理员权限；如果从普通 PowerShell 启动，会自动打开管理员窗口。该窗口在检测或安装结束后保持打开，便于查看结果和错误日志，可确认完成后手动关闭。部署完成时脚本会创建并立即启动 Windows 计划任务 `DataAnonymizationWslKeepAlive`：该任务在当前用户登录后自动启动 WSL、Docker 和本项目，并用一个不含密码或密钥的常驻进程避免 WSL 因空闲退出。任务没有执行时限，在使用电池时也不会被系统自动停止。
 
 首次启用 WSL2 时需要重启 Windows。脚本会写入一次性的 `RunOnce` 续跑项；手动重启并登录原管理员账号后，安装会自动继续，且不会重复询问是否安装。全部完成后续跑项会自动清除。
 
@@ -121,7 +121,23 @@ Web 直连的进度由 HTTP 响应中的总大小和实际写入磁盘的字节�
 
 ## 安装后操作
 
-访问地址：<http://localhost:5291>
+首选访问地址：<http://127.0.0.1:5291>
+
+备用访问地址：<http://localhost:5291>
+
+安装脚本不会在第一次请求成功后立即结束，而会从 Windows 对两个地址执行至少 5 次连续健康检查。连续约 15 秒均可访问、且 `DataAnonymizationWslKeepAlive` 仍处于运行状态时，才会显示“安装和部署全部完成”。微软明确说明，systemd 服务本身不会使 WSL 实例保持运行，因此请勿删除或停止这个计划任务。
+
+查看常驻任务状态：
+
+```powershell
+Get-ScheduledTask -TaskName DataAnonymizationWslKeepAlive
+```
+
+如果该任务被手工停止，可重新启动：
+
+```powershell
+Start-ScheduledTask -TaskName DataAnonymizationWslKeepAlive
+```
 
 进入 WSL 后查看状态和日志：
 
@@ -199,6 +215,12 @@ Get-NetTCPConnection -LocalPort 5291 -State Listen
 
 停止冲突程序后重新运行安装脚本。本项目对外端口固定为 `5291`。
 
+### 脚本显示完成，但关闭窗口后网页无法访问
+
+旧版脚本只在部署命令刚结束时检查一次网站；WSL 随后因空闲退出时，浏览器会显示 `ERR_CONNECTION_REFUSED`。日志中容器和健康检查都成功、但脚本结束后端口消失，正是这一情况。微软的 WSL systemd 文档说明，systemd 服务不会自行保持 WSL 实例存活。
+
+请更新项目并重新运行同一个一键脚本。新版会创建 `DataAnonymizationWslKeepAlive` 登录自动启动任务，并在脚本结束前做连续稳定性检查；重新运行不会删除 `.env`、MySQL 数据卷、任务记录或保存文件。完成后优先访问 <http://127.0.0.1:5291>。
+
 ### 重跑是否会清空数据
 
 不会。脚本是幂等的，现有 `.env` 和 Docker 数据卷会保留。数据库密码不一致时只执行账号密码同步，不重建数据卷。除非明确执行 `docker compose down -v`，否则 MySQL 和保存文件不会被删除。
@@ -207,7 +229,8 @@ Get-NetTCPConnection -LocalPort 5291 -State Listen
 
 - [Microsoft：安装 WSL](https://learn.microsoft.com/zh-cn/windows/wsl/install)
 - [Microsoft：旧版本 WSL 的手动安装步骤与 WSL2 要求](https://learn.microsoft.com/zh-cn/windows/wsl/install-manual)
-- [Microsoft：在 WSL 中使用 systemd（要求 WSL 0.67.6 或更高）](https://learn.microsoft.com/zh-cn/windows/wsl/systemd)
+- [Microsoft：在 WSL 中使用 systemd（要求 WSL 0.67.6 或更高；systemd 服务不会保持 WSL 实例运行）](https://learn.microsoft.com/zh-cn/windows/wsl/systemd)
+- [Microsoft：从 Windows 通过 localhost 访问 WSL 网络应用](https://learn.microsoft.com/zh-cn/windows/wsl/networking)
 - [MySQL 8.4：`--skip-grant-tables` 与禁用远程连接](https://dev.mysql.com/doc/refman/8.4/en/server-options.html)
 - [MySQL 8.4：`FLUSH PRIVILEGES` 重新加载权限表](https://dev.mysql.com/doc/refman/8.4/en/flush.html)
 - [Docker 官方 MySQL 镜像：已有数据目录时初始化环境变量不会修改现有数据库](https://github.com/docker-library/docs/blob/master/mysql/README.md)
