@@ -2406,7 +2406,7 @@ try {
         Write-Warning "CPU 低于建议值 $RecommendedLogicalProcessors 个逻辑核心，UIE-micro 推理可能较慢。"
     }
     if ($memoryGB -lt $RecommendedMemoryGB -and $memoryGB -ge $MinimumMemoryGB) {
-        Write-Warning "内存低于常驻模式建议值 $RecommendedMemoryGB GB，请优先选择“临时调用”。"
+        Write-Warning "内存低于常驻模式建议值 $RecommendedMemoryGB GB，请优先选择【临时调用】。"
     }
     if ($diskFreeGB -lt $RecommendedDiskGB -and $diskFreeGB -ge $MinimumDiskGB) {
         Write-Warning "磁盘空间低于建议值 $RecommendedDiskGB GB，请定期清理不用的 Docker 镜像。"
