@@ -15,9 +15,18 @@ from rest_framework.response import Response
 
 from .crypto import decrypt_mapping, encrypt_mapping
 from .file_processors import ProcessingError, SUPPORTED_EXTENSIONS, process_file, validate_upload_content
-from .models import AnonymizationTask
+from .models import AnonymizationTask, RecognitionLabel, TrainingExample
 from .recognizer import DEFAULT_CATEGORIES, MappingBuilder, restore_text
 from .serializers import TaskSerializer
+from .training_data import (
+    active_custom_entities,
+    create_or_reactivate_label,
+    deactivate_label,
+    label_to_dict,
+    save_task_custom_entities,
+    update_label,
+)
+from .uie_runtime import UIEProcessingError, predict_entities, runtime_status, set_runtime_mode
 
 
 def _safe_name(name):
@@ -94,9 +103,84 @@ def _sha256(upload):
     return digest.hexdigest()
 
 
+def _collect_text_chunks(source, task_id):
+    chunks = []
+    seen = set()
+    total_chars = 0
+    extension = Path(source).suffix.lower()
+    discovery_path = Path(settings.MEDIA_ROOT) / "processing" / str(task_id) / f"uie-discovery{extension}"
+
+    def collect(text):
+        nonlocal total_chars
+        value = str(text or "").strip()
+        if not value or value in seen:
+            return text
+        total_chars += len(value)
+        if total_chars > settings.UIE_MAX_TOTAL_CHARS:
+            raise ProcessingError(
+                f"文件可识别文字超过 UIE 上限 {settings.UIE_MAX_TOTAL_CHARS} 字符，请拆分文件后处理。"
+            )
+        seen.add(value)
+        chunks.append(value)
+        return text
+
+    try:
+        process_file(source, discovery_path, collect)
+    finally:
+        discovery_path.unlink(missing_ok=True)
+    return chunks
+
+
 @api_view(["GET"])
 def health(request):
     return Response({"status": "ok", "service": "烟草行业数据脱敏系统", "time": timezone.now()})
+
+
+@api_view(["GET", "POST"])
+def model_runtime(request):
+    if request.method == "GET":
+        return Response(runtime_status())
+    mode = request.data.get("mode", "on_demand")
+    try:
+        set_runtime_mode(mode)
+    except UIEProcessingError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    result = runtime_status()
+    result["selected_mode"] = mode
+    return Response(result)
+
+
+@api_view(["GET", "POST"])
+def label_collection(request):
+    if request.method == "GET":
+        labels = [label_to_dict(label) for label in RecognitionLabel.objects.filter(is_active=True)]
+        return Response({
+            "labels": labels,
+            "active_count": len(labels),
+            "training_example_count": TrainingExample.objects.count(),
+        })
+    try:
+        label, changed = create_or_reactivate_label(request.data.get("text"), request.data.get("category", "custom"))
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(label_to_dict(label), status=status.HTTP_201_CREATED if changed else status.HTTP_200_OK)
+
+
+@api_view(["PATCH", "DELETE"])
+def label_detail(request, label_id):
+    label = get_object_or_404(RecognitionLabel, id=label_id, is_active=True)
+    if request.method == "DELETE":
+        deactivate_label(label)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    try:
+        label = update_label(
+            label,
+            request.data.get("text", label_to_dict(label)["text"]),
+            request.data.get("category", label.category),
+        )
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(label_to_dict(label))
 
 
 @api_view(["GET", "POST"])
@@ -113,7 +197,16 @@ def task_collection(request):
 
     categories = _parse_json(request.data.get("categories"), DEFAULT_CATEGORIES)
     categories = [item for item in categories if item in DEFAULT_CATEGORIES]
+    uie_mode = request.data.get("uie_mode", "on_demand")
+    if uie_mode not in {"on_demand", "resident"}:
+        return Response({"detail": "无效的 UIE 运行模式。"}, status=status.HTTP_400_BAD_REQUEST)
     custom = _custom_entities(request.data.get("custom_entities", ""))
+    try:
+        save_task_custom_entities(custom)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    learned = active_custom_entities()
+    combined_custom = list({(item["category"], item["text"]): item for item in [*learned, *custom]}.values())
     original_name = _safe_name(upload.name)
     task = AnonymizationTask.objects.create(
         task_name=_task_name(original_name),
@@ -122,11 +215,28 @@ def task_collection(request):
         file_size=upload.size,
         sha256=_sha256(upload),
         input_file=upload,
-        options={"categories": categories, "custom_entity_count": len(custom)},
+        options={
+            "categories": categories,
+            "custom_entity_count": len(custom),
+            "learned_label_count": len(learned),
+            "uie_mode": uie_mode,
+            "uie_model": settings.UIE_MODEL if settings.UIE_ENABLED else "disabled",
+        },
     )
 
     try:
-        builder = MappingBuilder(str(task.id), categories, custom)
+        builder = MappingBuilder(str(task.id), categories, combined_custom)
+        model_entity_count = 0
+        if settings.UIE_ENABLED and set(categories) & {"person", "organization", "address"}:
+            text_chunks = _collect_text_chunks(task.input_file.path, task.id)
+            filename_stem = Path(original_name).stem
+            if filename_stem and filename_stem not in text_chunks:
+                text_chunks.append(filename_stem)
+            model_entities = predict_entities(text_chunks, categories, uie_mode)
+            for entity in sorted(model_entities, key=lambda item: (-len(item.get("text", "")), item.get("text_index", 0))):
+                if builder.register_detected(entity.get("text"), entity.get("category")):
+                    model_entity_count += 1
+            task.options["uie_detected_count"] = model_entity_count
         anonymized_stem = builder.anonymize_filename_stem(Path(original_name).stem)
         output_name = _output_name(original_name, "已脱敏", anonymized_stem)
         output_path = Path(settings.MEDIA_ROOT) / "processing" / str(task.id) / output_name
@@ -141,7 +251,7 @@ def task_collection(request):
         output_path.unlink(missing_ok=True)
     except Exception as exc:
         task.status = AnonymizationTask.Status.FAILED
-        task.error_message = str(exc) if isinstance(exc, (ProcessingError, ValueError)) else "文件处理失败，请检查文件是否损坏。"
+        task.error_message = str(exc) if isinstance(exc, (ProcessingError, UIEProcessingError, ValueError)) else "文件处理失败，请检查文件是否损坏。"
         task.save(update_fields=["status", "error_message", "updated_at"])
         return Response(TaskSerializer(task, context={"request": request}).data, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
@@ -215,7 +325,7 @@ def download_task(request, task_id, kind):
 @api_view(["GET"])
 def stats(request):
     tasks = AnonymizationTask.objects.all()
-    totals = {"tasks": tasks.count(), "completed": tasks.filter(status__in=["completed", "restored"]).count(), "restored": tasks.filter(status="restored").count(), "entities": 0}
+    totals = {"tasks": tasks.count(), "completed": tasks.filter(status__in=["completed", "restored"]).count(), "restored": tasks.filter(status="restored").count(), "entities": 0, "training_examples": TrainingExample.objects.count(), "active_labels": RecognitionLabel.objects.filter(is_active=True).count()}
     for counts in tasks.values_list("entity_counts", flat=True):
         totals["entities"] += sum(counts.values()) if isinstance(counts, dict) else 0
     return Response(totals)

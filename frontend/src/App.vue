@@ -6,7 +6,7 @@ import AppIcon from './components/AppIcon.vue'
 const nav = ref('workspace')
 const mode = ref('anonymize')
 const tasks = ref([])
-const stats = ref({ tasks: 0, completed: 0, restored: 0, entities: 0 })
+const stats = ref({ tasks: 0, completed: 0, restored: 0, entities: 0, training_examples: 0, active_labels: 0 })
 const loading = ref(false)
 const loadingHistory = ref(false)
 const deletingTaskId = ref('')
@@ -17,6 +17,15 @@ const restoreFile = ref(null)
 const selectedTaskId = ref('')
 const dragging = ref('')
 const customEntities = ref('')
+const uieMode = ref(localStorage.getItem('uieMode') || 'on_demand')
+const modelRuntime = ref({ enabled: true, available: false, model: 'uie-micro', resident_loaded: false })
+const modelModeLoading = ref(false)
+const trainingLabels = ref([])
+const trainingExampleCount = ref(0)
+const labelForm = ref({ text: '', category: 'person' })
+const editingLabelId = ref('')
+const editingLabel = ref({ text: '', category: 'person' })
+const labelLoading = ref(false)
 const selectedCategories = ref(['organization', 'person', 'phone', 'id_card', 'email', 'address'])
 
 const categoryOptions = [
@@ -27,6 +36,7 @@ const categoryOptions = [
   { key: 'email', label: '电子邮箱' },
   { key: 'address', label: '地址信息' }
 ]
+const labelCategoryOptions = [...categoryOptions, { key: 'custom', label: '其他敏感项' }]
 
 const completedTasks = computed(() => tasks.value.filter(task => ['completed', 'restored'].includes(task.status)))
 const selectedTask = computed(() => tasks.value.find(task => task.id === selectedTaskId.value))
@@ -75,6 +85,88 @@ async function refreshData() {
   }
 }
 
+async function refreshModelRuntime() {
+  try {
+    modelRuntime.value = await api.getModelRuntime()
+  } catch (e) {
+    modelRuntime.value = { enabled: true, available: false, model: 'uie-micro', resident_loaded: false, detail: e.message }
+  }
+}
+
+async function selectUieMode(nextMode) {
+  uieMode.value = nextMode
+  localStorage.setItem('uieMode', nextMode)
+  if (!modelRuntime.value.enabled) return
+  modelModeLoading.value = true
+  error.value = ''
+  try {
+    modelRuntime.value = await api.setModelRuntime(nextMode)
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    modelModeLoading.value = false
+    await refreshModelRuntime()
+  }
+}
+
+async function refreshLabels() {
+  try {
+    const data = await api.listLabels()
+    trainingLabels.value = data.labels || []
+    trainingExampleCount.value = data.training_example_count || 0
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+function startEditLabel(label) {
+  editingLabelId.value = label.id
+  editingLabel.value = { text: label.text, category: label.category }
+}
+
+async function addLabel() {
+  if (!labelForm.value.text.trim()) return
+  labelLoading.value = true
+  error.value = ''
+  try {
+    await api.createLabel(labelForm.value)
+    labelForm.value = { text: '', category: 'person' }
+    await Promise.all([refreshLabels(), refreshData()])
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    labelLoading.value = false
+  }
+}
+
+async function saveLabel(labelId) {
+  labelLoading.value = true
+  error.value = ''
+  try {
+    await api.updateLabel(labelId, editingLabel.value)
+    editingLabelId.value = ''
+    await Promise.all([refreshLabels(), refreshData()])
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    labelLoading.value = false
+  }
+}
+
+async function removeLabel(label) {
+  if (!window.confirm(`确认停用识别标签“${label.text}”吗？\n历史训练记录仍会保留。`)) return
+  labelLoading.value = true
+  error.value = ''
+  try {
+    await api.deleteLabel(label.id)
+    await Promise.all([refreshLabels(), refreshData()])
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    labelLoading.value = false
+  }
+}
+
 async function submitAnonymize() {
   if (!anonymizeFile.value) {
     error.value = '请先选择要脱敏的文件。'
@@ -84,8 +176,8 @@ async function submitAnonymize() {
   error.value = ''
   result.value = null
   try {
-    result.value = await api.anonymize(anonymizeFile.value, selectedCategories.value, customEntities.value)
-    await refreshData()
+    result.value = await api.anonymize(anonymizeFile.value, selectedCategories.value, customEntities.value, uieMode.value)
+    await Promise.all([refreshData(), refreshModelRuntime(), refreshLabels()])
   } catch (e) {
     error.value = e.message
     if (e.data?.id) result.value = e.data
@@ -140,7 +232,7 @@ function selectMode(nextMode) {
   error.value = ''
 }
 
-onMounted(refreshData)
+onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels()]))
 </script>
 
 <template>
@@ -160,6 +252,10 @@ onMounted(refreshData)
           <AppIcon name="history" /> 处理记录
           <span v-if="tasks.length" class="nav-count">{{ tasks.length }}</span>
         </button>
+        <button :class="{ active: nav === 'labels' }" @click="nav = 'labels'; refreshLabels()">
+          <AppIcon name="info" /> 训练标签
+          <span v-if="trainingLabels.length" class="nav-count">{{ trainingLabels.length }}</span>
+        </button>
         <button :class="{ active: nav === 'guide' }" @click="nav = 'guide'">
           <AppIcon name="book" /> 使用说明
         </button>
@@ -175,8 +271,8 @@ onMounted(refreshData)
     <main class="main-panel">
       <header class="topbar">
         <div>
-          <h1>{{ nav === 'workspace' ? '数据处理台' : nav === 'history' ? '处理记录' : '使用说明' }}</h1>
-          <p>{{ nav === 'workspace' ? '文件级敏感信息匿名化与安全恢复' : nav === 'history' ? '查看并下载历史处理结果' : '了解安全、可逆的数据处理流程' }}</p>
+          <h1>{{ nav === 'workspace' ? '数据处理台' : nav === 'history' ? '处理记录' : nav === 'labels' ? '本地训练标签' : '使用说明' }}</h1>
+          <p>{{ nav === 'workspace' ? '文件级敏感信息匿名化与安全恢复' : nav === 'history' ? '查看并下载历史处理结果' : nav === 'labels' ? '维护本地词库并沉淀模型训练样本' : '了解安全、可逆的数据处理流程' }}</p>
         </div>
         <div class="industry-badge"><AppIcon name="building" :size="17" /> 烟草行业专用</div>
       </header>
@@ -242,8 +338,28 @@ onMounted(refreshData)
               <div>
                 <label class="form-label app-label" for="customEntities">指定敏感词 <small>可选</small></label>
                 <textarea id="customEntities" v-model="customEntities" class="form-control" rows="4" placeholder="每行一个，如：中国烟草总公司&#10;也可写：单位|某某卷烟厂"></textarea>
-                <div class="form-hint">指定词优先识别，可使用“单位|内容”或“人名|内容”标注类型</div>
+                <div class="form-hint">指定词优先识别，可使用“单位|内容”或“人名|内容”标注类型。新增内容会加密保存到本机训练标签库，并立即用于后续任务。</div>
               </div>
+            </div>
+
+            <div class="uie-settings">
+              <div class="uie-heading">
+                <div><strong>UIE-micro 智能识别方式</strong><small>规则负责精确匹配，UIE 补充识别人名、单位、部门和地址</small></div>
+                <span class="model-state" :class="{ loaded: modelRuntime.resident_loaded, unavailable: !modelRuntime.available }">
+                  {{ !modelRuntime.available ? '模型服务不可用' : modelRuntime.resident_loaded ? '模型已常驻' : '模型未占用内存' }}
+                </span>
+              </div>
+              <div class="uie-mode-grid">
+                <label :class="{ active: uieMode === 'on_demand' }">
+                  <input type="radio" name="uieMode" value="on_demand" :checked="uieMode === 'on_demand'" :disabled="modelModeLoading" @change="selectUieMode('on_demand')" />
+                  <span><b>临时调用（推荐）</b><small>每个文件加载一次，处理后立即释放约 0.9～1.5 GB 内存；每次会增加冷启动等待时间。</small></span>
+                </label>
+                <label :class="{ active: uieMode === 'resident' }">
+                  <input type="radio" name="uieMode" value="resident" :checked="uieMode === 'resident'" :disabled="modelModeLoading" @change="selectUieMode('resident')" />
+                  <span><b>模型常驻</b><small>首次加载后保留在内存，后续文件更快；空闲时仍持续占用约 0.9～1.5 GB 内存。</small></span>
+                </label>
+              </div>
+              <div v-if="modelModeLoading" class="model-loading"><span class="spinner-border spinner-border-sm"></span> 正在切换模型运行方式，请稍候…</div>
             </div>
 
             <div class="action-row">
@@ -251,7 +367,7 @@ onMounted(refreshData)
               <button class="btn primary-btn" :disabled="loading || !anonymizeFile" @click="submitAnonymize">
                 <span v-if="loading" class="spinner-border spinner-border-sm"></span>
                 <AppIcon v-else name="file-lock" :size="18" />
-                {{ loading ? '正在识别并处理…' : '开始数据匿名' }}
+                {{ loading ? '正在加载模型并识别…' : '开始数据匿名' }}
               </button>
             </div>
           </section>
@@ -304,6 +420,9 @@ onMounted(refreshData)
               <p>{{ result.code }} · {{ result.task_name }}</p>
               <div v-if="result.status !== 'restored'" class="entity-tags">
                 <span v-for="(count, label) in result.entity_counts" :key="label">{{ label }} {{ count }}</span>
+                <span v-if="result.uie_detected_count">UIE 补充 {{ result.uie_detected_count }}</span>
+                <span v-if="result.recognition_mode === 'on_demand'">临时调用</span>
+                <span v-else-if="result.recognition_mode === 'resident'">模型常驻</span>
                 <span v-if="!Object.keys(result.entity_counts || {}).length">未发现自动识别项，请确认文件不是扫描图片，或补充“指定敏感词”</span>
               </div>
             </div>
@@ -347,6 +466,51 @@ onMounted(refreshData)
           </section>
         </template>
 
+        <template v-else-if="nav === 'labels'">
+          <section class="training-explain">
+            <span><AppIcon name="info" :size="25" /></span>
+            <div>
+              <h2>标签立即用于识别，修改历史沉淀为训练数据</h2>
+              <p>新增或修改标签后，系统会加密保存原值并立即加入本地精确词库；同时保留一条加密训练样本，供后续集中微调 UIE-micro。保存训练数据不等于每次立即重新训练模型，避免频繁训练造成卡顿和模型退化。</p>
+            </div>
+            <div class="training-count"><strong>{{ trainingLabels.length }}</strong><small>有效标签</small><strong>{{ trainingExampleCount }}</strong><small>训练样本</small></div>
+          </section>
+
+          <section class="label-card">
+            <div class="label-add-row">
+              <div><h2>新增识别标签</h2><p>适合补充内部人员、简称、车间、供应商和项目代号</p></div>
+              <select v-model="labelForm.category" class="form-select">
+                <option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option>
+              </select>
+              <input v-model="labelForm.text" class="form-control" maxlength="200" placeholder="输入需要识别的完整内容" @keyup.enter="addLabel" />
+              <button class="btn primary-btn" :disabled="labelLoading || !labelForm.text.trim()" @click="addLabel">保存标签</button>
+            </div>
+
+            <div class="table-responsive">
+              <table class="table align-middle mb-0 label-table">
+                <thead><tr><th>类型</th><th>标签内容</th><th>更新时间</th><th class="text-end">操作</th></tr></thead>
+                <tbody>
+                  <tr v-for="label in trainingLabels" :key="label.id">
+                    <template v-if="editingLabelId === label.id">
+                      <td><select v-model="editingLabel.category" class="form-select"><option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option></select></td>
+                      <td><input v-model="editingLabel.text" class="form-control" maxlength="200" /></td>
+                      <td>{{ formatDate(label.updated_at) }}</td>
+                      <td class="text-end label-actions"><button class="save" :disabled="labelLoading" @click="saveLabel(label.id)">保存</button><button @click="editingLabelId = ''">取消</button></td>
+                    </template>
+                    <template v-else>
+                      <td><span class="file-type">{{ label.category_label }}</span></td>
+                      <td><strong>{{ label.text }}</strong></td>
+                      <td>{{ formatDate(label.updated_at) }}</td>
+                      <td class="text-end label-actions"><button @click="startEditLabel(label)">修改</button><button class="danger" :disabled="labelLoading" @click="removeLabel(label)">停用</button></td>
+                    </template>
+                  </tr>
+                  <tr v-if="!trainingLabels.length"><td colspan="4" class="empty-state">暂无本地训练标签；也可以在脱敏页面的“指定敏感词”中添加。</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </template>
+
         <template v-else>
           <section class="guide-hero">
             <span><AppIcon name="shield-check" :size="34" /></span>
@@ -361,6 +525,8 @@ onMounted(refreshData)
             <h3>使用建议</h3>
             <ul>
               <li>自动识别前，建议在“指定敏感词”中补充烟草专卖局、卷烟厂、供应商和人员名单。</li>
+              <li>“临时调用”在每个任务结束后释放 UIE 内存；“模型常驻”适合连续处理大量文件，但空闲时仍占用约 0.9～1.5 GB 内存。</li>
+              <li>新增或修改的识别标签会加密保存并立即加入本地词库，同时形成后续批量微调所需的训练样本。</li>
               <li>PDF 扫描件请先 OCR；PDF 处理结果会重新排版，复杂公文建议优先使用 DOCX。</li>
               <li>生产部署时必须修改环境文件中的 Django 密钥、映射加密密钥和数据库密码。</li>
               <li>AI 处理过程中不得删除、拆分或改写全角书名号包裹的匿名标记。</li>

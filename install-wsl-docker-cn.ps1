@@ -22,10 +22,12 @@ $OutputEncoding = $utf8NoBom
 $script:InstallProgressActive = $false
 $script:InstallProgressCells = 0
 $MinimumBuild = 19041
-$MinimumMemoryGB = 4
-$RecommendedMemoryGB = 8
-$MinimumDiskGB = 20
-$RecommendedDiskGB = 30
+$MinimumLogicalProcessors = 4
+$RecommendedLogicalProcessors = 6
+$MinimumMemoryGB = 8
+$RecommendedMemoryGB = 16
+$MinimumDiskGB = 30
+$RecommendedDiskGB = 40
 $MinimumWslVersion = [version]'0.67.6'
 $MinimumDockerVersion = '24.0'
 $MaximumDockerVersion = '30.0'
@@ -320,12 +322,20 @@ write_secure_environment() {
             fi
         }
         set_env_value MYSQL_IMAGE "${DOCKER_HUB_PREFIX}mysql:8.4"
-        set_env_value PYTHON_IMAGE "${DOCKER_HUB_PREFIX}python:3.13-slim"
+        set_env_value PYTHON_IMAGE "${DOCKER_HUB_PREFIX}python:3.12-slim"
         set_env_value NODE_IMAGE "${DOCKER_HUB_PREFIX}node:22-alpine"
         set_env_value NGINX_IMAGE "${DOCKER_HUB_PREFIX}nginx:1.27-alpine"
         set_env_value PIP_INDEX_URL "$PYPI_MIRROR"
         set_env_value NPM_REGISTRY "$NPM_MIRROR"
         set_env_value DEBIAN_MIRROR "${APT_MIRROR}/debian"
+        set_env_value UIE_ENABLED "1"
+        set_env_value UIE_MODEL "uie-micro"
+        set_env_value UIE_POSITION_PROB "0.45"
+        set_env_value UIE_BATCH_SIZE "2"
+        set_env_value UIE_MAX_SEQ_LEN "512"
+        set_env_value UIE_MAX_TOTAL_CHARS "500000"
+        set_env_value UIE_START_TIMEOUT_SECONDS "180"
+        set_env_value UIE_REQUEST_TIMEOUT_SECONDS "600"
         return
     fi
 
@@ -344,12 +354,20 @@ ALLOWED_HOSTS=${allowed_hosts}
 MAX_UPLOAD_SIZE_MB=50
 DATA_RETENTION_DAYS=30
 MYSQL_IMAGE=${DOCKER_HUB_PREFIX}mysql:8.4
-PYTHON_IMAGE=${DOCKER_HUB_PREFIX}python:3.13-slim
+PYTHON_IMAGE=${DOCKER_HUB_PREFIX}python:3.12-slim
 NODE_IMAGE=${DOCKER_HUB_PREFIX}node:22-alpine
 NGINX_IMAGE=${DOCKER_HUB_PREFIX}nginx:1.27-alpine
 PIP_INDEX_URL=${PYPI_MIRROR}
 NPM_REGISTRY=${NPM_MIRROR}
 DEBIAN_MIRROR=${APT_MIRROR}/debian
+UIE_ENABLED=1
+UIE_MODEL=uie-micro
+UIE_POSITION_PROB=0.45
+UIE_BATCH_SIZE=2
+UIE_MAX_SEQ_LEN=512
+UIE_MAX_TOTAL_CHARS=500000
+UIE_START_TIMEOUT_SECONDS=180
+UIE_REQUEST_TIMEOUT_SECONDS=600
 EOF
     chmod 600 "$env_file"
 }
@@ -382,7 +400,7 @@ deploy_application() {
     cd "$PROJECT_DIR"
     progress 15 "步骤 3/11：拉取 MySQL 与 Nginx 基础镜像"
     retry docker compose pull db nginx
-    progress 30 "步骤 4/11：构建 Django 后端镜像"
+    progress 30 "步骤 4/11：构建 Django 与 UIE-micro 后端镜像（含模型下载）"
     docker compose build backend
     progress 48 "步骤 5/11：构建 Vue 前端镜像"
     docker compose build frontend
@@ -2088,6 +2106,13 @@ try {
     if (-not $cpu) { throw '无法读取 Win32_Processor 处理器信息。请确认 WMI/CIM 服务正在运行。' }
     $build = [int]$os.BuildNumber
     $memoryGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 1)
+    $logicalProcessors = if ($computer.NumberOfLogicalProcessors) {
+        [int]$computer.NumberOfLogicalProcessors
+    } elseif ($cpu.NumberOfLogicalProcessors) {
+        [int]$cpu.NumberOfLogicalProcessors
+    } else {
+        0
+    }
     $architecture = Get-WindowsArchitecture $computer $os
     $disk = Invoke-SystemProbeWithTimeout -Name '读取项目磁盘空间（WMI）' `
         -StepNumber 4 -StepCount $probeStepCount -ProgressPercent 4 -TimeoutSeconds 15 `
@@ -2339,7 +2364,8 @@ try {
         [pscustomobject]@{ Item = '系统版本'; Result = "Build $build"; Required = "Build >= $MinimumBuild" }
         [pscustomobject]@{ Item = '体系结构'; Result = $architecture; Required = 'X64 或 Arm64' }
         [pscustomobject]@{ Item = 'CPU 虚拟化'; Result = if ($virtualization) { '已启用' } else { '未检测到' }; Required = 'BIOS/UEFI 中启用' }
-        [pscustomobject]@{ Item = '物理内存'; Result = "$memoryGB GB"; Required = ">= $MinimumMemoryGB GB，建议 >= $RecommendedMemoryGB GB" }
+        [pscustomobject]@{ Item = 'CPU 逻辑核心'; Result = if ($logicalProcessors) { "$logicalProcessors 核" } else { '无法识别' }; Required = ">= $MinimumLogicalProcessors 核，建议 >= $RecommendedLogicalProcessors 核" }
+        [pscustomobject]@{ Item = '物理内存'; Result = "$memoryGB GB"; Required = ">= $MinimumMemoryGB GB，常驻模式建议 >= $RecommendedMemoryGB GB" }
         [pscustomobject]@{ Item = '项目盘可用空间'; Result = "$diskFreeGB GB"; Required = ">= $MinimumDiskGB GB，建议 >= $RecommendedDiskGB GB" }
         [pscustomobject]@{ Item = 'WSL 组件'; Result = $wslFeature.State; Required = 'Enabled（脚本可自动启用）' }
         [pscustomobject]@{ Item = '虚拟机平台'; Result = $vmFeature.State; Required = 'Enabled（脚本可自动启用）' }
@@ -2351,11 +2377,20 @@ try {
         }
     )
     $results | Format-Table -AutoSize
+    Write-Host ''
+    Write-Host 'UIE-micro 配置说明：' -ForegroundColor Cyan
+    Write-Host "  最低配置：$MinimumLogicalProcessors 个逻辑核心、$MinimumMemoryGB GB 内存、$MinimumDiskGB GB 可用空间（建议选择临时调用）。"
+    Write-Host "  建议配置：$RecommendedLogicalProcessors 个及以上逻辑核心、$RecommendedMemoryGB GB 内存、$RecommendedDiskGB GB 可用 SSD 空间（适合模型常驻）。"
 
     $blocking = New-Object System.Collections.Generic.List[string]
     if ($build -lt $MinimumBuild) { $blocking.Add("Windows Build $build 低于 $MinimumBuild，请先运行 Windows Update。") }
     if ($architecture -notin @('X64', 'Arm64')) { $blocking.Add("不支持的体系结构：$architecture。") }
     if (-not $virtualization) { $blocking.Add('未检测到硬件虚拟化，请在 BIOS/UEFI 中启用 Intel VT-x 或 AMD-V。') }
+    if (-not $logicalProcessors) {
+        $blocking.Add('无法读取 CPU 逻辑核心数，请检查 WMI/CIM 服务状态。')
+    } elseif ($logicalProcessors -lt $MinimumLogicalProcessors) {
+        $blocking.Add("CPU 逻辑核心不足 $MinimumLogicalProcessors 个。")
+    }
     if ($memoryGB -lt $MinimumMemoryGB) { $blocking.Add("内存不足 $MinimumMemoryGB GB。") }
     if ($diskFreeGB -lt $MinimumDiskGB) { $blocking.Add("项目所在磁盘可用空间不足 $MinimumDiskGB GB。") }
     if (-not (Test-Path (Join-Path $resolvedProject 'docker-compose.yml'))) { $blocking.Add('项目目录缺少 docker-compose.yml。') }
@@ -2367,8 +2402,11 @@ try {
     }
     if (-not $selectedContainerMirror) { $blocking.Add('DaoCloud 和 Docker Hub 官方地址均不可访问。') }
 
+    if ($logicalProcessors -and $logicalProcessors -lt $RecommendedLogicalProcessors -and $logicalProcessors -ge $MinimumLogicalProcessors) {
+        Write-Warning "CPU 低于建议值 $RecommendedLogicalProcessors 个逻辑核心，UIE-micro 推理可能较慢。"
+    }
     if ($memoryGB -lt $RecommendedMemoryGB -and $memoryGB -ge $MinimumMemoryGB) {
-        Write-Warning "内存低于建议值 $RecommendedMemoryGB GB，首次构建可能较慢。"
+        Write-Warning "内存低于常驻模式建议值 $RecommendedMemoryGB GB，请优先选择“临时调用”。"
     }
     if ($diskFreeGB -lt $RecommendedDiskGB -and $diskFreeGB -ge $MinimumDiskGB) {
         Write-Warning "磁盘空间低于建议值 $RecommendedDiskGB GB，请定期清理不用的 Docker 镜像。"

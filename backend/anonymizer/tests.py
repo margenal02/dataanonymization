@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import xlrd
 import xlwt
@@ -18,8 +19,12 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen import canvas
 
 from .file_processors import process_file
-from .models import AnonymizationTask
+from .crypto import decrypt_mapping
+from .models import AnonymizationTask, RecognitionLabel, TrainingExample
 from .recognizer import MappingBuilder, restore_text
+from .training_data import decrypt_label
+from .uie_runtime import UIEProcessingError, _manager_url
+from .uie_worker import _predict
 
 
 class MappingBuilderTests(TestCase):
@@ -87,6 +92,12 @@ class MappingBuilderTests(TestCase):
         self.assertNotIn("潘富昆", anonymized_stem)
         self.assertIn("ANON_人名_FILE_001", anonymized_stem)
         self.assertEqual(restore_text(anonymized_stem, builder.export()), "潘富昆技能竞赛活动方案")
+
+    def test_registers_valid_model_entity_and_rejects_role_word(self):
+        builder = MappingBuilder("model123", ["person"])
+        self.assertIsNotNone(builder.register_detected("潘富昆", "person"))
+        self.assertIsNone(builder.register_detected("工作人员", "person"))
+        self.assertEqual(builder.counts(), {"人名": 1})
 
     def test_detects_pdf_style_spaces_inside_entities(self):
         source = "单 位：中 国 烟 草 总 公 司\n联 系 人：张 三\n138 0013 8000"
@@ -270,6 +281,71 @@ class TaskApiTests(TestCase):
         for sensitive_value in ("云南中烟工业有限责任公司", "红云红河烟草（集团）有限责任公司", "王建国", "李娜"):
             self.assertNotIn(sensitive_value, anonymized)
 
+    @override_settings(UIE_ENABLED=True)
+    @patch("anonymizer.views.predict_entities")
+    def test_uie_model_entities_are_merged_and_mode_is_recorded(self, predict):
+        predict.return_value = [{
+            "text_index": 1,
+            "text": "爱丽丝",
+            "category": "person",
+            "start": 0,
+            "end": 3,
+            "probability": 0.99,
+        }]
+        upload = SimpleUploadedFile("爱丽丝活动材料.txt", "活动按计划实施。".encode("utf-8"), content_type="text/plain")
+        response = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["person"]),
+            "uie_mode": "resident",
+        })
+
+        self.assertEqual(response.status_code, 201, response.content)
+        task = response.json()
+        self.assertEqual(task["recognition_mode"], "resident")
+        self.assertEqual(task["uie_detected_count"], 1)
+        predict.assert_called_once()
+        self.assertIn("爱丽丝活动材料", predict.call_args.args[0])
+        self.assertNotIn("爱丽丝", task["display_name"])
+        download = self.client.get(task["anonymized_download_url"])
+        self.assertNotIn("爱丽丝", download.headers["Content-Disposition"])
+
+    def test_training_labels_are_encrypted_versioned_and_used_by_later_tasks(self):
+        response = self.client.post("/api/labels/", {"text": "李作英", "category": "person"}, content_type="application/json")
+        self.assertEqual(response.status_code, 201, response.content)
+        label = RecognitionLabel.objects.get(id=response.json()["id"])
+        self.assertNotIn("李作英", label.text_ciphertext)
+        self.assertEqual(decrypt_label(label), "李作英")
+        self.assertEqual(TrainingExample.objects.count(), 1)
+
+        response = self.client.patch(
+            f"/api/labels/{label.id}/",
+            {"text": "赵英桥", "category": "person"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(TrainingExample.objects.count(), 2)
+        sample = decrypt_mapping(TrainingExample.objects.first().payload_ciphertext)
+        self.assertEqual(sample["after"]["text"], "赵英桥")
+
+        upload = SimpleUploadedFile("后续任务.txt", "由赵英桥完成。".encode("utf-8"), content_type="text/plain")
+        response = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["person"]),
+            "uie_mode": "on_demand",
+        })
+        self.assertEqual(response.status_code, 201, response.content)
+        download = self.client.get(response.json()["anonymized_download_url"])
+        self.assertNotIn("赵英桥", b"".join(download.streaming_content).decode("utf-8"))
+
+    @patch("anonymizer.views.set_runtime_mode")
+    @patch("anonymizer.views.runtime_status")
+    def test_model_runtime_control_api(self, status_mock, set_mode):
+        status_mock.return_value = {"enabled": True, "available": True, "model": "uie-micro", "resident_loaded": True}
+        response = self.client.post("/api/model/runtime/", {"mode": "resident"}, content_type="application/json")
+        self.assertEqual(response.status_code, 200, response.content)
+        set_mode.assert_called_once_with("resident")
+        self.assertTrue(response.json()["resident_loaded"])
+
     def test_anonymizes_download_filename_and_restores_formal_filename(self):
         source = "组长：潘富昆。\n成员：赵英桥、李作英。"
         upload = SimpleUploadedFile(
@@ -337,3 +413,28 @@ class TaskApiTests(TestCase):
         response = self.client.post("/api/tasks/", {"file": upload})
         self.assertEqual(response.status_code, 400)
         self.assertIn("不安全", response.json()["detail"])
+
+
+class UIEWorkerTests(TestCase):
+    @override_settings(UIE_MANAGER_URL="file:///tmp/model.sock")
+    def test_model_manager_rejects_non_loopback_url(self):
+        with self.assertRaises(UIEProcessingError):
+            _manager_url("/status")
+
+    def test_worker_normalizes_numpy_like_probabilities_and_categories(self):
+        class FakeEngine:
+            def set_schema(self, schema):
+                self.schema = schema
+
+            def __call__(self, texts):
+                return [{"人名": [{"text": "潘富昆", "start": 3, "end": 6, "probability": 0.98}]}]
+
+        entities = _predict(FakeEngine(), {"texts": ["组长：潘富昆。"], "categories": ["person"]})
+        self.assertEqual(entities, [{
+            "text_index": 0,
+            "text": "潘富昆",
+            "category": "person",
+            "start": 3,
+            "end": 6,
+            "probability": 0.98,
+        }])
