@@ -372,6 +372,7 @@ deploy_application() {
         echo "项目目录无效或缺少 docker-compose.yml：${PROJECT_DIR}" >&2
         exit 1
     fi
+    local database_health_result
     progress 2 "步骤 1/11：启动并检查 Docker Engine"
     start_docker
     progress 8 "步骤 2/11：检查并生成安全配置"
@@ -399,6 +400,110 @@ deploy_application() {
         docker compose logs --no-color --tail=100 "$service" 2>&1 || true
     }
 
+    database_authentication_failed() {
+        local container_id="$1"
+        docker inspect --format '{{if .State.Health}}{{range .State.Health.Log}}{{println .Output}}{{end}}{{end}}' \
+            "$container_id" 2>/dev/null | grep -q 'ERROR 1045'
+    }
+
+    read_env_value() {
+        local key="$1"
+        sed -n "s/^${key}=//p" "${PROJECT_DIR}/.env" | tail -n 1 | tr -d '\r'
+    }
+
+    stop_mysql_repair_container() {
+        local container_name="$1"
+        docker stop --time 30 "$container_name" >/dev/null 2>&1 || true
+        docker rm -f "$container_name" >/dev/null 2>&1 || true
+    }
+
+    repair_mysql_credentials() {
+        local database_name database_user database_password root_password
+        local container_id volume_name database_image repair_container repair_ready attempt
+
+        database_name="$(read_env_value MYSQL_DATABASE)"
+        database_user="$(read_env_value MYSQL_USER)"
+        database_password="$(read_env_value MYSQL_PASSWORD)"
+        root_password="$(read_env_value MYSQL_ROOT_PASSWORD)"
+
+        if [[ ! "$database_name" =~ ^[A-Za-z0-9_]+$ || ! "$database_user" =~ ^[A-Za-z0-9_]+$ ]]; then
+            echo "无法自动同步 MySQL 凭据：数据库名或用户名包含不受支持的字符。" >&2
+            return 1
+        fi
+        if [[ ! "$database_password" =~ ^[0-9A-Fa-f]{64}$ || ! "$root_password" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+            echo "无法自动同步 MySQL 凭据：仅支持脚本生成的 64 位十六进制随机密码。" >&2
+            echo "未修改数据库数据；请按照部署文档的“数据库密码不一致”章节处理。" >&2
+            return 1
+        fi
+
+        container_id="$(docker compose ps -aq db | tail -n 1)"
+        if [[ -z "$container_id" ]]; then
+            echo "无法自动同步 MySQL 凭据：未找到 db 容器。" >&2
+            return 1
+        fi
+        volume_name="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Name}}{{end}}{{end}}' "$container_id" 2>/dev/null)"
+        database_image="$(docker inspect --format '{{.Config.Image}}' "$container_id" 2>/dev/null)"
+        if [[ -z "$volume_name" || -z "$database_image" ]]; then
+            echo "无法自动同步 MySQL 凭据：未识别到数据库卷或 MySQL 镜像。" >&2
+            return 1
+        fi
+
+        log "检测到 MySQL 数据卷密码与当前 .env 不一致，开始无损同步账号凭据"
+        progress 70 "步骤 7/11：无损同步 MySQL 账号密码（不会删除数据库和任务记录）"
+        docker compose stop --timeout 60 db >/dev/null
+
+        repair_container="dataanonymization-mysql-repair"
+        stop_mysql_repair_container "$repair_container"
+        if ! docker run -d --rm --name "$repair_container" --user mysql \
+            --volume "${volume_name}:/var/lib/mysql" --entrypoint mysqld "$database_image" \
+            --skip-grant-tables --skip-networking --socket=/tmp/mysql-repair.sock \
+            --pid-file=/tmp/mysql-repair.pid --skip-log-bin --general-log=OFF \
+            --slow-query-log=OFF >/dev/null; then
+            echo "MySQL 临时维护容器启动失败。" >&2
+            docker compose up -d db >/dev/null 2>&1 || true
+            return 1
+        fi
+
+        repair_ready=false
+        for attempt in {1..60}; do
+            if docker exec "$repair_container" mysqladmin --protocol=socket \
+                --socket=/tmp/mysql-repair.sock -uroot ping >/dev/null 2>&1; then
+                repair_ready=true
+                break
+            fi
+            if [[ "$(docker inspect --format '{{.State.Running}}' "$repair_container" 2>/dev/null || true)" != "true" ]]; then
+                break
+            fi
+            sleep 1
+        done
+        if [[ "$repair_ready" != "true" ]]; then
+            echo "MySQL 临时维护容器未能就绪。" >&2
+            docker logs --tail=80 "$repair_container" >&2 2>&1 || true
+            stop_mysql_repair_container "$repair_container"
+            docker compose up -d db >/dev/null 2>&1 || true
+            return 1
+        fi
+
+        if ! printf '%s\n' \
+            'FLUSH PRIVILEGES;' \
+            "CREATE DATABASE IF NOT EXISTS \`${database_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+            "CREATE USER IF NOT EXISTS '${database_user}'@'%' IDENTIFIED BY '${database_password}';" \
+            "ALTER USER '${database_user}'@'%' IDENTIFIED BY '${database_password}' ACCOUNT UNLOCK;" \
+            "GRANT ALL PRIVILEGES ON \`${database_name}\`.* TO '${database_user}'@'%';" \
+            "ALTER USER 'root'@'localhost' IDENTIFIED BY '${root_password}';" \
+            'FLUSH PRIVILEGES;' | docker exec -i "$repair_container" mysql \
+                --protocol=socket --socket=/tmp/mysql-repair.sock -uroot >/dev/null; then
+            echo "MySQL 账号凭据同步失败。" >&2
+            stop_mysql_repair_container "$repair_container"
+            docker compose up -d db >/dev/null 2>&1 || true
+            return 1
+        fi
+
+        stop_mysql_repair_container "$repair_container"
+        docker compose up -d --force-recreate db
+        log "MySQL 账号凭据已与当前 .env 同步，数据库内容保持不变"
+    }
+
     wait_for_healthy() {
         local service="$1"
         local maximum_attempts="$2"
@@ -417,6 +522,10 @@ deploy_application() {
             if [[ "$health" == "healthy" ]]; then
                 return 0
             fi
+            if [[ "$service" == "db" ]] && database_authentication_failed "$container_id"; then
+                progress "$stage_percent" "${stage_label}（检测到 ERROR 1045：数据卷密码与当前 .env 不一致）"
+                return 2
+            fi
             progress "$stage_percent" "${stage_label}（第 ${attempt}/${maximum_attempts} 次：容器 ${state:-未知}，健康 ${health:-未知}）"
             if [[ "$state" == "exited" || "$state" == "dead" ]]; then
                 compose_diagnostics "$service"
@@ -430,11 +539,28 @@ deploy_application() {
 
     log "启动 MySQL 与前端容器"
     progress 62 "步骤 6/11：启动 MySQL 与前端容器"
+    stop_mysql_repair_container dataanonymization-mysql-repair
     docker compose up -d --remove-orphans db frontend
     progress 70 "步骤 7/11：等待 MySQL 接受应用账号连接"
-    if ! wait_for_healthy db 60 70 "步骤 7/11：等待 MySQL 接受应用账号连接"; then
-        echo "MySQL 容器未能在 180 秒内通过健康检查。" >&2
-        exit 1
+    if wait_for_healthy db 60 70 "步骤 7/11：等待 MySQL 接受应用账号连接"; then
+        :
+    else
+        database_health_result=$?
+        if [[ "$database_health_result" -eq 2 ]]; then
+            if ! repair_mysql_credentials; then
+                compose_diagnostics db
+                echo "MySQL 密码不一致且无损同步失败；数据库数据未被删除。" >&2
+                exit 1
+            fi
+            if ! wait_for_healthy db 60 70 "步骤 7/11：验证同步后的 MySQL 连接"; then
+                compose_diagnostics db
+                echo "MySQL 凭据已尝试同步，但容器仍未通过健康检查。" >&2
+                exit 1
+            fi
+        else
+            echo "MySQL 容器未能在 180 秒内通过健康检查。" >&2
+            exit 1
+        fi
     fi
 
     log "启动并检查 Django 后端容器"

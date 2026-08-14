@@ -115,7 +115,7 @@ Web 直连的进度由 HTTP 响应中的总大小和实际写入磁盘的字节�
 - MySQL root 密码；
 - MySQL 应用账号密码。
 
-脚本会同时设置 WSL 文件权限和 Windows NTFS ACL，仅保留当前管理员、SYSTEM 和本机管理员组权限。请离线备份 `MAPPING_ENCRYPTION_KEY`；该密钥丢失后，已保存任务无法反匿名。脚本不会覆盖已有 `.env`，如果其中仍含示例弱密钥则会拒绝部署。
+脚本会同时设置 WSL 文件权限和 Windows NTFS ACL，仅保留当前管理员、SYSTEM 和本机管理员组权限。请离线备份 `MAPPING_ENCRYPTION_KEY`；该密钥丢失后，已保存任务无法反匿名。脚本不会覆盖已有 `.env`，如果其中仍含示例弱密钥则会拒绝部署。如果脚本生成的 `.env` 与已初始化 MySQL 数据卷密码不一致，部署程序只同步 MySQL root 与应用账号密码，不修改 Django 密钥、映射加密密钥或业务数据。
 
 本应用按需求无需登录，因此请勿把 `5291` 直接暴露到互联网。建议只允许可信办公内网访问，并在正式环境通过组织网关增加 HTTPS、身份认证和访问审计。
 
@@ -183,7 +183,9 @@ docker compose up -d --build      # 更新并重建
 
 最新版脚本会分阶段启动 MySQL、前端、Django 后端和 Nginx，不再让 `docker compose up` 在依赖失败时隐藏根因。MySQL 健康检查会使用应用实际数据库账号执行 `SELECT 1`，后端健康检查也有独立启动缓冲。任一容器退出或超时，窗口及 `.runtime` 安装日志会自动显示容器状态、退出码、最近的健康检查结果和对应服务日志。
 
-如果诊断信息提示 MySQL `Access denied`，通常是现有 `mysql_data` 数据卷的旧密码与当前 `.env` 不一致。脚本不会自动删除数据库卷。已有数据时应恢复与该数据卷匹配的原 `.env`；只有明确确认没有需要保留的数据时，才可按运维文档手工重建数据库卷。
+如果诊断信息提示 MySQL `ERROR 1045` 或 `Access denied`，通常是现有 `mysql_data` 数据卷的旧密码与当前 `.env` 不一致。最新版脚本会在首次发现 1045 后停止等待，验证 `.env` 使用的是脚本生成的 64 位十六进制随机密码，然后停止正常数据库容器，使用不开放网络、仅允许容器内部 Unix 套接字连接的临时维护容器，同步 root 与应用账号密码。同步完成后临时容器立即删除，原数据库卷、任务记录和业务表不会删除，部署会自动继续。
+
+如果 `.env` 使用了人工设置的其他密码格式，脚本会安全停止而不会修改数据库。此时应恢复与数据卷匹配的原 `.env`，或由数据库管理员按组织流程手工重置密码；只有明确确认没有需要保留的数据时，才可按运维文档重建数据库卷。不要直接执行 `docker compose down -v` 处理密码错误。
 
 容器部署阶段会显示 `步骤 1/11` 至 `步骤 11/11`，依次覆盖 Docker 启动、安全配置、基础镜像拉取、后端构建、前端构建、MySQL 启动与检查、Django 启动与检查、Nginx 启动和网站检查。同一小步骤耗时较长时，单行进度会每秒更新本步骤耗时、部署总耗时和最近一条 Docker 输出；数据库及后端健康检查还会显示当前检查次数、容器状态和健康状态。当前步骤同时写入 `.runtime` 下的临时状态文件，Docker 构建日志很大时也不会丢失步骤名称，流程结束后自动删除该文件。
 
@@ -199,13 +201,16 @@ Get-NetTCPConnection -LocalPort 5291 -State Listen
 
 ### 重跑是否会清空数据
 
-不会。脚本是幂等的，现有 `.env` 和 Docker 数据卷会保留。除非明确执行 `docker compose down -v`，否则 MySQL 和保存文件不会被删除。
+不会。脚本是幂等的，现有 `.env` 和 Docker 数据卷会保留。数据库密码不一致时只执行账号密码同步，不重建数据卷。除非明确执行 `docker compose down -v`，否则 MySQL 和保存文件不会被删除。
 
 ## 参考依据
 
 - [Microsoft：安装 WSL](https://learn.microsoft.com/zh-cn/windows/wsl/install)
 - [Microsoft：旧版本 WSL 的手动安装步骤与 WSL2 要求](https://learn.microsoft.com/zh-cn/windows/wsl/install-manual)
 - [Microsoft：在 WSL 中使用 systemd（要求 WSL 0.67.6 或更高）](https://learn.microsoft.com/zh-cn/windows/wsl/systemd)
+- [MySQL 8.4：`--skip-grant-tables` 与禁用远程连接](https://dev.mysql.com/doc/refman/8.4/en/server-options.html)
+- [MySQL 8.4：`FLUSH PRIVILEGES` 重新加载权限表](https://dev.mysql.com/doc/refman/8.4/en/flush.html)
+- [Docker 官方 MySQL 镜像：已有数据目录时初始化环境变量不会修改现有数据库](https://github.com/docker-library/docs/blob/master/mysql/README.md)
 - [Docker：在 Ubuntu 安装 Docker Engine](https://docs.docker.com/engine/install/ubuntu/)
 - [Docker：安装 Compose 插件](https://docs.docker.com/compose/install/linux/)
 - [清华大学 TUNA：Docker CE 镜像使用帮助](https://mirrors.tuna.tsinghua.edu.cn/help/docker-ce/)

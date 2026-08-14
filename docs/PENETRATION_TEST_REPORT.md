@@ -72,6 +72,7 @@
 - 删除要求任务 UUID 二次确认，并同步删除整个任务目录。
 - API 匿名访问频率限制为每来源地址每分钟 180 次。
 - MySQL 不对宿主机直接开放端口。
+- MySQL 数据卷凭据与 `.env` 不一致时，仅允许安装脚本对其自行生成的 64 位十六进制密码执行无损同步；维护容器强制禁用 TCP 网络、二进制日志、通用日志和慢查询日志，只通过容器内部 Unix 套接字修改 root 与应用账号密码，完成后立即删除。该流程不会删除数据库卷或任务记录。
 - Nginx 配置 CSP、Permissions-Policy、X-Frame-Options、X-Content-Type-Options 和 Referrer-Policy。
 - 生产配置默认关闭 Django Debug 并限制 Host。
 - Windows 安装脚本的 WSL MSI 只接受 GitHub 官方发布接口提供的资产；下载后校验官方 SHA-256（接口提供时）及微软 Authenticode 数字签名。
