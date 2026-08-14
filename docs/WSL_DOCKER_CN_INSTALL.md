@@ -14,7 +14,7 @@
 | 网络 | 能访问 Microsoft WSL 服务及所配置国内镜像 | 稳定宽带 |
 | 端口 | TCP 5291 未被其他程序占用 | 仅向可信内网开放 |
 
-Windows 10 家庭版、专业版、企业版和教育版只要达到上述版本并支持 WSL2，均可使用。WSL 本身是 Windows 签名系统组件，仍从 Microsoft 官方服务安装；Ubuntu APT、Docker CE、PyPI、npm 和应用基础容器使用中国大陆镜像。
+Windows 10 家庭版、专业版、企业版和教育版只要达到上述版本并支持 WSL2，均可使用。WSL 本身是 Windows 签名系统组件，仍从 Microsoft 官方服务安装；Ubuntu APT、Docker CE 和 PyPI 会在清华、阿里云与 USTC 之间选择，npm 和应用基础容器则优先使用中国大陆镜像，国内候选不可用时再尝试对应官方源。
 
 脚本默认部署 Ubuntu 24.04、Python 3.13、Django 5.2、MySQL 8.4、Node.js 22 和 Nginx 1.27。组件兼容范围如下：
 
@@ -27,7 +27,7 @@ Windows 10 家庭版、专业版、企业版和教育版只要达到上述版本
 
 上述上限是安装脚本采用的保守自动部署边界，并不表示更高版本一定不能运行。超出上限时停止，是为了避免安装脚本在未验证的新主版本上修改现有环境。
 
-最开始的系统资源检测会显示 `系统检测 1/11` 至 `系统检测 11/11`，依次检查 Windows 版本、内存与虚拟机信息、处理器虚拟化、项目磁盘、端口 5291、两个 Windows 功能和四个国内镜像。WMI、端口与网络单项最长等待 15 秒，DISM Windows 功能检查单项最长等待 45 秒。每项开始、完成或失败状态都会写入固定支持日志；某项失去响应时会终止该独立检测任务并报告具体名称，不再无限停留在“检测 Windows、硬件与部署资源”。
+最开始的系统资源检测会显示 `系统检测 1/10` 至 `系统检测 10/10`，依次检查 Windows 版本、内存与虚拟机信息、处理器虚拟化、项目磁盘、端口 5291、两个 Windows 功能，并为软件包、npm 和容器镜像选择可用来源。WMI 与端口单项最长等待 15 秒，DISM Windows 功能检查单项最长等待 45 秒；镜像候选超时后自动尝试下一个，不再因为单个公共镜像不可访问而终止。每项开始、完成、失败及最终选择都会写入固定支持日志。
 
 选择继续安装后，现有环境检测会明确显示“WSL 运行时版本、WSL 发行版、发行版版本、Docker/Compose”四个子步骤。WSL 版本和发行版查询各最多等待 12 秒，Docker/Compose 查询最多等待 20 秒；命令超时会结束本次只读检测，按“未安装或版本不可识别”继续，不会无限停在“检测主机现有的 WSL、Ubuntu 与 Docker”。
 
@@ -97,16 +97,14 @@ Web 直连的进度由 HTTP 响应中的总大小和实际写入磁盘的字节�
 
 ## 自动配置的镜像
 
-| 依赖 | 默认中国大陆来源 |
+| 依赖 | 自动选择顺序 |
 |---|---|
-| Ubuntu APT | 清华大学 TUNA |
-| Docker CE 软件包 | 清华大学 TUNA |
-| Python / Django 包 | 清华大学 TUNA PyPI |
-| npm 包 | npmmirror |
-| Python、MySQL、Node、Nginx 容器 | DaoCloud 公共镜像代理 |
-| Docker Hub 加速 | DaoCloud |
+| Ubuntu APT、Docker CE、Python / Django | 清华大学 TUNA → 阿里云 → USTC |
+| npm 包 | npmmirror → npm 官方源 |
+| Python、MySQL、Node、Nginx 容器 | DaoCloud 公共镜像代理 → Docker Hub 官方地址 |
+| Docker Hub 加速 | 选择 DaoCloud 时启用；回退官方地址时不写入无效加速项 |
 
-国内公共镜像属于外部依赖，服务地址可能调整。生产环境建议将所需镜像同步到组织自有的 Harbor/制品库，并将 `.env` 中的四个镜像地址改为内部地址。
+脚本会把检测选中的实际地址写入 WSL 配置和 `.env`，不是只在检测阶段临时放行；已有 `.env` 的密码与密钥保持不变，只更新镜像相关字段，确保失败后重试也能应用新选择。国内公共镜像属于外部依赖，服务地址可能调整。生产环境建议将所需镜像同步到组织自有的 Harbor/制品库，并将 `.env` 中的四个镜像地址改为内部地址。
 
 ## 安全配置
 
@@ -175,7 +173,7 @@ docker compose up -d --build      # 更新并重建
 
 ### 国内 Docker 镜像不可用
 
-公共镜像可用性会变化。编辑 `.env`，把 `MYSQL_IMAGE`、`PYTHON_IMAGE`、`NODE_IMAGE`、`NGINX_IMAGE` 改为可用的组织内部镜像或官方镜像，然后重新执行：
+最新版脚本会自动尝试清华、阿里云、USTC、npmmirror、DaoCloud 以及必要的官方回退地址。只有同一类别的所有候选均不可用时才停止。此时可编辑 `.env`，把 `MYSQL_IMAGE`、`PYTHON_IMAGE`、`NODE_IMAGE`、`NGINX_IMAGE` 改为可用的组织内部镜像或官方镜像，然后重新执行：
 
 ```powershell
 .\install-wsl-docker-cn.ps1
@@ -212,3 +210,7 @@ Get-NetTCPConnection -LocalPort 5291 -State Listen
 - [Docker：安装 Compose 插件](https://docs.docker.com/compose/install/linux/)
 - [清华大学 TUNA：Docker CE 镜像使用帮助](https://mirrors.tuna.tsinghua.edu.cn/help/docker-ce/)
 - [清华大学 TUNA：PyPI 镜像使用帮助](https://mirrors.tuna.tsinghua.edu.cn/help/pypi/)
+- [阿里云：Docker CE 镜像](https://developer.aliyun.com/mirror/docker-ce/)
+- [阿里云：PyPI 镜像](https://developer.aliyun.com/mirror/pypi)
+- [中国科学技术大学 USTC：Docker CE 镜像](https://mirrors.ustc.edu.cn/help/docker-ce.html)
+- [中国科学技术大学 USTC：PyPI 镜像](https://mirrors.ustc.edu.cn/help/pypi.html)

@@ -38,12 +38,12 @@ set -Eeuo pipefail
 
 PHASE="${1:-all}"
 PROJECT_DIR="${2:-}"
-APT_MIRROR="https://mirrors.tuna.tsinghua.edu.cn"
-PYPI_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-NPM_MIRROR="https://registry.npmmirror.com"
-DOCKER_CE_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/docker-ce"
-DOCKER_HUB_PREFIX="m.daocloud.io/docker.io/library/"
-DOCKER_REGISTRY_MIRROR="https://docker.m.daocloud.io"
+APT_MIRROR="__APT_MIRROR__"
+PYPI_MIRROR="__PYPI_MIRROR__"
+NPM_MIRROR="__NPM_MIRROR__"
+DOCKER_CE_MIRROR="__DOCKER_CE_MIRROR__"
+DOCKER_HUB_PREFIX="__DOCKER_HUB_PREFIX__"
+DOCKER_REGISTRY_MIRROR="__DOCKER_REGISTRY_MIRROR__"
 DOCKER_MIN_VERSION="24.0"
 DOCKER_MAX_VERSION="30.0"
 COMPOSE_MIN_VERSION="2.20"
@@ -85,7 +85,7 @@ require_root() {
 }
 
 configure_ubuntu_mirror() {
-    log "配置 Ubuntu 清华大学镜像源"
+    log "配置 Ubuntu 软件源：${APT_MIRROR}"
     if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
         cp -n /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.before-data-anonymization || true
         sed -i \
@@ -155,7 +155,7 @@ install_docker() {
     if [[ "$docker_supported" == true ]]; then
         log "Docker Engine ${docker_version} 位于支持范围，仅补装/升级 Compose，不重复安装 Engine"
     else
-        log "Docker Engine 缺失或低于支持范围，将通过清华大学 Docker CE 镜像仓库安装"
+        log "Docker Engine 缺失或低于支持范围，将通过 ${DOCKER_CE_MIRROR} 安装"
         DEBIAN_FRONTEND=noninteractive apt-get remove -y \
             docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc \
             >/dev/null 2>&1 || true
@@ -239,7 +239,11 @@ EOF
 }
 
 configure_docker_mirror() {
-    log "配置 Docker Hub 中国大陆镜像加速"
+    if [[ -z "$DOCKER_REGISTRY_MIRROR" ]]; then
+        log "未找到可用的 Docker Hub 国内代理，使用 Docker Hub 官方地址"
+        return
+    fi
+    log "配置 Docker Hub 镜像加速：${DOCKER_REGISTRY_MIRROR}"
     install -d -m 0755 /etc/docker
     if [[ -s /etc/docker/daemon.json ]]; then
         if ! jq empty /etc/docker/daemon.json >/dev/null 2>&1; then
@@ -300,11 +304,27 @@ start_docker() {
 write_secure_environment() {
     local env_file="${PROJECT_DIR}/.env"
     if [[ -f "$env_file" ]]; then
-        log "检测到现有 .env，保留原配置"
+        log "检测到现有 .env，保留密钥和密码并更新镜像地址"
         if grep -Eq '=(please-change-|local-dev-)' "$env_file"; then
             echo "现有 .env 仍含示例弱密钥。请删除它让脚本生成随机密钥，或手工替换示例值。" >&2
             exit 1
         fi
+        set_env_value() {
+            local key="$1"
+            local value="$2"
+            if grep -q "^${key}=" "$env_file"; then
+                sed -i "s|^${key}=.*|${key}=${value}|" "$env_file"
+            else
+                printf '%s=%s\n' "$key" "$value" >>"$env_file"
+            fi
+        }
+        set_env_value MYSQL_IMAGE "${DOCKER_HUB_PREFIX}mysql:8.4"
+        set_env_value PYTHON_IMAGE "${DOCKER_HUB_PREFIX}python:3.13-slim"
+        set_env_value NODE_IMAGE "${DOCKER_HUB_PREFIX}node:22-alpine"
+        set_env_value NGINX_IMAGE "${DOCKER_HUB_PREFIX}nginx:1.27-alpine"
+        set_env_value PIP_INDEX_URL "$PYPI_MIRROR"
+        set_env_value NPM_REGISTRY "$NPM_MIRROR"
+        set_env_value DEBIAN_MIRROR "${APT_MIRROR}/debian"
         return
     fi
 
@@ -488,9 +508,25 @@ function Get-ProjectDiskInfo([string]$ResolvedPath) {
         Select-Object -First 1
 }
 
-function Write-WslBootstrap([string]$TargetPath) {
+function Write-WslBootstrap([string]$TargetPath, [System.Collections.IDictionary]$MirrorConfig) {
+    if (-not $MirrorConfig) { throw '缺少已选择的镜像配置，无法生成 WSL 安装脚本。' }
     $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
     $linuxText = $WslBootstrap -replace "`r`n", "`n"
+    $replacements = [ordered]@{
+        '__APT_MIRROR__' = [string]$MirrorConfig.AptMirror
+        '__PYPI_MIRROR__' = [string]$MirrorConfig.PypiMirror
+        '__NPM_MIRROR__' = [string]$MirrorConfig.NpmMirror
+        '__DOCKER_CE_MIRROR__' = [string]$MirrorConfig.DockerCeMirror
+        '__DOCKER_HUB_PREFIX__' = [string]$MirrorConfig.DockerHubPrefix
+        '__DOCKER_REGISTRY_MIRROR__' = [string]$MirrorConfig.DockerRegistryMirror
+    }
+    foreach ($replacement in $replacements.GetEnumerator()) {
+        $linuxText = $linuxText.Replace([string]$replacement.Key, [string]$replacement.Value)
+    }
+    $unresolvedMirrorTokens = @($replacements.Keys | Where-Object { $linuxText.Contains([string]$_) })
+    if ($unresolvedMirrorTokens.Count -gt 0) {
+        throw "WSL 安装脚本仍包含未替换的镜像占位符：$($unresolvedMirrorTokens -join ', ')"
+    }
     [IO.File]::WriteAllText($TargetPath, $linuxText, $utf8WithoutBom)
 }
 
@@ -1797,7 +1833,7 @@ Write-Host '安全说明：日志不会主动输出 .env 密码、密钥或令�
 
 try {
     Write-Step '检测 Windows、硬件与部署资源'
-    $probeStepCount = 11
+    $probeStepCount = 10
     $os = Invoke-SystemProbeWithTimeout -Name '读取 Windows 版本（WMI）' `
         -StepNumber 1 -StepCount $probeStepCount -ProgressPercent 1 -TimeoutSeconds 15 `
         -ScriptBlock {
@@ -1852,39 +1888,131 @@ try {
             Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
         }
 
-    $mirrorEndpoints = [ordered]@{
-        '清华 Docker CE' = 'https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/ubuntu/gpg'
-        '清华 PyPI' = 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/django/'
-        'npmmirror' = 'https://registry.npmmirror.com/vue'
-        'DaoCloud 容器镜像' = 'https://m.daocloud.io/v2/'
+    $packageMirrorCandidates = @(
+        [pscustomobject]@{
+            Name = '清华大学 TUNA'; AptMirror = 'https://mirrors.tuna.tsinghua.edu.cn'
+            DockerCeMirror = 'https://mirrors.tuna.tsinghua.edu.cn/docker-ce'
+            PypiMirror = 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple'
+            DockerProbe = 'https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/ubuntu/gpg'
+            PypiProbe = 'https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/django/'
+        }
+        [pscustomobject]@{
+            Name = '阿里云'; AptMirror = 'https://mirrors.aliyun.com'
+            DockerCeMirror = 'https://mirrors.aliyun.com/docker-ce'
+            PypiMirror = 'https://mirrors.aliyun.com/pypi/simple'
+            DockerProbe = 'https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg'
+            PypiProbe = 'https://mirrors.aliyun.com/pypi/simple/django/'
+        }
+        [pscustomobject]@{
+            Name = '中国科学技术大学 USTC'; AptMirror = 'https://mirrors.ustc.edu.cn'
+            DockerCeMirror = 'https://mirrors.ustc.edu.cn/docker-ce'
+            PypiMirror = 'https://mirrors.ustc.edu.cn/pypi/simple'
+            DockerProbe = 'https://mirrors.ustc.edu.cn/docker-ce/linux/ubuntu/gpg'
+            PypiProbe = 'https://mirrors.ustc.edu.cn/pypi/simple/django/'
+        }
+    )
+    $selectedPackageMirror = $null
+    foreach ($candidate in $packageMirrorCandidates) {
+        try {
+            $candidateResult = Invoke-SystemProbeWithTimeout -Name "选择软件源：$($candidate.Name)" `
+                -StepNumber 8 -StepCount $probeStepCount -ProgressPercent 8 -TimeoutSeconds 14 `
+                -ArgumentList @([string]$candidate.DockerProbe, [string]$candidate.PypiProbe) `
+                -ScriptBlock {
+                    param($dockerProbe, $pypiProbe)
+                    $ProgressPreference = 'SilentlyContinue'
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                    foreach ($probeUrl in @($dockerProbe, $pypiProbe)) {
+                        try {
+                            $null = Invoke-WebRequest -UseBasicParsing -Method Head -Uri $probeUrl `
+                                -TimeoutSec 6 -ErrorAction Stop
+                        } catch {
+                            return $false
+                        }
+                    }
+                    return $true
+                }
+            if ([bool]($candidateResult | Select-Object -First 1)) {
+                $selectedPackageMirror = $candidate
+                break
+            }
+            Write-Warning "$($candidate.Name) 软件源不可访问，自动尝试下一个候选。"
+        } catch {
+            Write-Warning "$($candidate.Name) 软件源检测超时，自动尝试下一个候选。"
+        }
     }
-    $networkStep = 7
-    $mirrorChecks = foreach ($endpoint in $mirrorEndpoints.GetEnumerator()) {
-        $networkStep++
-        $networkPercent = [math]::Min(10, 7 + [math]::Ceiling(($networkStep - 7) * 3 / $mirrorEndpoints.Count))
-        $reachableResult = Invoke-SystemProbeWithTimeout -Name "检测国内镜像：$($endpoint.Key)" `
-            -StepNumber $networkStep -StepCount $probeStepCount -ProgressPercent $networkPercent `
-            -TimeoutSeconds 15 -ArgumentList @([string]$endpoint.Key, [string]$endpoint.Value) `
-            -ScriptBlock {
-                param($endpointName, $endpointUrl)
-                $ProgressPreference = 'SilentlyContinue'
-                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                if ($endpointName -eq 'DaoCloud 容器镜像') {
-                    # Registry /v2/ 的 401 是正常认证挑战，只检测 HTTPS 端口。
-                    return Test-NetConnection -ComputerName ([Uri]$endpointUrl).Host -Port 443 `
+
+    $npmCandidates = @(
+        [pscustomobject]@{ Name = 'npmmirror'; Registry = 'https://registry.npmmirror.com'; Probe = 'https://registry.npmmirror.com/vue'; IsOfficialFallback = $false }
+        [pscustomobject]@{ Name = 'npm 官方源'; Registry = 'https://registry.npmjs.org'; Probe = 'https://registry.npmjs.org/vue'; IsOfficialFallback = $true }
+    )
+    $selectedNpmMirror = $null
+    foreach ($candidate in $npmCandidates) {
+        try {
+            $candidateResult = Invoke-SystemProbeWithTimeout -Name "选择 npm 源：$($candidate.Name)" `
+                -StepNumber 9 -StepCount $probeStepCount -ProgressPercent 9 -TimeoutSeconds 10 `
+                -ArgumentList @([string]$candidate.Probe) -ScriptBlock {
+                    param($probeUrl)
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                    try {
+                        $null = Invoke-WebRequest -UseBasicParsing -Method Head -Uri $probeUrl `
+                            -TimeoutSec 6 -ErrorAction Stop
+                        return $true
+                    } catch {
+                        return $false
+                    }
+                }
+            if ([bool]($candidateResult | Select-Object -First 1)) {
+                $selectedNpmMirror = $candidate
+                break
+            }
+            Write-Warning "$($candidate.Name) 不可访问，自动尝试下一个候选。"
+        } catch {
+            Write-Warning "$($candidate.Name) 检测超时，自动尝试下一个候选。"
+        }
+    }
+
+    $containerMirrorCandidates = @(
+        [pscustomobject]@{
+            Name = 'DaoCloud'; Host = 'm.daocloud.io'
+            ImagePrefix = 'm.daocloud.io/docker.io/library/'
+            RegistryMirror = 'https://docker.m.daocloud.io'; IsOfficialFallback = $false
+        }
+        [pscustomobject]@{
+            Name = 'Docker Hub 官方地址'; Host = 'registry-1.docker.io'
+            ImagePrefix = ''; RegistryMirror = ''; IsOfficialFallback = $true
+        }
+    )
+    $selectedContainerMirror = $null
+    foreach ($candidate in $containerMirrorCandidates) {
+        try {
+            $candidateResult = Invoke-SystemProbeWithTimeout -Name "选择容器镜像源：$($candidate.Name)" `
+                -StepNumber 10 -StepCount $probeStepCount -ProgressPercent 10 -TimeoutSeconds 10 `
+                -ArgumentList @([string]$candidate.Host) -ScriptBlock {
+                    param($hostName)
+                    $ProgressPreference = 'SilentlyContinue'
+                    return Test-NetConnection -ComputerName $hostName -Port 443 `
                         -InformationLevel Quiet -WarningAction SilentlyContinue
                 }
-                try {
-                    $null = Invoke-WebRequest -UseBasicParsing -Method Head -Uri $endpointUrl `
-                        -TimeoutSec 10 -ErrorAction Stop
-                    return $true
-                } catch {
-                    return $false
-                }
+            if ([bool]($candidateResult | Select-Object -First 1)) {
+                $selectedContainerMirror = $candidate
+                break
             }
-        $reachable = [bool]($reachableResult | Select-Object -First 1)
-        [pscustomobject]@{ Name = $endpoint.Key; Reachable = $reachable; Url = $endpoint.Value }
+            Write-Warning "$($candidate.Name) 不可访问，自动尝试下一个候选。"
+        } catch {
+            Write-Warning "$($candidate.Name) 检测超时，自动尝试下一个候选。"
+        }
     }
+
+    $selectedMirrorConfig = if ($selectedPackageMirror -and $selectedNpmMirror -and $selectedContainerMirror) {
+        [ordered]@{
+            AptMirror = [string]$selectedPackageMirror.AptMirror
+            DockerCeMirror = [string]$selectedPackageMirror.DockerCeMirror
+            PypiMirror = [string]$selectedPackageMirror.PypiMirror
+            NpmMirror = [string]$selectedNpmMirror.Registry
+            DockerHubPrefix = [string]$selectedContainerMirror.ImagePrefix
+            DockerRegistryMirror = [string]$selectedContainerMirror.RegistryMirror
+        }
+    } else { $null }
 
     $results = @(
         [pscustomobject]@{ Item = 'Windows'; Result = $os.Caption; Required = 'Windows 10 2004 / Build 19041 或 Windows 11' }
@@ -1896,7 +2024,11 @@ try {
         [pscustomobject]@{ Item = 'WSL 组件'; Result = $wslFeature.State; Required = 'Enabled（脚本可自动启用）' }
         [pscustomobject]@{ Item = '虚拟机平台'; Result = $vmFeature.State; Required = 'Enabled（脚本可自动启用）' }
         [pscustomobject]@{ Item = '应用端口 5291'; Result = if ($portOwner) { "已占用，PID $($portOwner.OwningProcess)" } else { '可用' }; Required = '部署时需可用' }
-        [pscustomobject]@{ Item = '国内镜像网络'; Result = if ($mirrorChecks.Reachable -notcontains $false) { '全部可访问' } else { '存在不可访问端点' }; Required = '清华、npmmirror、DaoCloud 可访问' }
+        [pscustomobject]@{
+            Item = '软件与容器镜像'
+            Result = if ($selectedMirrorConfig) { "$($selectedPackageMirror.Name) / $($selectedNpmMirror.Name) / $($selectedContainerMirror.Name)" } else { '没有完整的可用组合' }
+            Required = '每类至少一个候选可访问'
+        }
     )
     $results | Format-Table -AutoSize
 
@@ -1907,9 +2039,9 @@ try {
     if ($memoryGB -lt $MinimumMemoryGB) { $blocking.Add("内存不足 $MinimumMemoryGB GB。") }
     if ($diskFreeGB -lt $MinimumDiskGB) { $blocking.Add("项目所在磁盘可用空间不足 $MinimumDiskGB GB。") }
     if (-not (Test-Path (Join-Path $resolvedProject 'docker-compose.yml'))) { $blocking.Add('项目目录缺少 docker-compose.yml。') }
-    foreach ($failedMirror in @($mirrorChecks | Where-Object { -not $_.Reachable })) {
-        $blocking.Add("国内镜像不可访问：$($failedMirror.Name)（$($failedMirror.Url)）。")
-    }
+    if (-not $selectedPackageMirror) { $blocking.Add('清华、阿里云和 USTC 软件源均不可访问。') }
+    if (-not $selectedNpmMirror) { $blocking.Add('npmmirror 和 npm 官方源均不可访问。') }
+    if (-not $selectedContainerMirror) { $blocking.Add('DaoCloud 和 Docker Hub 官方地址均不可访问。') }
 
     if ($memoryGB -lt $RecommendedMemoryGB -and $memoryGB -ge $MinimumMemoryGB) {
         Write-Warning "内存低于建议值 $RecommendedMemoryGB GB，首次构建可能较慢。"
@@ -1919,6 +2051,15 @@ try {
     }
     if ($portOwner) {
         Write-Warning "端口 5291 当前由 PID $($portOwner.OwningProcess) 监听；若不是本项目，部署会失败。"
+    }
+    if ($selectedPackageMirror) { Write-Host "已选择软件源：$($selectedPackageMirror.Name)" -ForegroundColor Green }
+    if ($selectedNpmMirror) {
+        Write-Host "已选择 npm 源：$($selectedNpmMirror.Name)" -ForegroundColor Green
+        if ($selectedNpmMirror.IsOfficialFallback) { Write-Warning '国内 npm 镜像不可用，本次将使用 npm 官方源。' }
+    }
+    if ($selectedContainerMirror) {
+        Write-Host "已选择容器镜像源：$($selectedContainerMirror.Name)" -ForegroundColor Green
+        if ($selectedContainerMirror.IsOfficialFallback) { Write-Warning 'DaoCloud 不可用，本次将直接使用 Docker Hub 官方地址。' }
     }
     if ($blocking.Count -gt 0) {
         throw ("系统不符合安装要求：`n- " + ($blocking -join "`n- "))
@@ -2057,7 +2198,7 @@ try {
 
     $linuxProject = ConvertTo-WslPath -Distribution $DistroName -WindowsPath $resolvedProject
     $bootstrapPath = Join-Path $runtimeDirectory 'wsl-bootstrap.sh'
-    Write-WslBootstrap $bootstrapPath
+    Write-WslBootstrap $bootstrapPath $selectedMirrorConfig
     $linuxInstaller = ConvertTo-WslPath -Distribution $DistroName -WindowsPath $bootstrapPath
     $deployProgressPath = Join-Path $runtimeDirectory 'wsl-deploy-progress.txt'
     $linuxDeployProgressPath = ConvertTo-WslPath -Distribution $DistroName -WindowsPath $runtimeDirectory
