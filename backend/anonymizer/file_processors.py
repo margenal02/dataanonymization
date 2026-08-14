@@ -5,6 +5,8 @@ from pathlib import Path, PurePosixPath
 import xlrd
 from charset_normalizer import from_bytes
 from docx import Document
+from docx.oxml.ns import qn
+from lxml import etree
 from pypdf import PdfReader
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
@@ -100,6 +102,31 @@ def _transform_table(table, transform):
                 _transform_table(nested, transform)
 
 
+def _transform_docx_xml_parts(document, transform):
+    """Process text boxes and other Word text that python-docx does not expose as paragraphs."""
+    seen_paragraphs = set()
+    for part in document.part.package.parts:
+        root = getattr(part, "element", None)
+        if root is None:
+            root = getattr(part, "_element", None)
+        if root is None or not hasattr(root, "iter"):
+            continue
+        for paragraph in root.iter(qn("w:p")):
+            paragraph_id = id(paragraph)
+            if paragraph_id in seen_paragraphs:
+                continue
+            seen_paragraphs.add(paragraph_id)
+            text_nodes = list(paragraph.iter(qn("w:t")))
+            if not text_nodes:
+                continue
+            original = "".join(node.text or "" for node in text_nodes)
+            changed = transform(original)
+            if changed != original:
+                text_nodes[0].text = changed
+                for node in text_nodes[1:]:
+                    node.text = ""
+
+
 def process_docx(source, destination, transform):
     document = Document(source)
     for paragraph in document.paragraphs:
@@ -112,6 +139,7 @@ def process_docx(source, destination, transform):
                 _transform_paragraph(paragraph, transform)
             for table in area.tables:
                 _transform_table(table, transform)
+    _transform_docx_xml_parts(document, transform)
     document.save(destination)
 
 
@@ -215,6 +243,13 @@ def process_pdf(source, destination, transform):
     pdf.save()
 
 
+def _xml_local_name(node):
+    tag = getattr(node, "tag", "")
+    if not isinstance(tag, str):
+        return ""
+    return etree.QName(tag).localname
+
+
 def process_ofd(source, destination, transform):
     if not zipfile.is_zipfile(source):
         raise ProcessingError("OFD 文件结构无效或已损坏。")
@@ -223,9 +258,45 @@ def process_ofd(source, destination, transform):
             data = input_zip.read(info.filename)
             if info.filename.lower().endswith(".xml"):
                 try:
-                    text = data.decode("utf-8")
-                    data = transform(text).encode("utf-8")
-                except UnicodeDecodeError:
+                    parser = etree.XMLParser(resolve_entities=False, load_dtd=False, no_network=True, huge_tree=False)
+                    root = etree.fromstring(data, parser=parser)
+                    processed = set()
+
+                    # OFD producers often split one visible value across several TextCode
+                    # elements. Join nodes within the same TextObject before recognition.
+                    for text_object in root.iter():
+                        if _xml_local_name(text_object) != "TextObject":
+                            continue
+                        text_nodes = [
+                            node for node in text_object.iter()
+                            if _xml_local_name(node) == "TextCode" and node.text
+                        ]
+                        if not text_nodes:
+                            continue
+                        original = "".join(node.text or "" for node in text_nodes)
+                        changed = transform(original)
+                        if changed != original:
+                            text_nodes[0].text = changed
+                            for node in text_nodes[1:]:
+                                node.text = ""
+                        processed.update(text_nodes)
+
+                    # Metadata and simpler OFD variants may store content directly in
+                    # ordinary XML text nodes rather than TextObject/TextCode pairs.
+                    for node in root.iter():
+                        if node in processed or not node.text:
+                            continue
+                        node.text = transform(node.text)
+
+                    encoding = root.getroottree().docinfo.encoding or "UTF-8"
+                    data = etree.tostring(
+                        root,
+                        encoding=encoding,
+                        xml_declaration=data.lstrip().startswith(b"<?xml"),
+                    )
+                except (etree.XMLSyntaxError, LookupError, UnicodeError):
+                    # Keep malformed or vendor-specific XML unchanged rather than risking
+                    # corruption of the OFD package.
                     pass
             output_zip.writestr(info, data)
 
