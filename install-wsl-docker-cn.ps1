@@ -1830,6 +1830,18 @@ function Get-OfficialWslMsiAsset([string]$Architecture) {
     }
 }
 
+function Test-WslRestartRequiredResult($Result) {
+    if ($null -eq $Result) { return $false }
+    if ($Result.PSObject.Properties.Name -contains 'RestartRequired' -and $Result.RestartRequired) {
+        return $true
+    }
+    if ($Result.PSObject.Properties.Name -contains 'ExitCode' -and [int]$Result.ExitCode -eq 3010) {
+        return $true
+    }
+    $outputText = [string]::Join("`n", @($Result.Output))
+    return $outputText -match 'WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED'
+}
+
 function Install-OfficialWslMsi([string]$Architecture, [int]$ProgressStart, [int]$ProgressEnd) {
     $asset = Get-OfficialWslMsiAsset $Architecture
     $downloadEnd = $ProgressEnd - 2
@@ -1868,7 +1880,12 @@ function Install-OfficialWslMsi([string]$Architecture, [int]$ProgressStart, [int
         -Activity '安装微软签名的 WSL MSI' -ProgressStart $downloadEnd -ProgressEnd $ProgressEnd `
         -CommandTimeoutSeconds 600
     if ($result.ExitCode -notin @(0, 3010)) { throw "WSL MSI 安装失败，退出码：$($result.ExitCode)" }
-    return [pscustomobject]@{ Output = $result.Output; ExitCode = 0; TimedOut = $false }
+    return [pscustomobject]@{
+        Output = $result.Output
+        ExitCode = $result.ExitCode
+        TimedOut = $false
+        RestartRequired = ($result.ExitCode -eq 3010)
+    }
 }
 
 function Get-OfficialDistributionAsset([string]$Distribution, [string]$Architecture) {
@@ -1927,6 +1944,10 @@ function Install-OfficialDistributionFile(
         -ArgumentList @('--install', '--from-file', $target, '--no-launch') -DisplayOutput `
         -Activity "从已校验文件安装 $Distribution" -ProgressStart $downloadEnd -ProgressEnd $ProgressEnd `
         -CommandTimeoutSeconds 600
+    if (Test-WslRestartRequiredResult $result) {
+        $result | Add-Member -NotePropertyName RestartRequired -NotePropertyValue $true -Force
+        return $result
+    }
     if ($result.ExitCode -ne 0) { throw "$Distribution 本地安装失败。" }
     return $result
 }
@@ -1990,6 +2011,7 @@ function Invoke-WslOfficialDownload {
         $lastResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList $arguments `
             -DisplayOutput -Activity $activity -ProgressStart $ProgressStart -ProgressEnd $ProgressEnd `
             -NoProgressTimeoutSeconds $timeoutForAttempt
+        if (Test-WslRestartRequiredResult $lastResult) { return $lastResult }
         if ($lastResult.ExitCode -eq 0) { return $lastResult }
 
         if ($index -lt $channels.Count - 1) {
@@ -2058,12 +2080,12 @@ function Clear-ResumeAfterRestart {
     }
 }
 
-function Stop-ForRestart {
+function Stop-ForRestart([string]$Reason = 'WSL2 系统组件已启用') {
     $resumeRegistered = Set-ResumeAfterRestart
     if ($resumeRegistered) {
-        Write-Warning 'WSL2 系统组件已启用，需要重启 Windows。登录后安装脚本会自动继续。'
+        Write-Warning "$Reason，需要重启 Windows。登录后安装脚本会自动继续。"
     } else {
-        Write-Warning 'WSL2 系统组件已启用，需要重启 Windows。重启后请在项目目录重新运行本脚本；已完成步骤会自动跳过。'
+        Write-Warning "$Reason，需要重启 Windows。重启后请在项目目录重新运行本脚本；已完成步骤会自动跳过。"
     }
     if ($AutoReboot) {
         Write-Warning '15 秒后自动重启。若要取消，请立即运行：shutdown /a'
@@ -2547,6 +2569,10 @@ try {
         Write-Host "WSL 未安装或低于 $MinimumWslVersion，开始安装/更新。" -ForegroundColor Yellow
         $wslResult = Invoke-WslOfficialDownload -Operation Update -Architecture $architecture `
             -ProgressStart 25 -ProgressEnd 40
+        if (Test-WslRestartRequiredResult $wslResult) {
+            Stop-ForRestart -Reason 'WSL 运行时已安装并等待系统完成配置'
+            return
+        }
         if ($wslResult.ExitCode -ne 0) {
             throw 'WSL 运行时安装/更新失败。Auto 已尝试可用的微软官方通道；请检查 Microsoft Store/GitHub 网络后重试。'
         }
@@ -2561,12 +2587,20 @@ try {
     }
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-default-version', '2') `
         -DisplayOutput -Activity '设置默认 WSL 版本为 2' -ProgressStart 40 -ProgressEnd 42
+    if (Test-WslRestartRequiredResult $wslResult) {
+        Stop-ForRestart -Reason 'WSL2 组件仍在等待系统重启'
+        return
+    }
     if ($wslResult.ExitCode -ne 0) { throw '无法把 WSL 默认版本设为 2。请先完成 Windows Update。' }
 
     if ($DistroName -notin $installedDistros) {
         $wslResult = Invoke-WslOfficialDownload -Operation Install -Distribution $DistroName `
             -Architecture $architecture `
             -ProgressStart 42 -ProgressEnd 57
+        if (Test-WslRestartRequiredResult $wslResult) {
+            Stop-ForRestart -Reason "$DistroName 安装所需的 WSL2 组件仍在等待系统重启"
+            return
+        }
         if ($wslResult.ExitCode -ne 0) { throw "$DistroName 安装失败。Auto 已尝试可用的微软官方通道，请检查网络后重试。" }
         $installedDistros = Get-InstalledWslDistros -ShowDetectionProgress `
             -ProgressStart 57 -ProgressEnd 57 -Activity "验证已安装的 $DistroName"
