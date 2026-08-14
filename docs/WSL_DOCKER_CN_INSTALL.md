@@ -137,7 +137,9 @@ docker compose down               # 停止服务，保留数据卷
 docker compose up -d --build      # 更新并重建
 ```
 
-安装日志保存在项目的 `.runtime` 目录，该目录不会提交到 Git。
+安装支持日志固定写入项目下的 `.runtime/install-support-latest.log`，该目录不会提交到 Git。安装失败、窗口异常或需要协助排查时，直接把这一个文件发送给维护人员即可，不需要截图或猜测哪份日志最新。日志持续写入磁盘，因此 PowerShell 被强制关闭时仍会保留终止前的内容；下次启动脚本前，会把没有正常结束标记的旧日志另存为 `install-wsl-docker-recovered-时间.log`，避免被覆盖。每次正常结束或捕获到错误后，也会保存 `install-wsl-docker-时间.log` 历史归档。
+
+日志包含脚本 SHA-256、PowerShell/Windows 信息、安装参数、各步骤状态、Docker 最近输出、容器退出码、健康检查和异常调用栈。脚本不会主动输出 `.env` 中的密码、密钥或令牌；不要把 `.env` 文件一并发送。日志仍可能包含主机路径、局域网 IP、镜像名称和容器元数据，应按内部运维资料保护。
 
 ## 常见问题
 

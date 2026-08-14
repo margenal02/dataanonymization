@@ -35,6 +35,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 如只做检测，可为同一脚本添加 `-CheckOnly`。完整流程、支持版本、国内镜像配置、重启续跑和故障排查参见 [Windows + WSL2 + Docker 中国大陆一键安装说明](docs/WSL_DOCKER_CN_INSTALL.md)。
 
+安装过程持续记录到 `.runtime/install-support-latest.log`。如果脚本报错、窗口异常关闭或需要协助排查，直接发送这一份日志即可；不要发送包含密码和加密密钥的 `.env` 文件。正常及已捕获的失败运行会另存带时间的历史日志，未正常结束的日志会在下次运行前自动抢救归档。
+
 WSL 系统包只使用微软官方来源；`Auto`/`Web` 会先对 GitHub 官方直连及大陆反向代理做小文件实测，验证文件头后选择最快通道，再通过 Windows 原生 `curl.exe` 下载微软签名的 WSL MSI 和微软清单中的 Ubuntu 包。窗口每 0.5 秒在同一个动态进度区域内更新真实百分比、已下载/总大小、瞬时及平均 MB/s，不会连续新增下载记录，并支持断点续传和缓存复用。容器部署进一步拆分为 11 个可见小步骤，持续显示已等待时间、最近的 Docker 输出及健康检查次数。代理传输内容仍必须通过官方 SHA-256 和微软数字签名校验。现有 WSL、发行版和 Docker 检测有 12～20 秒超时保护；旧版 `wsl.exe` 的 UTF-16/系统代码页输出也会自动解码，避免中文乱码。Ubuntu APT、Docker、PyPI、npm 和应用容器继续使用大陆镜像。
 
 安装完成后访问 [http://localhost:5291](http://localhost:5291)。日常运维统一进入 WSL2：
