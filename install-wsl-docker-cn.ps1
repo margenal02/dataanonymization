@@ -567,6 +567,61 @@ function Clear-InstallProgressLine {
     $script:InstallProgressCells = 0
 }
 
+function Invoke-SystemProbeWithTimeout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList = @(),
+        [ValidateRange(1, 120)]
+        [int]$TimeoutSeconds = 15,
+        [ValidateRange(1, 20)]
+        [int]$StepNumber,
+        [ValidateRange(1, 20)]
+        [int]$StepCount,
+        [ValidateRange(0, 10)]
+        [int]$ProgressPercent
+    )
+
+    $activity = "系统检测 $StepNumber/$StepCount：$Name"
+    Write-InstallProgress -Percent $ProgressPercent -Activity $activity `
+        -Status "开始（最长等待 $TimeoutSeconds 秒）" -CompleteLine
+
+    $job = $null
+    try {
+        $job = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
+        $completedJob = Wait-Job -Job $job -Timeout $TimeoutSeconds
+        if (-not $completedJob) {
+            throw "系统检测 [$Name] 超过 $TimeoutSeconds 秒无响应，已停止。请检查 WMI、DISM 或网络服务状态。"
+        }
+        if ($job.State -ne 'Completed') {
+            $reason = $job.ChildJobs[0].JobStateInfo.Reason
+            $reasonText = if ($reason) { $reason.Message } else { "任务状态为 $($job.State)" }
+            throw "系统检测 [$Name] 未正常完成：$reasonText"
+        }
+
+        $output = @(Receive-Job -Job $job -ErrorAction Stop)
+        Write-InstallProgress -Percent $ProgressPercent -Activity $activity -Status '完成' -CompleteLine
+        if ($output.Count -eq 1) { return $output[0] }
+        return $output
+    }
+    catch {
+        Write-InstallProgress -Percent $ProgressPercent -Activity $activity `
+            -Status "失败：$($_.Exception.Message)" -CompleteLine
+        throw
+    }
+    finally {
+        if ($job) {
+            if ($job.State -in @('Running', 'NotStarted')) {
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+            }
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function ConvertFrom-NativeBytes([byte[]]$Bytes) {
     if (-not $Bytes -or $Bytes.Length -eq 0) { return '' }
     if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
@@ -1742,22 +1797,60 @@ Write-Host '安全说明：日志不会主动输出 .env 密码、密钥或令�
 
 try {
     Write-Step '检测 Windows、硬件与部署资源'
-    $os = Get-CimInstance Win32_OperatingSystem
-    $computer = Get-CimInstance Win32_ComputerSystem
-    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $probeStepCount = 11
+    $os = Invoke-SystemProbeWithTimeout -Name '读取 Windows 版本（WMI）' `
+        -StepNumber 1 -StepCount $probeStepCount -ProgressPercent 1 -TimeoutSeconds 15 `
+        -ScriptBlock {
+            Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 10 -ErrorAction Stop |
+                Select-Object -First 1
+        }
+    $computer = Invoke-SystemProbeWithTimeout -Name '读取内存和虚拟机信息（WMI）' `
+        -StepNumber 2 -StepCount $probeStepCount -ProgressPercent 2 -TimeoutSeconds 15 `
+        -ScriptBlock {
+            Get-CimInstance Win32_ComputerSystem -OperationTimeoutSec 10 -ErrorAction Stop |
+                Select-Object -First 1
+        }
+    $cpu = Invoke-SystemProbeWithTimeout -Name '读取处理器虚拟化信息（WMI）' `
+        -StepNumber 3 -StepCount $probeStepCount -ProgressPercent 3 -TimeoutSeconds 15 `
+        -ScriptBlock {
+            Get-CimInstance Win32_Processor -OperationTimeoutSec 10 -ErrorAction Stop |
+                Select-Object -First 1
+        }
     if (-not $os) { throw '无法读取 Win32_OperatingSystem 系统信息。请确认 WMI/CIM 服务正在运行。' }
     if (-not $computer) { throw '无法读取 Win32_ComputerSystem 硬件信息。请确认 WMI/CIM 服务正在运行。' }
     if (-not $cpu) { throw '无法读取 Win32_Processor 处理器信息。请确认 WMI/CIM 服务正在运行。' }
     $build = [int]$os.BuildNumber
     $memoryGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 1)
     $architecture = Get-WindowsArchitecture $computer $os
-    $disk = Get-ProjectDiskInfo $resolvedProject
+    $disk = Invoke-SystemProbeWithTimeout -Name '读取项目磁盘空间（WMI）' `
+        -StepNumber 4 -StepCount $probeStepCount -ProgressPercent 4 -TimeoutSeconds 15 `
+        -ArgumentList @($resolvedProject) -ScriptBlock {
+            param($projectPath)
+            $root = [IO.Path]::GetPathRoot([string]$projectPath)
+            if ([string]::IsNullOrWhiteSpace($root) -or $root.Length -lt 2) { return }
+            $deviceId = $root.Substring(0, 2)
+            Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$deviceId'" `
+                -OperationTimeoutSec 10 -ErrorAction Stop | Select-Object -First 1
+        }
     $diskFreeGB = if ($disk -and $null -ne $disk.FreeSpace) { [math]::Round($disk.FreeSpace / 1GB, 1) } else { 0 }
     $virtualization = [bool]$computer.HypervisorPresent -or [bool]$cpu.VirtualizationFirmwareEnabled
-    $portOwner = Get-NetTCPConnection -State Listen -LocalPort 5291 -ErrorAction SilentlyContinue | Select-Object -First 1
+    $portOwner = Invoke-SystemProbeWithTimeout -Name '检查应用端口 5291' `
+        -StepNumber 5 -StepCount $probeStepCount -ProgressPercent 5 -TimeoutSeconds 15 `
+        -ScriptBlock {
+            Get-NetTCPConnection -State Listen -LocalPort 5291 -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        }
 
-    $wslFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux
-    $vmFeature = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+    $wslFeature = Invoke-SystemProbeWithTimeout -Name '检查 WSL Windows 功能（DISM）' `
+        -StepNumber 6 -StepCount $probeStepCount -ProgressPercent 6 -TimeoutSeconds 45 `
+        -ScriptBlock {
+            Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction Stop
+        }
+    $vmFeature = Invoke-SystemProbeWithTimeout -Name '检查虚拟机平台功能（DISM）' `
+        -StepNumber 7 -StepCount $probeStepCount -ProgressPercent 7 -TimeoutSeconds 45 `
+        -ScriptBlock {
+            Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
+        }
 
     $mirrorEndpoints = [ordered]@{
         '清华 Docker CE' = 'https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/ubuntu/gpg'
@@ -1765,21 +1858,31 @@ try {
         'npmmirror' = 'https://registry.npmmirror.com/vue'
         'DaoCloud 容器镜像' = 'https://m.daocloud.io/v2/'
     }
+    $networkStep = 7
     $mirrorChecks = foreach ($endpoint in $mirrorEndpoints.GetEnumerator()) {
-        $reachable = $false
-        if ($endpoint.Key -eq 'DaoCloud 容器镜像') {
-            # Docker Registry v2 的 /v2/ 会按协议返回 401 认证挑战；
-            # 直接检查 HTTPS 端口，避免把预期 401 记成支持日志中的假错误。
-            $reachable = Test-NetConnection -ComputerName ([Uri]$endpoint.Value).Host -Port 443 `
-                -InformationLevel Quiet -WarningAction SilentlyContinue
-        } else {
-            try {
-                $null = Invoke-WebRequest -UseBasicParsing -Method Head -Uri $endpoint.Value -TimeoutSec 15
-                $reachable = $true
-            } catch {
-                $reachable = $false
+        $networkStep++
+        $networkPercent = [math]::Min(10, 7 + [math]::Ceiling(($networkStep - 7) * 3 / $mirrorEndpoints.Count))
+        $reachableResult = Invoke-SystemProbeWithTimeout -Name "检测国内镜像：$($endpoint.Key)" `
+            -StepNumber $networkStep -StepCount $probeStepCount -ProgressPercent $networkPercent `
+            -TimeoutSeconds 15 -ArgumentList @([string]$endpoint.Key, [string]$endpoint.Value) `
+            -ScriptBlock {
+                param($endpointName, $endpointUrl)
+                $ProgressPreference = 'SilentlyContinue'
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                if ($endpointName -eq 'DaoCloud 容器镜像') {
+                    # Registry /v2/ 的 401 是正常认证挑战，只检测 HTTPS 端口。
+                    return Test-NetConnection -ComputerName ([Uri]$endpointUrl).Host -Port 443 `
+                        -InformationLevel Quiet -WarningAction SilentlyContinue
+                }
+                try {
+                    $null = Invoke-WebRequest -UseBasicParsing -Method Head -Uri $endpointUrl `
+                        -TimeoutSec 10 -ErrorAction Stop
+                    return $true
+                } catch {
+                    return $false
+                }
             }
-        }
+        $reachable = [bool]($reachableResult | Select-Object -First 1)
         [pscustomobject]@{ Name = $endpoint.Key; Reachable = $reachable; Url = $endpoint.Value }
     }
 
