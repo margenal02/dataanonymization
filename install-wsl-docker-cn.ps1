@@ -1717,8 +1717,28 @@ if (-not (Test-Administrator)) {
 $resolvedProject = [IO.Path]::GetFullPath($ProjectPath)
 $runtimeDirectory = Join-Path $resolvedProject '.runtime'
 New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
-$logPath = Join-Path $runtimeDirectory ('install-wsl-docker-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-Start-Transcript -Path $logPath -Append | Out-Null
+$runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$logPath = Join-Path $runtimeDirectory 'install-support-latest.log'
+$archiveLogPath = Join-Path $runtimeDirectory ("install-wsl-docker-$runTimestamp.log")
+if (Test-Path -LiteralPath $logPath) {
+    $previousTail = @(Get-Content -LiteralPath $logPath -Tail 30 -ErrorAction SilentlyContinue)
+    if (-not ($previousTail -match '^SUPPORT_LOG_FINALIZED=')) {
+        $recoveredLogPath = Join-Path $runtimeDirectory ("install-wsl-docker-recovered-$runTimestamp.log")
+        Copy-Item -LiteralPath $logPath -Destination $recoveredLogPath -Force
+    }
+}
+$transcriptStarted = $false
+Start-Transcript -Path $logPath -Force | Out-Null
+$transcriptStarted = $true
+$scriptHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+Write-Host "SUPPORT_LOG_BEGIN=$([DateTime]::Now.ToString('o'))"
+Write-Host "支持日志：$logPath" -ForegroundColor Yellow
+Write-Host "脚本 SHA-256：$scriptHash"
+Write-Host "PowerShell：$($PSVersionTable.PSVersion) / $($PSVersionTable.PSEdition) / $([IntPtr]::Size * 8)-bit"
+Write-Host "Windows：$([Environment]::OSVersion.VersionString)"
+Write-Host "项目目录：$resolvedProject"
+Write-Host "运行参数：发行版=$DistroName；WSL通道=$WslDownloadChannel；仅检测=$CheckOnly；自动重启=$AutoReboot；重启续跑=$ResumeAfterRestart"
+Write-Host '安全说明：日志不会主动输出 .env 密码、密钥或令牌；发送前仍应按组织要求作为内部运维资料处理。'
 
 try {
     Write-Step '检测 Windows、硬件与部署资源'
@@ -1747,13 +1767,17 @@ try {
     }
     $mirrorChecks = foreach ($endpoint in $mirrorEndpoints.GetEnumerator()) {
         $reachable = $false
-        try {
-            $null = Invoke-WebRequest -UseBasicParsing -Method Head -Uri $endpoint.Value -TimeoutSec 15
-            $reachable = $true
-        } catch {
-            if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 401) {
-                # Docker Registry v2 使用 401 响应发起标准匿名令牌认证挑战。
+        if ($endpoint.Key -eq 'DaoCloud 容器镜像') {
+            # Docker Registry v2 的 /v2/ 会按协议返回 401 认证挑战；
+            # 直接检查 HTTPS 端口，避免把预期 401 记成支持日志中的假错误。
+            $reachable = Test-NetConnection -ComputerName ([Uri]$endpoint.Value).Host -Port 443 `
+                -InformationLevel Quiet -WarningAction SilentlyContinue
+        } else {
+            try {
+                $null = Invoke-WebRequest -UseBasicParsing -Method Head -Uri $endpoint.Value -TimeoutSec 15
                 $reachable = $true
+            } catch {
+                $reachable = $false
             }
         }
         [pscustomobject]@{ Name = $endpoint.Key; Reachable = $reachable; Url = $endpoint.Value }
@@ -1988,7 +2012,8 @@ try {
     Clear-ResumeAfterRestart
     Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
     Write-Host "`n安装和部署全部完成：http://localhost:5291" -ForegroundColor Green
-    Write-Host "安装日志：$logPath"
+    Write-Host "支持日志（可直接发送给维护人员）：$logPath"
+    Write-Host "本次日志归档：$archiveLogPath"
 }
 catch {
     Clear-InstallProgressLine
@@ -1999,7 +2024,8 @@ catch {
     if ($_.ScriptStackTrace) {
         Write-Host "调用栈：$($_.ScriptStackTrace)" -ForegroundColor DarkRed
     }
-    Write-Host "日志位置：$logPath" -ForegroundColor Yellow
+    Write-Host "支持日志（请直接把此文件发给维护人员）：$logPath" -ForegroundColor Yellow
+    Write-Host "本次日志归档：$archiveLogPath" -ForegroundColor Yellow
     # 抛回调用者而不是退出整个 PowerShell 主机，避免窗口直接关闭。
     throw
 }
@@ -2008,5 +2034,9 @@ finally {
     if (Get-Variable -Name bootstrapPath -ErrorAction SilentlyContinue) {
         Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
     }
-    try { Stop-Transcript | Out-Null } catch { }
+    if ($transcriptStarted) {
+        Write-Host "SUPPORT_LOG_FINALIZED=$([DateTime]::Now.ToString('o'))"
+        try { Stop-Transcript | Out-Null } catch { }
+        try { Copy-Item -LiteralPath $logPath -Destination $archiveLogPath -Force } catch { }
+    }
 }
