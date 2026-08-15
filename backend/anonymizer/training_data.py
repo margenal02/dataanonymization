@@ -142,3 +142,18 @@ def active_custom_entities():
 def save_task_custom_entities(entities):
     for item in entities:
         create_or_reactivate_label(item.get("text"), item.get("category", "custom"), source="task_custom")
+
+
+def record_rejected_entities(entities, task_id):
+    for item in entities:
+        text = normalize_label_text(item.get("text"))
+        category = validate_category(item.get("category", "custom"))
+        TrainingExample.objects.create(
+            action="rejected",
+            payload_ciphertext=encrypt_mapping({
+                "before": {"text": text, "category": category},
+                "after": None,
+                "source": "task_review",
+                "task_id": str(task_id),
+            }),
+        )

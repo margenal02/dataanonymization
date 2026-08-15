@@ -9,6 +9,7 @@ urlpatterns = [
     path("labels/<uuid:label_id>/", views.label_detail, name="label-detail"),
     path("tasks/", views.task_collection, name="task-collection"),
     path("tasks/<uuid:task_id>/", views.task_detail, name="task-detail"),
+    path("tasks/<uuid:task_id>/review/", views.task_review, name="task-review"),
     path("tasks/<uuid:task_id>/restore/", views.restore_task, name="restore-task"),
     path("tasks/<uuid:task_id>/download/<str:kind>/", views.download_task, name="download-task"),
 ]

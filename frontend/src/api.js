@@ -57,6 +57,12 @@ export const api = {
     form.append('file', file)
     return request(`/tasks/${taskId}/restore/`, { method: 'POST', body: form })
   },
+  getTaskReview: taskId => request(`/tasks/${taskId}/review/`),
+  applyTaskReview: (taskId, additions, removeTokens) => request(`/tasks/${taskId}/review/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ additions, remove_tokens: removeTokens })
+  }),
   deleteTask: taskId => request(`/tasks/${taskId}/`, {
     method: 'DELETE',
     headers: { 'X-Task-Delete-Confirm': taskId }

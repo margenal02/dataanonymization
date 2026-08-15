@@ -54,7 +54,7 @@ def predict_entities(texts, categories, mode):
         return []
     if mode not in {"on_demand", "resident"}:
         raise UIEProcessingError("无效的 UIE 运行模式。")
-    supported = [item for item in categories if item in {"person", "organization", "address"}]
+    supported = [item for item in categories if item in {"person", "organization", "address", "location", "product"}]
     if not supported or not texts:
         return []
     return _request("/predict", {

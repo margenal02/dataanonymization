@@ -16,13 +16,14 @@ from rest_framework.response import Response
 from .crypto import decrypt_mapping, encrypt_mapping
 from .file_processors import ProcessingError, SUPPORTED_EXTENSIONS, process_file, validate_upload_content
 from .models import AnonymizationTask, RecognitionLabel, TrainingExample
-from .recognizer import DEFAULT_CATEGORIES, MappingBuilder, restore_text
+from .recognizer import CATEGORY_LABELS, DEFAULT_CATEGORIES, MappingBuilder, restore_text
 from .serializers import TaskSerializer
 from .training_data import (
     active_custom_entities,
     create_or_reactivate_label,
     deactivate_label,
     label_to_dict,
+    record_rejected_entities,
     save_task_custom_entities,
     update_label,
 )
@@ -67,7 +68,11 @@ def _custom_entities(value):
     if isinstance(parsed, list):
         return [item for item in parsed if isinstance(item, dict)]
     entities = []
-    category_map = {"单位": "organization", "人名": "person", "电话": "phone", "证件": "id_card", "邮箱": "email", "地址": "address"}
+    category_map = {
+        "单位": "organization", "人名": "person", "产品": "product", "品牌": "product",
+        "产区": "location", "地点": "location", "电话": "phone", "证件": "id_card",
+        "邮箱": "email", "地址": "address", "敏感项": "custom",
+    }
     for line in (value or "").splitlines():
         line = line.strip()
         if not line:
@@ -129,6 +134,86 @@ def _collect_text_chunks(source, task_id):
     finally:
         discovery_path.unlink(missing_ok=True)
     return chunks
+
+
+def _select_model_entities(builder, entities):
+    """Apply per-category thresholds and resolve UIE type conflicts by surface value."""
+    priority = {"organization": 5, "product": 4, "location": 3, "address": 2, "person": 1}
+    selected = {}
+    rejected_count = 0
+    for entity in entities:
+        category = entity.get("category")
+        probability = float(entity.get("probability", 0.0) or 0.0)
+        if probability < settings.UIE_CATEGORY_THRESHOLDS.get(category, 1.0):
+            rejected_count += 1
+            continue
+        value = builder.validate_detected(entity.get("text"), category)
+        if not value:
+            rejected_count += 1
+            continue
+        candidate = dict(entity, text=value, probability=probability)
+        # Once every candidate has passed its own threshold, prefer the more
+        # specific tobacco-domain type for the same surface value.  The value is
+        # still masked either way; this keeps the review label deterministic.
+        score = (priority.get(category, 0), probability)
+        current = selected.get(value)
+        if current is None or score > current[0]:
+            if current is not None:
+                rejected_count += 1
+            selected[value] = (score, candidate)
+        else:
+            rejected_count += 1
+    ordered = sorted(
+        (item[1] for item in selected.values()),
+        key=lambda item: (item.get("text_index", 0), item.get("start", -1), -len(item.get("text", ""))),
+    )
+    return ordered, rejected_count
+
+
+def _process_task(task, categories, uie_mode, combined_custom, excluded_entities=None):
+    builder = MappingBuilder(
+        str(task.id), categories, combined_custom, excluded_entities=excluded_entities,
+    )
+    options = dict(task.options or {})
+    model_entity_count = 0
+    if settings.UIE_ENABLED and set(categories) & {"person", "organization", "address", "location", "product"}:
+        text_chunks = _collect_text_chunks(task.input_file.path, task.id)
+        filename_stem = Path(task.original_name).stem
+        if filename_stem and filename_stem not in text_chunks:
+            text_chunks.append(filename_stem)
+        for text_chunk in text_chunks:
+            builder.discover(text_chunk)
+        model_entities, rejected_count = _select_model_entities(
+            builder, predict_entities(text_chunks, categories, uie_mode)
+        )
+        for entity in model_entities:
+            if builder.register_detected(entity.get("text"), entity.get("category")):
+                model_entity_count += 1
+        options["uie_rejected_count"] = rejected_count
+    options["uie_detected_count"] = model_entity_count
+
+    anonymized_stem = builder.anonymize_filename_stem(Path(task.original_name).stem)
+    output_name = _output_name(task.original_name, "已脱敏", anonymized_stem)
+    output_path = Path(settings.MEDIA_ROOT) / "processing" / str(task.id) / output_name
+    try:
+        process_file(task.input_file.path, output_path, builder.anonymize)
+        if task.anonymized_file:
+            task.anonymized_file.delete(save=False)
+        with output_path.open("rb") as handle:
+            task.anonymized_file.save(output_name, File(handle), save=False)
+    finally:
+        output_path.unlink(missing_ok=True)
+
+    mapping = builder.export()
+    mapping["review_exclusions"] = list(excluded_entities or [])
+    task.mapping_ciphertext = encrypt_mapping(mapping)
+    task.entity_counts = builder.counts()
+    task.task_name = _task_name(anonymized_stem)
+    task.options = options
+    task.error_message = ""
+    task.status = AnonymizationTask.Status.COMPLETED
+    task.save()
+    return task
 
 
 @api_view(["GET"])
@@ -225,30 +310,7 @@ def task_collection(request):
     )
 
     try:
-        builder = MappingBuilder(str(task.id), categories, combined_custom)
-        model_entity_count = 0
-        if settings.UIE_ENABLED and set(categories) & {"person", "organization", "address"}:
-            text_chunks = _collect_text_chunks(task.input_file.path, task.id)
-            filename_stem = Path(original_name).stem
-            if filename_stem and filename_stem not in text_chunks:
-                text_chunks.append(filename_stem)
-            model_entities = predict_entities(text_chunks, categories, uie_mode)
-            for entity in sorted(model_entities, key=lambda item: (-len(item.get("text", "")), item.get("text_index", 0))):
-                if builder.register_detected(entity.get("text"), entity.get("category")):
-                    model_entity_count += 1
-            task.options["uie_detected_count"] = model_entity_count
-        anonymized_stem = builder.anonymize_filename_stem(Path(original_name).stem)
-        output_name = _output_name(original_name, "已脱敏", anonymized_stem)
-        output_path = Path(settings.MEDIA_ROOT) / "processing" / str(task.id) / output_name
-        process_file(task.input_file.path, output_path, builder.anonymize)
-        with output_path.open("rb") as handle:
-            task.anonymized_file.save(output_name, File(handle), save=False)
-        task.mapping_ciphertext = encrypt_mapping(builder.export())
-        task.entity_counts = builder.counts()
-        task.task_name = _task_name(anonymized_stem)
-        task.status = AnonymizationTask.Status.COMPLETED
-        task.save()
-        output_path.unlink(missing_ok=True)
+        _process_task(task, categories, uie_mode, combined_custom)
     except Exception as exc:
         task.status = AnonymizationTask.Status.FAILED
         task.error_message = str(exc) if isinstance(exc, (ProcessingError, UIEProcessingError, ValueError)) else "文件处理失败，请检查文件是否损坏。"
@@ -267,6 +329,94 @@ def task_detail(request, task_id):
         task.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
     return Response(TaskSerializer(task, context={"request": request}).data)
+
+
+def _review_entities(mapping):
+    categories = mapping.get("token_categories", {})
+    entities = []
+    for token, text in mapping.get("token_to_original", {}).items():
+        if not token.startswith("【"):
+            continue
+        category = categories.get(token, "custom")
+        entities.append({
+            "token": token,
+            "text": text,
+            "category": category,
+            "category_label": CATEGORY_LABELS.get(category, CATEGORY_LABELS["custom"]),
+        })
+    return sorted(entities, key=lambda item: (item["category_label"], item["token"]))
+
+
+@api_view(["GET", "POST"])
+def task_review(request, task_id):
+    task = get_object_or_404(AnonymizationTask, id=task_id)
+    if not task.mapping_ciphertext or not task.input_file:
+        return Response({"detail": "该任务没有可校正的识别映射或原始文件。"}, status=status.HTTP_409_CONFLICT)
+    try:
+        mapping = decrypt_mapping(task.mapping_ciphertext)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+
+    if request.method == "GET":
+        return Response({
+            "task": TaskSerializer(task, context={"request": request}).data,
+            "entities": _review_entities(mapping),
+            "excluded_count": len(mapping.get("review_exclusions", [])),
+        })
+
+    additions = _custom_entities(request.data.get("additions", ""))
+    remove_tokens = request.data.get("remove_tokens", [])
+    if not isinstance(remove_tokens, list):
+        return Response({"detail": "误识别标记必须是列表。"}, status=status.HTTP_400_BAD_REQUEST)
+    token_to_original = mapping.get("token_to_original", {})
+    token_categories = mapping.get("token_categories", {})
+    removals = []
+    for token in dict.fromkeys(remove_tokens):
+        if token.startswith("【") and token in token_to_original:
+            removals.append({
+                "text": token_to_original[token],
+                "category": token_categories.get(token, "custom"),
+            })
+
+    try:
+        save_task_custom_entities(additions)
+        previous_exclusions = [
+            item for item in mapping.get("review_exclusions", []) if isinstance(item, dict)
+        ]
+        additions_keys = {(item.get("text", "").strip(), item.get("category", "custom")) for item in additions}
+        exclusions_by_key = {
+            (item.get("text", "").strip(), item.get("category", "custom")): item
+            for item in [*previous_exclusions, *removals]
+            if item.get("text", "").strip()
+        }
+        for key in additions_keys:
+            exclusions_by_key.pop(key, None)
+        excluded_entities = list(exclusions_by_key.values())
+        learned = active_custom_entities()
+        combined_custom = list({(item["category"], item["text"]): item for item in learned}.values())
+        categories = [
+            item for item in (task.options or {}).get("categories", DEFAULT_CATEGORIES)
+            if item in DEFAULT_CATEGORIES
+        ]
+        uie_mode = (task.options or {}).get("uie_mode", "on_demand")
+        _process_task(task, categories, uie_mode, combined_custom, excluded_entities)
+        if removals:
+            record_rejected_entities(removals, task.id)
+        for field_name in ("restore_input_file", "restored_file"):
+            field = getattr(task, field_name)
+            if field:
+                field.delete(save=False)
+        task.save(update_fields=["restore_input_file", "restored_file", "updated_at"])
+    except (ProcessingError, UIEProcessingError, ValueError) as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+    except Exception:
+        return Response({"detail": "校正后重新处理失败，请查看后端日志。"}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+    return Response({
+        "task": TaskSerializer(task, context={"request": request}).data,
+        "entities": _review_entities(decrypt_mapping(task.mapping_ciphertext)),
+        "excluded_count": len(excluded_entities),
+    })
 
 
 @api_view(["POST"])
