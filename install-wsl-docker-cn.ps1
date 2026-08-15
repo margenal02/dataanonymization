@@ -728,35 +728,66 @@ function Register-WslKeepAliveTask {
         '--', 'bash', '-lc', $keepAliveCommand
     ) | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' '
 
-    $existingTask = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
-    if ($existingTask) {
-        Stop-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $KeepAliveTaskName -Confirm:$false -ErrorAction Stop
-    }
-
     $wslExecutable = Join-Path $env:SystemRoot 'System32\wsl.exe'
-    $action = New-ScheduledTaskAction -Execute $wslExecutable -Argument $taskArguments
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentIdentity
-    $principal = New-ScheduledTaskPrincipal -UserId $currentIdentity -LogonType Interactive -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit ([TimeSpan]::Zero) -Hidden -MultipleInstances IgnoreNew `
-        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
-    Register-ScheduledTask -TaskName $KeepAliveTaskName -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings `
-        -Description '保持数据脱敏应用的 WSL2 与 Docker 容器运行，并在登录 Windows 后自动恢复。' `
-        -Force | Out-Null
-    Start-ScheduledTask -TaskName $KeepAliveTaskName
+    try {
+        $existingTask = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            Stop-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $KeepAliveTaskName -Confirm:$false -ErrorAction Stop
+        }
 
-    for ($attempt = 1; $attempt -le 10; $attempt++) {
-        Start-Sleep -Milliseconds 500
-        $task = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
-        if ($task -and $task.State -eq 'Running') { return }
-        if ($task -and $task.State -in @('Disabled', 'Ready')) { break }
+        $action = New-ScheduledTaskAction -Execute $wslExecutable -Argument $taskArguments -ErrorAction Stop
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentIdentity -ErrorAction Stop
+        $principal = New-ScheduledTaskPrincipal -UserId $currentIdentity -LogonType Interactive -RunLevel Highest -ErrorAction Stop
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) -Hidden -MultipleInstances IgnoreNew `
+            -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -ErrorAction Stop
+        Register-ScheduledTask -TaskName $KeepAliveTaskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings `
+            -Description '保持数据脱敏应用的 WSL2 与 Docker 容器运行，并在登录 Windows 后自动恢复。' `
+            -Force -ErrorAction Stop | Out-Null
+        Start-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction Stop
+
+        for ($attempt = 1; $attempt -le 10; $attempt++) {
+            Start-Sleep -Milliseconds 500
+            $task = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+            if ($task -and $task.State -eq 'Running') {
+                return [pscustomobject]@{
+                    Mode = 'ScheduledTask'
+                    Active = $true
+                    ProcessId = $null
+                    Detail = "Windows 登录计划任务 $KeepAliveTaskName"
+                }
+            }
+            if ($task -and $task.State -in @('Disabled', 'Ready')) { break }
+        }
+
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+        $lastResult = if ($taskInfo) { [string]$taskInfo.LastTaskResult } else { '未知' }
+        throw "计划任务未能保持运行（上次结果：$lastResult）"
+    } catch {
+        $scheduledTaskFailure = $_.Exception.Message
+        Write-Warning "Windows 策略不允许创建或启动计划任务，将改用当前登录会话的隐藏后台进程保活。原因：$scheduledTaskFailure"
+
+        try {
+            $keepAliveProcess = Start-Process -FilePath $wslExecutable -ArgumentList $taskArguments `
+                -WindowStyle Hidden -PassThru -ErrorAction Stop
+            Start-Sleep -Seconds 2
+            $keepAliveProcess.Refresh()
+            if ($keepAliveProcess.HasExited) {
+                throw "后台 WSL 进程已退出，退出码为 $($keepAliveProcess.ExitCode)"
+            }
+            return [pscustomobject]@{
+                Mode = 'CurrentSession'
+                Active = $true
+                ProcessId = $keepAliveProcess.Id
+                Detail = "当前 Windows 登录会话后台进程 PID $($keepAliveProcess.Id)"
+                ScheduledTaskFailure = $scheduledTaskFailure
+            }
+        } catch {
+            throw "Windows 计划任务创建失败（$scheduledTaskFailure），当前会话后台保活也失败（$($_.Exception.Message)）。"
+        }
     }
-
-    $taskInfo = Get-ScheduledTaskInfo -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
-    $lastResult = if ($taskInfo) { [string]$taskInfo.LastTaskResult } else { '未知' }
-    throw "WSL 常驻任务未能保持运行（上次结果：$lastResult）。"
 }
 
 function Wait-WindowsApplicationStable {
@@ -2680,21 +2711,31 @@ try {
         }
     }
 
-    Write-Step '创建 WSL 常驻与 Windows 登录自动启动任务'
-    Register-WslKeepAliveTask -Distribution $DistroName -LinuxProjectPath $linuxProject
-    Write-InstallProgress -Percent 95 -Activity 'WSL 常驻任务' -Status "已启动：$KeepAliveTaskName" -CompleteLine
+    Write-Step '配置 WSL 常驻与 Windows 登录自动启动方式'
+    $keepAliveResult = Register-WslKeepAliveTask -Distribution $DistroName -LinuxProjectPath $linuxProject
+    $keepAliveStatus = if ($keepAliveResult.Mode -eq 'ScheduledTask') {
+        "登录计划任务已启动：$KeepAliveTaskName"
+    } else {
+        "系统策略拒绝计划任务，已启动当前会话后台保活（PID $($keepAliveResult.ProcessId)）"
+    }
+    Write-InstallProgress -Percent 95 -Activity 'WSL 常驻方式' -Status $keepAliveStatus -CompleteLine
 
     Write-Step '从 Windows 持续检查应用端口与健康状态'
     $stabilityResult = Wait-WindowsApplicationStable
     if (-not $stabilityResult.Healthy) {
-        $task = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
-        $taskState = if ($task) { [string]$task.State } else { '不存在' }
-        throw "WSL 常驻任务状态为 $taskState，且 Windows 无法持续访问 http://127.0.0.1:5291/api/health/ 或 http://localhost:5291/api/health/。"
+        throw "WSL 保活方式为 [$($keepAliveResult.Detail)]，但 Windows 无法持续访问 http://127.0.0.1:5291/api/health/ 或 http://localhost:5291/api/health/。"
     }
-    $keepAliveTask = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
-    if (-not $keepAliveTask -or $keepAliveTask.State -ne 'Running') {
-        $taskState = if ($keepAliveTask) { [string]$keepAliveTask.State } else { '不存在' }
-        throw "网站健康检查通过，但 WSL 常驻任务状态为 $taskState，不能保证安装窗口关闭后继续运行。"
+    if ($keepAliveResult.Mode -eq 'ScheduledTask') {
+        $keepAliveTask = Get-ScheduledTask -TaskName $KeepAliveTaskName -ErrorAction SilentlyContinue
+        if (-not $keepAliveTask -or $keepAliveTask.State -ne 'Running') {
+            $taskState = if ($keepAliveTask) { [string]$keepAliveTask.State } else { '不存在' }
+            throw "网站健康检查通过，但 WSL 常驻任务状态为 $taskState，不能保证安装窗口关闭后继续运行。"
+        }
+    } else {
+        $keepAliveProcess = Get-Process -Id $keepAliveResult.ProcessId -ErrorAction SilentlyContinue
+        if (-not $keepAliveProcess) {
+            throw '网站健康检查通过，但当前会话后台保活进程已经退出。'
+        }
     }
     Write-InstallProgress -Percent 100 -Activity '应用健康检查' -Status '安装部署完成' -CompleteLine
     Clear-InstallProgressLine
@@ -2703,7 +2744,12 @@ try {
     Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
     Write-Host "`n安装和部署全部完成：http://127.0.0.1:5291" -ForegroundColor Green
     Write-Host "备用地址：http://localhost:5291"
-    Write-Host "WSL 常驻任务：$KeepAliveTaskName（Windows 登录后自动恢复应用）"
+    if ($keepAliveResult.Mode -eq 'ScheduledTask') {
+        Write-Host "WSL 常驻任务：$KeepAliveTaskName（Windows 登录后自动恢复应用）"
+    } else {
+        Write-Host "WSL 保活：当前登录会话后台进程 PID $($keepAliveResult.ProcessId)" -ForegroundColor Yellow
+        Write-Warning '系统策略拒绝创建登录计划任务；本次登录期间应用可持续运行。Windows 重启或注销后，请重新运行本脚本恢复应用，或由管理员放行计划任务创建权限。'
+    }
     Write-Host "支持日志（可直接发送给维护人员）：$logPath"
     Write-Host "本次日志归档：$archiveLogPath"
 }
