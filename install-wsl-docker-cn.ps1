@@ -386,6 +386,19 @@ prepare_system() {
     enable_systemd
 }
 
+run_compose_build() {
+    local service="$1"
+    local description="$2"
+    local build_log="${PROJECT_DIR}/.runtime/docker-build-${service}.log"
+    mkdir -p "${PROJECT_DIR}/.runtime"
+    : >"$build_log"
+    log "${description}；BuildKit 明细实时写入 ${build_log}"
+    printf '[%s] 开始构建 %s\n' "$(date '+%F %T')" "$service" | tee -a "$build_log"
+    COMPOSE_ANSI=never BUILDKIT_PROGRESS=plain \
+        docker compose build "$service" 2>&1 | tee -a "$build_log"
+    printf '[%s] %s 构建完成\n' "$(date '+%F %T')" "$service" | tee -a "$build_log"
+}
+
 deploy_application() {
     if [[ -z "$PROJECT_DIR" || ! -f "${PROJECT_DIR}/docker-compose.yml" ]]; then
         echo "项目目录无效或缺少 docker-compose.yml：${PROJECT_DIR}" >&2
@@ -401,9 +414,9 @@ deploy_application() {
     progress 15 "步骤 3/11：拉取 MySQL 与 Nginx 基础镜像"
     retry docker compose pull db nginx
     progress 30 "步骤 4/11：构建 Django 与 UIE-micro 后端镜像（含模型下载）"
-    docker compose build backend
+    run_compose_build backend '构建后端：系统依赖 → Python 依赖 → UIE-micro 模型下载与自检'
     progress 48 "步骤 5/11：构建 Vue 前端镜像"
-    docker compose build frontend
+    run_compose_build frontend '构建前端：Node 依赖 → Vue 编译 → Nginx 静态镜像'
 
     compose_diagnostics() {
         local service="$1"
