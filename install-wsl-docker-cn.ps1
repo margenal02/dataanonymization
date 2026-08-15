@@ -336,6 +336,11 @@ write_secure_environment() {
         set_env_value UIE_MAX_TOTAL_CHARS "500000"
         set_env_value UIE_START_TIMEOUT_SECONDS "180"
         set_env_value UIE_REQUEST_TIMEOUT_SECONDS "600"
+        current_upload_limit="$(sed -n 's/^MAX_UPLOAD_SIZE_MB=//p' "$env_file" | tail -n 1 | tr -d '\r')"
+        if [[ -z "$current_upload_limit" || "$current_upload_limit" == "50" ]]; then
+            set_env_value MAX_UPLOAD_SIZE_MB "200"
+            log "上传上限已设置为 200 MB（旧版默认值 50 MB 已自动迁移）"
+        fi
         return
     fi
 
@@ -351,7 +356,7 @@ MYSQL_USER=anonymizer
 MYSQL_PASSWORD=$(openssl rand -hex 32)
 DJANGO_DEBUG=0
 ALLOWED_HOSTS=${allowed_hosts}
-MAX_UPLOAD_SIZE_MB=50
+MAX_UPLOAD_SIZE_MB=200
 DATA_RETENTION_DAYS=30
 MYSQL_IMAGE=${DOCKER_HUB_PREFIX}mysql:8.4
 PYTHON_IMAGE=${DOCKER_HUB_PREFIX}python:3.12-slim
@@ -606,7 +611,9 @@ deploy_application() {
 
     log "启动 Nginx 入口容器"
     progress 93 "步骤 10/11：启动 Nginx 入口容器"
-    docker compose up -d --no-deps nginx
+    # nginx/default.conf 是只读挂载文件；强制重建才能让正在运行的 Nginx
+    # 立即加载新的上传上限和 JSON 错误响应，不要求用户手工重启容器。
+    docker compose up -d --no-deps --force-recreate nginx
 
     log "等待应用健康检查"
     local attempt

@@ -38,7 +38,7 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-data_anonymization}
       MYSQL_USER: ${MYSQL_USER:-anonymizer}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-anonymizer-local-password}
-      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-50}
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-200}
       DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-30}
       UIE_ENABLED: ${UIE_ENABLED:-1}
       UIE_MODEL: ${UIE_MODEL:-uie-micro}
