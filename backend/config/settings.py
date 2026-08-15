@@ -82,6 +82,13 @@ UIE_MANAGER_URL = os.getenv("UIE_MANAGER_URL", "http://127.0.0.1:8765")
 UIE_START_TIMEOUT_SECONDS = int(os.getenv("UIE_START_TIMEOUT_SECONDS", "180"))
 UIE_REQUEST_TIMEOUT_SECONDS = int(os.getenv("UIE_REQUEST_TIMEOUT_SECONDS", "600"))
 UIE_MAX_TOTAL_CHARS = int(os.getenv("UIE_MAX_TOTAL_CHARS", "500000"))
+UIE_CATEGORY_THRESHOLDS = {
+    "person": float(os.getenv("UIE_PERSON_PROB", "0.70")),
+    "organization": float(os.getenv("UIE_ORGANIZATION_PROB", "0.55")),
+    "address": float(os.getenv("UIE_ADDRESS_PROB", "0.60")),
+    "location": float(os.getenv("UIE_LOCATION_PROB", "0.60")),
+    "product": float(os.getenv("UIE_PRODUCT_PROB", "0.60")),
+}
 
 CORS_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 REST_FRAMEWORK = {

@@ -331,6 +331,11 @@ write_secure_environment() {
         set_env_value UIE_ENABLED "1"
         set_env_value UIE_MODEL "uie-micro"
         set_env_value UIE_POSITION_PROB "0.45"
+        set_env_value UIE_PERSON_PROB "0.70"
+        set_env_value UIE_ORGANIZATION_PROB "0.55"
+        set_env_value UIE_ADDRESS_PROB "0.60"
+        set_env_value UIE_LOCATION_PROB "0.60"
+        set_env_value UIE_PRODUCT_PROB "0.60"
         set_env_value UIE_BATCH_SIZE "2"
         set_env_value UIE_MAX_SEQ_LEN "512"
         set_env_value UIE_MAX_TOTAL_CHARS "500000"
@@ -368,6 +373,11 @@ DEBIAN_MIRROR=${APT_MIRROR}/debian
 UIE_ENABLED=1
 UIE_MODEL=uie-micro
 UIE_POSITION_PROB=0.45
+UIE_PERSON_PROB=0.70
+UIE_ORGANIZATION_PROB=0.55
+UIE_ADDRESS_PROB=0.60
+UIE_LOCATION_PROB=0.60
+UIE_PRODUCT_PROB=0.60
 UIE_BATCH_SIZE=2
 UIE_MAX_SEQ_LEN=512
 UIE_MAX_TOTAL_CHARS=500000

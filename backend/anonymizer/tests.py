@@ -25,6 +25,7 @@ from .recognizer import MappingBuilder, restore_text
 from .training_data import decrypt_label
 from .uie_runtime import UIEProcessingError, _manager_url
 from .uie_worker import _predict
+from .views import _select_model_entities
 
 
 class MappingBuilderTests(TestCase):
@@ -35,7 +36,7 @@ class MappingBuilderTests(TestCase):
         self.assertNotIn("中国烟草总公司", anonymized)
         self.assertNotIn("张三", anonymized)
         self.assertNotIn("13800138000", anonymized)
-        self.assertIn("【单位_ABCD_001】", anonymized)
+        self.assertIn("【单001】", anonymized)
         self.assertEqual(restore_text(anonymized, builder.export()), source)
 
     def test_detects_entities_in_real_tobacco_document_language(self):
@@ -73,7 +74,7 @@ class MappingBuilderTests(TestCase):
         source = (
             "组长：潘富昆。负责整个技能竞赛的宏观指导与活动协调。\n"
             "成员：赵英桥、李作英。负责跟进各项活动的具体实施。\n"
-            "参加活动人员：厂领导、【单位_FCA2_002】及生产加工车间参赛人员。"
+            "参加活动人员：厂领导、【单002】及生产加工车间参赛人员。"
         )
         builder = MappingBuilder("fca2002", ["person"])
         anonymized = builder.anonymize(source)
@@ -90,14 +91,48 @@ class MappingBuilderTests(TestCase):
         anonymized_stem = builder.anonymize_filename_stem("潘富昆技能竞赛活动方案")
 
         self.assertNotIn("潘富昆", anonymized_stem)
-        self.assertIn("ANON_人名_FILE_001", anonymized_stem)
+        self.assertIn("ANON_人001", anonymized_stem)
         self.assertEqual(restore_text(anonymized_stem, builder.export()), "潘富昆技能竞赛活动方案")
 
     def test_registers_valid_model_entity_and_rejects_role_word(self):
         builder = MappingBuilder("model123", ["person"])
         self.assertIsNotNone(builder.register_detected("潘富昆", "person"))
         self.assertIsNone(builder.register_detected("工作人员", "person"))
+        self.assertIsNone(builder.register_detected("文山雨露", "person"))
         self.assertEqual(builder.counts(), {"人名": 1})
+
+    def test_detects_tobacco_alias_product_and_location_without_false_person(self):
+        source = "山东中烟在文山产区生产品牌：文山雨露。"
+        builder = MappingBuilder("domain123")
+        anonymized = builder.anonymize(source)
+
+        for sensitive_value in ("山东中烟", "文山", "文山雨露"):
+            self.assertNotIn(sensitive_value, anonymized)
+        self.assertEqual(builder.counts(), {"单位": 1, "产区": 1, "产品": 1})
+        self.assertEqual(restore_text(anonymized, builder.export()), source)
+
+    @override_settings(UIE_CATEGORY_THRESHOLDS={
+        "person": 0.70,
+        "organization": 0.55,
+        "address": 0.60,
+        "location": 0.60,
+        "product": 0.60,
+    })
+    def test_model_conflict_resolution_filters_invalid_person_and_low_confidence(self):
+        builder = MappingBuilder("conflict", ["person", "product", "organization", "location"])
+        selected, rejected_count = _select_model_entities(builder, [
+            {"text": "文山雨露", "category": "person", "probability": 0.99},
+            {"text": "文山雨露", "category": "product", "probability": 0.82},
+            {"text": "云南省", "category": "person", "probability": 0.99},
+            {"text": "云南省", "category": "location", "probability": 0.80},
+            {"text": "山东中烟", "category": "organization", "probability": 0.40},
+        ])
+
+        self.assertEqual(
+            [(item["text"], item["category"]) for item in selected],
+            [("文山雨露", "product"), ("云南省", "location")],
+        )
+        self.assertEqual(rejected_count, 3)
 
     def test_detects_pdf_style_spaces_inside_entities(self):
         source = "单 位：中 国 烟 草 总 公 司\n联 系 人：张 三\n138 0013 8000"
@@ -149,6 +184,32 @@ class FileProcessorTests(TestCase):
         anonymized, restored = self._roundtrip(source, ".docx")
         self.assertNotIn("张三", "\n".join(p.text for p in Document(anonymized).paragraphs))
         self.assertIn("张三", "\n".join(p.text for p in Document(restored).paragraphs))
+
+    def test_docx_preserves_run_boundaries_and_formatting(self):
+        source = self.directory / "styled.docx"
+        document = Document()
+        paragraph = document.add_paragraph()
+        prefix = paragraph.add_run("委托单位：")
+        prefix.bold = True
+        sensitive_a = paragraph.add_run("山东")
+        sensitive_a.italic = True
+        sensitive_b = paragraph.add_run("中烟")
+        sensitive_b.underline = True
+        suffix = paragraph.add_run("，报告日期：2026年3月。")
+        suffix.bold = True
+        document.save(source)
+
+        builder = MappingBuilder("styled")
+        anonymized = self.directory / "styled-anonymized.docx"
+        process_file(source, anonymized, builder.anonymize)
+        result = Document(anonymized).paragraphs[0]
+
+        self.assertEqual(len(result.runs), 4)
+        self.assertEqual(result.text, "委托单位：【单001】，报告日期：2026年3月。")
+        self.assertTrue(result.runs[0].bold)
+        self.assertTrue(result.runs[1].italic)
+        self.assertTrue(result.runs[2].underline)
+        self.assertTrue(result.runs[3].bold)
 
     def test_docx_text_box_content_is_processed(self):
         source = self.directory / "textbox.docx"
@@ -210,7 +271,7 @@ class FileProcessorTests(TestCase):
         with zipfile.ZipFile(restored) as archive:
             restored_xml = archive.read("OFD.xml").decode()
         self.assertNotIn("张三", anonymized_xml)
-        self.assertIn("【人名_1234_001】", anonymized_xml)
+        self.assertIn("【人001】", anonymized_xml)
         self.assertIn("张三", restored_xml)
 
     def test_pdf_roundtrip(self):
@@ -301,13 +362,13 @@ class TaskApiTests(TestCase):
     def test_uie_model_entities_are_merged_and_mode_is_recorded(self, predict):
         predict.return_value = [{
             "text_index": 1,
-            "text": "爱丽丝",
+            "text": "潘富昆",
             "category": "person",
             "start": 0,
             "end": 3,
             "probability": 0.99,
         }]
-        upload = SimpleUploadedFile("爱丽丝活动材料.txt", "活动按计划实施。".encode("utf-8"), content_type="text/plain")
+        upload = SimpleUploadedFile("潘富昆活动材料.txt", "活动按计划实施。".encode("utf-8"), content_type="text/plain")
         response = self.client.post("/api/tasks/", {
             "file": upload,
             "categories": json.dumps(["person"]),
@@ -319,10 +380,43 @@ class TaskApiTests(TestCase):
         self.assertEqual(task["recognition_mode"], "resident")
         self.assertEqual(task["uie_detected_count"], 1)
         predict.assert_called_once()
-        self.assertIn("爱丽丝活动材料", predict.call_args.args[0])
-        self.assertNotIn("爱丽丝", task["display_name"])
+        self.assertIn("潘富昆活动材料", predict.call_args.args[0])
+        self.assertNotIn("潘富昆", task["display_name"])
         download = self.client.get(task["anonymized_download_url"])
-        self.assertNotIn("爱丽丝", download.headers["Content-Disposition"])
+        self.assertNotIn("潘富昆", download.headers["Content-Disposition"])
+
+    def test_review_removes_false_positive_adds_missing_entity_and_reprocesses(self):
+        source = "联系人：张三，内部代号星辰一号。"
+        upload = SimpleUploadedFile("校正测试.txt", source.encode("utf-8"), content_type="text/plain")
+        response = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["person", "product"]),
+            "custom_entities": "",
+        })
+        self.assertEqual(response.status_code, 201, response.content)
+        task_id = response.json()["id"]
+
+        review = self.client.get(f"/api/tasks/{task_id}/review/")
+        self.assertEqual(review.status_code, 200, review.content)
+        person_token = next(
+            item["token"] for item in review.json()["entities"] if item["text"] == "张三"
+        )
+        response = self.client.post(
+            f"/api/tasks/{task_id}/review/",
+            {"additions": "产品|星辰一号", "remove_tokens": [person_token]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["excluded_count"], 1)
+        self.assertNotIn("张三", [item["text"] for item in response.json()["entities"]])
+        self.assertIn("星辰一号", [item["text"] for item in response.json()["entities"]])
+
+        task_data = response.json()["task"]
+        download = self.client.get(task_data["anonymized_download_url"])
+        anonymized = b"".join(download.streaming_content).decode("utf-8")
+        self.assertIn("张三", anonymized)
+        self.assertNotIn("星辰一号", anonymized)
+        self.assertEqual(TrainingExample.objects.filter(action="rejected").count(), 1)
 
     def test_training_labels_are_encrypted_versioned_and_used_by_later_tasks(self):
         response = self.client.post("/api/labels/", {"text": "李作英", "category": "person"}, content_type="application/json")
@@ -378,7 +472,7 @@ class TaskApiTests(TestCase):
         task = AnonymizationTask.objects.get(id=task_data["id"])
         anonymized_name = Path(task.anonymized_file.name).name
         self.assertNotIn("潘富昆", anonymized_name)
-        self.assertIn("ANON_人名_", anonymized_name)
+        self.assertIn("ANON_人", anonymized_name)
         self.assertEqual(task_data["display_name"], anonymized_name)
         self.assertNotIn("潘富昆", task_data["task_name"])
 

@@ -60,6 +60,8 @@ class RecognitionLabel(models.Model):
     CATEGORY_CHOICES = [
         ("organization", "单位"),
         ("person", "人名"),
+        ("product", "品牌/产品"),
+        ("location", "产区/地点"),
         ("phone", "电话"),
         ("id_card", "证件"),
         ("email", "邮箱"),
@@ -90,6 +92,7 @@ class TrainingExample(models.Model):
         ("updated", "修改"),
         ("deleted", "停用"),
         ("task_custom", "任务新增"),
+        ("rejected", "人工否决"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

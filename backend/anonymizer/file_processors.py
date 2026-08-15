@@ -1,5 +1,6 @@
 import zipfile
 import re
+from difflib import SequenceMatcher
 from pathlib import Path, PurePosixPath
 
 import xlrd
@@ -82,24 +83,67 @@ def validate_upload_content(upload):
     upload.seek(0)
 
 
-def _transform_paragraph(paragraph, transform):
-    if not paragraph.runs:
+XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+
+
+def _set_text_node(node, value):
+    node.text = value
+    if value and (value[0].isspace() or value[-1].isspace()):
+        node.set(XML_SPACE, "preserve")
+    else:
+        node.attrib.pop(XML_SPACE, None)
+
+
+def _replace_text_nodes(text_nodes, transform):
+    """Replace only changed spans while preserving the surrounding XML run nodes."""
+    if not text_nodes:
         return
-    original = "".join(run.text for run in paragraph.runs)
+    original_parts = [node.text or "" for node in text_nodes]
+    original = "".join(original_parts)
     changed = transform(original)
-    if changed != original:
-        paragraph.runs[0].text = changed
-        for run in paragraph.runs[1:]:
-            run.text = ""
+    if changed == original:
+        return
 
+    ranges = []
+    cursor = 0
+    for part in original_parts:
+        ranges.append((cursor, cursor + len(part)))
+        cursor += len(part)
+    result_parts = list(original_parts)
 
-def _transform_table(table, transform):
-    for row in table.rows:
-        for cell in row.cells:
-            for paragraph in cell.paragraphs:
-                _transform_paragraph(paragraph, transform)
-            for nested in cell.tables:
-                _transform_table(nested, transform)
+    def anchor_for(offset):
+        for index, (start, end) in enumerate(ranges):
+            if start <= offset < end:
+                return index
+            if start == offset and start == end:
+                return index
+        return max(0, len(ranges) - 1)
+
+    edits = [
+        opcode for opcode in SequenceMatcher(None, original, changed, autojunk=False).get_opcodes()
+        if opcode[0] != "equal"
+    ]
+    for _, source_start, source_end, changed_start, changed_end in reversed(edits):
+        anchor = anchor_for(source_start)
+        anchor_start = ranges[anchor][0]
+        insertion_offset = max(0, source_start - anchor_start)
+        for index, (node_start, node_end) in enumerate(ranges):
+            overlap_start = max(source_start, node_start)
+            overlap_end = min(source_end, node_end)
+            if overlap_start >= overlap_end:
+                continue
+            local_start = overlap_start - node_start
+            local_end = overlap_end - node_start
+            result_parts[index] = result_parts[index][:local_start] + result_parts[index][local_end:]
+        replacement = changed[changed_start:changed_end]
+        result_parts[anchor] = (
+            result_parts[anchor][:insertion_offset]
+            + replacement
+            + result_parts[anchor][insertion_offset:]
+        )
+
+    for node, value in zip(text_nodes, result_parts):
+        _set_text_node(node, value)
 
 
 def _transform_docx_xml_parts(document, transform):
@@ -120,25 +164,12 @@ def _transform_docx_xml_parts(document, transform):
             if not text_nodes:
                 continue
             original = "".join(node.text or "" for node in text_nodes)
-            changed = transform(original)
-            if changed != original:
-                text_nodes[0].text = changed
-                for node in text_nodes[1:]:
-                    node.text = ""
+            if original:
+                _replace_text_nodes(text_nodes, transform)
 
 
 def process_docx(source, destination, transform):
     document = Document(source)
-    for paragraph in document.paragraphs:
-        _transform_paragraph(paragraph, transform)
-    for table in document.tables:
-        _transform_table(table, transform)
-    for section in document.sections:
-        for area in (section.header, section.footer):
-            for paragraph in area.paragraphs:
-                _transform_paragraph(paragraph, transform)
-            for table in area.tables:
-                _transform_table(table, transform)
     _transform_docx_xml_parts(document, transform)
     document.save(destination)
 
@@ -274,11 +305,8 @@ def process_ofd(source, destination, transform):
                         if not text_nodes:
                             continue
                         original = "".join(node.text or "" for node in text_nodes)
-                        changed = transform(original)
-                        if changed != original:
-                            text_nodes[0].text = changed
-                            for node in text_nodes[1:]:
-                                node.text = ""
+                        if original:
+                            _replace_text_nodes(text_nodes, transform)
                         processed.update(text_nodes)
 
                     # Metadata and simpler OFD variants may store content directly in

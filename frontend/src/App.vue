@@ -26,11 +26,18 @@ const labelForm = ref({ text: '', category: 'person' })
 const editingLabelId = ref('')
 const editingLabel = ref({ text: '', category: 'person' })
 const labelLoading = ref(false)
-const selectedCategories = ref(['organization', 'person', 'phone', 'id_card', 'email', 'address'])
+const reviewOpen = ref(false)
+const reviewLoading = ref(false)
+const reviewData = ref({ entities: [], excluded_count: 0 })
+const reviewAdditions = ref('')
+const reviewRemoveTokens = ref([])
+const selectedCategories = ref(['organization', 'person', 'product', 'location', 'phone', 'id_card', 'email', 'address'])
 
 const categoryOptions = [
   { key: 'organization', label: '单位 / 部门' },
   { key: 'person', label: '人员姓名' },
+  { key: 'product', label: '品牌 / 产品' },
+  { key: 'location', label: '产区 / 地点' },
   { key: 'phone', label: '联系电话' },
   { key: 'id_card', label: '证件号码' },
   { key: 'email', label: '电子邮箱' },
@@ -184,6 +191,7 @@ async function submitAnonymize() {
   loading.value = true
   error.value = ''
   result.value = null
+  reviewOpen.value = false
   try {
     result.value = await api.anonymize(anonymizeFile.value, selectedCategories.value, customEntities.value, uieMode.value)
     await Promise.all([refreshData(), refreshModelRuntime(), refreshLabels()])
@@ -230,6 +238,47 @@ async function deleteTask(task) {
   }
 }
 
+async function openReview(task = result.value) {
+  if (!task?.id) return
+  nav.value = 'workspace'
+  mode.value = 'anonymize'
+  result.value = task
+  reviewOpen.value = true
+  reviewLoading.value = true
+  reviewAdditions.value = ''
+  reviewRemoveTokens.value = []
+  error.value = ''
+  try {
+    reviewData.value = await api.getTaskReview(task.id)
+  } catch (e) {
+    error.value = e.message
+    reviewOpen.value = false
+  } finally {
+    reviewLoading.value = false
+  }
+}
+
+async function applyReview() {
+  if (!result.value?.id) return
+  reviewLoading.value = true
+  error.value = ''
+  try {
+    reviewData.value = await api.applyTaskReview(
+      result.value.id,
+      reviewAdditions.value,
+      reviewRemoveTokens.value
+    )
+    result.value = reviewData.value.task
+    reviewAdditions.value = ''
+    reviewRemoveTokens.value = []
+    await Promise.all([refreshData(), refreshLabels()])
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    reviewLoading.value = false
+  }
+}
+
 function openDownload(url) {
   if (url) window.location.assign(url)
 }
@@ -238,6 +287,7 @@ function selectMode(nextMode) {
   mode.value = nextMode
   nav.value = 'workspace'
   result.value = null
+  reviewOpen.value = false
   error.value = ''
 }
 
@@ -347,13 +397,13 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               <div>
                 <label class="form-label app-label" for="customEntities">指定敏感词 <small>可选</small></label>
                 <textarea id="customEntities" v-model="customEntities" class="form-control" rows="4" placeholder="每行一个，如：中国烟草总公司&#10;也可写：单位|某某卷烟厂"></textarea>
-                <div class="form-hint">指定词优先识别，可使用“单位|内容”或“人名|内容”标注类型。新增内容会加密保存到本机训练标签库，并立即用于后续任务。</div>
+                <div class="form-hint">指定词优先识别，可使用“单位、产品、产区、人名|内容”标注类型。新增内容会加密保存到本机训练标签库，并立即用于后续任务。</div>
               </div>
             </div>
 
             <div class="uie-settings">
               <div class="uie-heading">
-                <div><strong>UIE-micro 智能识别方式</strong><small>规则负责精确匹配，UIE 补充识别人名、单位、部门和地址</small></div>
+                <div><strong>UIE-micro 智能识别方式</strong><small>规则负责精确匹配，UIE 补充识别人名、单位、产品、产区和地址</small></div>
                 <span class="model-state" :class="{ loaded: modelRuntime.resident_loaded, unavailable: !modelRuntime.available }">
                   {{ !modelRuntime.available ? '模型服务不可用' : modelRuntime.resident_loaded ? '模型已常驻' : '模型未占用内存' }}
                 </span>
@@ -412,7 +462,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               </label>
             </div>
 
-            <div class="notice-box"><AppIcon name="alert" :size="18" /><span>请勿修改形如 <code>【单位_A1B2_001】</code> 的匿名标记，否则对应信息将无法恢复。</span></div>
+            <div class="notice-box"><AppIcon name="alert" :size="18" /><span>请勿修改形如 <code>【单001】</code>、<code>【人001】</code> 的匿名标记，否则对应信息将无法恢复。</span></div>
             <div class="action-row justify-content-end">
               <button class="btn restore-btn" :disabled="loading || !selectedTaskId || !restoreFile" @click="submitRestore">
                 <span v-if="loading" class="spinner-border spinner-border-sm"></span>
@@ -430,17 +480,59 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               <div v-if="result.status !== 'restored'" class="entity-tags">
                 <span v-for="(count, label) in result.entity_counts" :key="label">{{ label }} {{ count }}</span>
                 <span v-if="result.uie_detected_count">UIE 补充 {{ result.uie_detected_count }}</span>
+                <span v-if="result.uie_rejected_count">已过滤低置信/冲突 {{ result.uie_rejected_count }}</span>
                 <span v-if="result.recognition_mode === 'on_demand'">临时调用</span>
                 <span v-else-if="result.recognition_mode === 'resident'">模型常驻</span>
                 <span v-if="!Object.keys(result.entity_counts || {}).length">未发现自动识别项，请确认文件不是扫描图片，或补充“指定敏感词”</span>
               </div>
             </div>
-            <button class="btn download-btn" @click="openDownload(result.status === 'restored' ? result.restored_download_url : result.anonymized_download_url)">
-              <AppIcon name="download" :size="18" /> 下载文件
-            </button>
+            <div class="result-actions">
+              <button v-if="result.anonymized_download_url" class="btn light-btn" @click="openReview(result)">
+                <AppIcon name="info" :size="18" /> 校正识别
+              </button>
+              <button class="btn download-btn" @click="openDownload(result.status === 'restored' ? result.restored_download_url : result.anonymized_download_url)">
+                <AppIcon name="download" :size="18" /> 下载文件
+              </button>
+            </div>
           </section>
 
-          <div class="format-note"><strong>格式说明：</strong>DOCX、XLS、TXT、OFD 尽量保持原结构；文本型 PDF 将生成排版规范的新 PDF。扫描 PDF 需先完成 OCR。</div>
+          <section v-if="reviewOpen" class="review-card">
+            <div class="review-heading">
+              <div><h3>识别结果人工校正</h3><p>勾选误识别项，并按“类别|完整内容”逐行补充漏识别词；保存后使用原始文件重新生成脱敏稿。</p></div>
+              <button class="review-close" @click="reviewOpen = false">关闭</button>
+            </div>
+            <div v-if="reviewLoading" class="review-loading"><span class="spinner-border spinner-border-sm"></span> 正在读取或重新处理文件…</div>
+            <template v-else>
+              <div class="review-warning">校正会更新该任务的匿名映射；已有反匿名上传稿和正式文件将作废，需要重新执行反匿名。</div>
+              <div class="review-grid">
+                <div>
+                  <label class="form-label app-label">已识别内容 <small>勾选需要移除的误识别</small></label>
+                  <div class="review-entities">
+                    <label v-for="entity in reviewData.entities" :key="entity.token" :class="{ rejected: reviewRemoveTokens.includes(entity.token) }">
+                      <input v-model="reviewRemoveTokens" type="checkbox" :value="entity.token" />
+                      <span class="review-token">{{ entity.token }}</span>
+                      <strong>{{ entity.text }}</strong>
+                      <small>{{ entity.category_label }}</small>
+                    </label>
+                    <p v-if="!reviewData.entities?.length" class="review-empty">当前没有识别项，请在右侧补充漏识别内容。</p>
+                  </div>
+                </div>
+                <div>
+                  <label class="form-label app-label">补充漏识别内容 <small>每行一个</small></label>
+                  <textarea v-model="reviewAdditions" class="form-control review-textarea" placeholder="单位|山东中烟&#10;产品|文山雨露&#10;产区|文山&#10;人名|张三"></textarea>
+                  <p class="form-hint">补录内容会立即加入加密本地词库；勾掉的误识别会保存为加密否决样本，供后续微调评测。</p>
+                </div>
+              </div>
+              <div class="review-footer">
+                <span>历史已排除 {{ reviewData.excluded_count || 0 }} 项</span>
+                <button class="btn primary-btn" :disabled="reviewLoading || (!reviewAdditions.trim() && !reviewRemoveTokens.length)" @click="applyReview">
+                  <AppIcon name="check" :size="18" /> 保存校正并重新脱敏
+                </button>
+              </div>
+            </template>
+          </section>
+
+          <div class="format-note"><strong>格式说明：</strong>DOCX 仅改写命中的文本区间并保留原有文字节点和样式；XLS、TXT、OFD 尽量保持原结构。文本型 PDF 仍会重新排版，扫描 PDF 需先完成 OCR。</div>
         </template>
 
         <template v-else-if="nav === 'history'">
@@ -461,6 +553,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                     <td>{{ formatDate(task.created_at) }}</td>
                     <td class="text-end table-actions">
                       <button v-if="task.anonymized_download_url" title="下载脱敏文件" @click="openDownload(task.anonymized_download_url)"><AppIcon name="download" :size="17" /></button>
+                      <button v-if="task.anonymized_download_url" title="校正识别结果" @click="openReview(task)"><AppIcon name="info" :size="17" /></button>
                       <button v-if="task.restored_download_url" class="amber" title="下载正式文件" @click="openDownload(task.restored_download_url)"><AppIcon name="restore" :size="17" /></button>
                       <button class="danger" title="删除记录及所有文件" :disabled="deletingTaskId === task.id" @click="deleteTask(task)">
                         <span v-if="deletingTaskId === task.id" class="spinner-border spinner-border-sm"></span>

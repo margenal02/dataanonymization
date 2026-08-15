@@ -122,6 +122,9 @@ chmod 600 .env
 
 编辑 `.env` 并确认：
 
+- `UIE_PERSON_PROB=0.70`，降低非姓名词被 UIE 当成人名的误报；
+- `UIE_ORGANIZATION_PROB=0.55`；
+- `UIE_ADDRESS_PROB=0.60`、`UIE_LOCATION_PROB=0.60`、`UIE_PRODUCT_PROB=0.60`；
 - `DJANGO_DEBUG=0`；
 - `ALLOWED_HOSTS` 包含服务器 IP 或内部域名；
 - 镜像地址适用于当前网络；

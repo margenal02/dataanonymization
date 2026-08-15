@@ -9,12 +9,16 @@ SCHEMA_BY_CATEGORY = {
     "person": ["人名"],
     "organization": ["单位名称", "部门名称"],
     "address": ["详细地址"],
+    "location": ["烟叶产区"],
+    "product": ["烟草品牌或产品名称"],
 }
 SCHEMA_CATEGORY = {
     "人名": "person",
     "单位名称": "organization",
     "部门名称": "organization",
     "详细地址": "address",
+    "烟叶产区": "location",
+    "烟草品牌或产品名称": "product",
 }
 
 

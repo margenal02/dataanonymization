@@ -5,6 +5,8 @@ from collections import Counter
 CATEGORY_LABELS = {
     "organization": "单位",
     "person": "人名",
+    "product": "产品",
+    "location": "产区",
     "phone": "电话",
     "id_card": "证件",
     "email": "邮箱",
@@ -12,7 +14,21 @@ CATEGORY_LABELS = {
     "custom": "敏感项",
 }
 
-DEFAULT_CATEGORIES = ["organization", "person", "phone", "id_card", "email", "address"]
+TOKEN_CODES = {
+    "organization": "单",
+    "person": "人",
+    "product": "品",
+    "location": "区",
+    "phone": "电",
+    "id_card": "证",
+    "email": "邮",
+    "address": "址",
+    "custom": "敏",
+}
+
+DEFAULT_CATEGORIES = [
+    "organization", "person", "product", "location", "phone", "id_card", "email", "address",
+]
 
 _SINGLE_SURNAMES = (
     "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
@@ -82,6 +98,35 @@ _PROVINCE = (
     r"西藏自治区|宁夏回族自治区|新疆维吾尔自治区|香港特别行政区|澳门特别行政区"
 )
 
+_TOBACCO_ORG_ALIASES = (
+    "中国烟草", "山东中烟", "云南中烟", "贵州中烟", "四川中烟", "重庆中烟", "湖南中烟",
+    "湖北中烟", "河南中烟", "安徽中烟", "福建中烟", "广东中烟", "广西中烟", "陕西中烟",
+    "甘肃烟草", "江苏中烟", "浙江中烟", "江西中烟", "河北中烟", "吉林烟草", "辽宁烟草",
+    "黑龙江烟草", "内蒙古烟草", "上海烟草", "北京烟草", "天津烟草",
+)
+_TOBACCO_ORG_ALIAS_RE = "|".join(map(re.escape, sorted(_TOBACCO_ORG_ALIASES, key=len, reverse=True)))
+
+_TOBACCO_LOCATIONS = (
+    "云南", "山东", "贵州", "四川", "重庆", "河南", "湖南", "湖北", "福建", "广东", "广西",
+    "陕西", "甘肃", "辽宁", "吉林", "黑龙江", "内蒙古", "新疆", "文山", "普洱", "曲靖", "保山",
+    "大理", "德宏", "红河", "玉溪", "楚雄", "临沧", "昭通", "昆明", "丽江", "西双版纳",
+)
+_TOBACCO_LOCATION_ALT = "|".join(
+    map(re.escape, sorted(_TOBACCO_LOCATIONS, key=len, reverse=True))
+)
+_TOBACCO_LOCATION_RE = re.compile(
+    _TOBACCO_LOCATION_ALT
+)
+_LOCATION_CONTEXT_RE = re.compile(
+    r"(?:产区|产地|地区|区域|来源地|来自|选自|分布于|覆盖)\s*(?:[：:]|为|是)?\s*"
+    r"([^\n\r，,；;。]{2,160})"
+)
+
+_PRODUCT_STOPWORDS = {
+    "产品", "品牌", "品名", "牌号", "规格", "型号", "模块", "原料", "烟叶", "卷烟", "配方",
+    "主产品", "主要产品", "产品名称", "品牌名称", "模块名称", "典型产品", "典型模块组合",
+}
+
 PATTERNS = {
     "organization": [
         # 烟草行业常见的多层级全称优先，避免只截取到中间的“烟草公司”。
@@ -105,6 +150,7 @@ PATTERNS = {
             r"([\u4e00-\u9fff]{2,16}(?:管理部|业务部|财务部|人力资源部|审计部|审计处|"
             r"专卖处|法规处|办公室))"
         ),
+        re.compile(rf"({_TOBACCO_ORG_ALIAS_RE})"),
         re.compile(rf"({_ORG_CHARS}{{2,70}}?(?:{_ORG_SUFFIX}))"),
     ],
     "person": [
@@ -143,6 +189,19 @@ PATTERNS = {
             r"[\u4e00-\u9fffA-Za-z0-9（）()\-]{1,50}(?:路|街|道|巷|大道|胡同|村|镇)"
             r"[\u4e00-\u9fffA-Za-z0-9号栋室层单元座\-]{0,30})"
         ),
+    ],
+    "product": [
+        re.compile(
+            r"(?:产品名称|品牌名称|模块名称|品名|牌号|品牌|产品|模块|原料)"
+            r"\s*(?:[：:]|为|是)\s*([\u4e00-\u9fffA-Za-z0-9（）()·&＆+\-]{2,60})"
+        ),
+        re.compile(
+            r"(?:型号|规格|配方编号|批次号)\s*(?:[：:]|为|是)?\s*"
+            r"([A-Za-z0-9][A-Za-z0-9./_+\-]{1,39})"
+        ),
+    ],
+    "location": [
+        re.compile(rf"({_TOBACCO_LOCATION_ALT})(?=产区|产地|烟区)"),
     ],
 }
 
@@ -236,7 +295,34 @@ def _is_likely_person_name(value):
         return False
     if compact in _PERSON_STOPWORDS:
         return False
-    return not re.search(r"(?:公司|集团|中心|单位|部门|项目|系统|地址|电话|人员)$", compact)
+    if compact in _TOBACCO_LOCATIONS:
+        return False
+    return not re.search(
+        r"(?:公司|集团|中心|单位|部门|项目|系统|地址|电话|人员|省|市|州|盟|区|县|旗|乡|镇|村|产区)$",
+        compact,
+    )
+
+
+def _normalize_detected_value(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip(" ，,；;。.!！、/：:")
+
+
+def _is_likely_product(value):
+    compact = re.sub(r"\s+", "", value)
+    if compact in _PRODUCT_STOPWORDS or not 2 <= len(compact) <= 60:
+        return False
+    return bool(re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9（）()·&＆+./_\-]{2,60}", compact))
+
+
+def _is_likely_location(value):
+    compact = re.sub(r"\s+", "", value)
+    if compact in _TOBACCO_LOCATIONS:
+        return True
+    return bool(
+        2 <= len(compact) <= 30
+        and re.fullmatch(r"[\u4e00-\u9fff]{2,30}", compact)
+        and re.search(r"(?:省|市|州|盟|区|县|旗|乡|镇|村|产区)$", compact)
+    )
 
 
 def _person_names_from_list(value):
@@ -251,9 +337,14 @@ def _person_names_from_list(value):
 
 
 class MappingBuilder:
-    def __init__(self, task_salt, enabled_categories=None, custom_entities=None):
+    def __init__(self, task_salt, enabled_categories=None, custom_entities=None, excluded_entities=None):
         self.task_salt = task_salt.upper()[:4]
         self.enabled = tuple(dict.fromkeys(enabled_categories or DEFAULT_CATEGORIES))
+        self.excluded_entities = {
+            (_normalize_detected_value(item.get("text")), item.get("category"))
+            for item in (excluded_entities or [])
+            if isinstance(item, dict) and _normalize_detected_value(item.get("text"))
+        }
         self.original_to_token = {}
         self.token_to_original = {}
         self.token_categories = {}
@@ -266,37 +357,54 @@ class MappingBuilder:
 
     def register(self, original, category):
         original = original.strip()
-        if len(original) < 2 or original in self.original_to_token or "【" in original:
+        if (
+            len(original) < 2
+            or original in self.original_to_token
+            or "【" in original
+            or (original, category) in self.excluded_entities
+        ):
             return self.original_to_token.get(original)
-        # A manually supplied longer term has priority over an automatic substring.
-        if any(original in known for known in self.original_to_token):
-            return None
+        # Overlapping values may be valid in different places (for example “文山” is
+        # a production area while “文山雨露” is a product).  Replacement is applied
+        # longest-first, so keeping both does not corrupt the longer value.
         self.counters[category] += 1
-        label = CATEGORY_LABELS.get(category, CATEGORY_LABELS["custom"])
-        token = f"【{label}_{self.task_salt}_{self.counters[category]:03d}】"
+        code = TOKEN_CODES.get(category, TOKEN_CODES["custom"])
+        token = f"【{code}{self.counters[category]:03d}】"
         self.original_to_token[original] = token
         self.token_to_original[token] = original
         self.token_categories[token] = category
         return token
 
-    def register_detected(self, original, category):
-        """Register a model-detected span after conservative type validation."""
-        value = re.sub(r"\s+", " ", str(original or "")).strip(" ，,；;。.!！、/：:")
+    def validate_detected(self, original, category):
+        """Return a normalized model span only when its semantic type is plausible."""
+        value = _normalize_detected_value(original)
         if category not in self.enabled or category not in DEFAULT_CATEGORIES:
             return None
         if category == "person":
             compact = value.replace(" ", "")
-            if not 2 <= len(compact) <= 20 or compact in _PERSON_STOPWORDS:
+            if not _is_likely_person_name(compact):
                 return None
-            if not re.fullmatch(r"[\u4e00-\u9fff·A-Za-z]{2,20}", compact):
-                return None
+            value = compact
         elif category == "organization":
             if not 2 <= len(value) <= 100:
                 return None
         elif category == "address":
             if not 4 <= len(value) <= 120:
                 return None
-        return self.register(value, category)
+        elif category == "location":
+            if not _is_likely_location(value):
+                return None
+        elif category == "product":
+            if not _is_likely_product(value):
+                return None
+        if (value, category) in self.excluded_entities:
+            return None
+        return value
+
+    def register_detected(self, original, category):
+        """Register a model-detected span after conservative type validation."""
+        value = self.validate_detected(original, category)
+        return self.register(value, category) if value else None
 
     def _pattern_candidates(self, text):
         candidates = []
@@ -346,11 +454,27 @@ class MappingBuilder:
                             seen.add(key)
                             candidates.append(key)
 
+            if "location" in self.enabled:
+                for context_match in _LOCATION_CONTEXT_RE.finditer(view):
+                    context_value = context_match.group(1)
+                    for location_match in _TOBACCO_LOCATION_RE.finditer(context_value):
+                        start_in_view = context_match.start(1) + location_match.start()
+                        end_in_view = context_match.start(1) + location_match.end()
+                        span = _source_span(text, indexes, start_in_view, end_in_view)
+                        if span:
+                            key = (span[0], span[1], "location", span[2])
+                            if key not in seen:
+                                seen.add(key)
+                                candidates.append(key)
+
+        stripped = text.strip()
         if "person" in self.enabled:
-            stripped = text.strip()
             if _is_likely_person_name(stripped):
                 start = text.find(stripped)
                 candidates.append((start, start + len(stripped), "person", stripped))
+        if "location" in self.enabled and stripped in _TOBACCO_LOCATIONS:
+            start = text.find(stripped)
+            candidates.append((start, start + len(stripped), "location", stripped))
         return candidates
 
     def discover(self, text):
@@ -402,7 +526,7 @@ class MappingBuilder:
 
     def export(self):
         return {
-            "version": 1,
+            "version": 2,
             "token_to_original": self.token_to_original,
             "token_categories": self.token_categories,
         }
