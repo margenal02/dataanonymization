@@ -6,7 +6,7 @@ import AppIcon from './components/AppIcon.vue'
 const nav = ref('workspace')
 const mode = ref('anonymize')
 const tasks = ref([])
-const stats = ref({ tasks: 0, completed: 0, restored: 0, entities: 0, training_examples: 0, active_labels: 0 })
+const stats = ref({ tasks: 0, completed: 0, restored: 0, entities: 0, training_examples: 0, active_labels: 0, max_upload_size_mb: 200 })
 const loading = ref(false)
 const loadingHistory = ref(false)
 const deletingTaskId = ref('')
@@ -40,6 +40,7 @@ const labelCategoryOptions = [...categoryOptions, { key: 'custom', label: '其�
 
 const completedTasks = computed(() => tasks.value.filter(task => ['completed', 'restored'].includes(task.status)))
 const selectedTask = computed(() => tasks.value.find(task => task.id === selectedTaskId.value))
+const maxUploadSizeMb = computed(() => Number(stats.value.max_upload_size_mb) || 200)
 
 function formatBytes(bytes) {
   if (!bytes) return '0 B'
@@ -65,6 +66,14 @@ function statusMeta(status) {
 function fileFromEvent(event, target) {
   const file = event.target.files?.[0] || event.dataTransfer?.files?.[0]
   if (!file) return
+  if (file.size > maxUploadSizeMb.value * 1024 * 1024) {
+    if (target === 'anonymize') anonymizeFile.value = null
+    else restoreFile.value = null
+    if (event.target && 'value' in event.target) event.target.value = ''
+    error.value = `文件大小不能超过 ${maxUploadSizeMb.value} MB，当前文件为 ${formatBytes(file.size)}。`
+    dragging.value = ''
+    return
+  }
   if (target === 'anonymize') anonymizeFile.value = file
   else restoreFile.value = file
   error.value = ''
@@ -321,7 +330,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               </template>
               <template v-else>
                 <strong>拖放文件到这里，或 <em>点击选择</em></strong>
-                <p>支持 XLS、DOCX、PDF、OFD、TXT，单文件不超过 50 MB</p>
+                <p>支持 XLS、DOCX、PDF、OFD、TXT，单文件不超过 {{ maxUploadSizeMb }} MB</p>
               </template>
             </label>
 
@@ -399,7 +408,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               >
                 <input type="file" accept=".xls,.docx,.pdf,.ofd,.txt" @change="fileFromEvent($event, 'restore')" />
                 <span class="upload-circle amber"><AppIcon :name="restoreFile ? 'check' : 'upload'" :size="23" /></span>
-                <div><strong>{{ restoreFile?.name || '上传 AI 处理后的文件' }}</strong><p>{{ restoreFile ? formatBytes(restoreFile.size) : '点击选择或拖放到这里' }}</p></div>
+                <div><strong>{{ restoreFile?.name || '上传 AI 处理后的文件' }}</strong><p>{{ restoreFile ? formatBytes(restoreFile.size) : `点击选择或拖放到这里，最大 ${maxUploadSizeMb} MB` }}</p></div>
               </label>
             </div>
 

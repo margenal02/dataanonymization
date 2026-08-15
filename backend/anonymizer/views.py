@@ -325,7 +325,15 @@ def download_task(request, task_id, kind):
 @api_view(["GET"])
 def stats(request):
     tasks = AnonymizationTask.objects.all()
-    totals = {"tasks": tasks.count(), "completed": tasks.filter(status__in=["completed", "restored"]).count(), "restored": tasks.filter(status="restored").count(), "entities": 0, "training_examples": TrainingExample.objects.count(), "active_labels": RecognitionLabel.objects.filter(is_active=True).count()}
+    totals = {
+        "tasks": tasks.count(),
+        "completed": tasks.filter(status__in=["completed", "restored"]).count(),
+        "restored": tasks.filter(status="restored").count(),
+        "entities": 0,
+        "training_examples": TrainingExample.objects.count(),
+        "active_labels": RecognitionLabel.objects.filter(is_active=True).count(),
+        "max_upload_size_mb": settings.MAX_UPLOAD_SIZE_MB,
+    }
     for counts in tasks.values_list("entity_counts", flat=True):
         totals["entities"] += sum(counts.values()) if isinstance(counts, dict) else 0
     return Response(totals)

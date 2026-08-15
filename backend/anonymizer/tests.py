@@ -261,6 +261,21 @@ class TaskApiTests(TestCase):
         self.assertIn("张三", restored)
         self.assertIn("AI补充内容", restored)
 
+    @override_settings(MAX_UPLOAD_SIZE_MB=1)
+    def test_rejects_oversized_upload_with_json_detail(self):
+        upload = SimpleUploadedFile("过大.txt", b"a" * (1024 * 1024 + 1), content_type="text/plain")
+        response = self.client.post("/api/tasks/", {"file": upload})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "文件大小不能超过 1 MB。")
+
+    @override_settings(MAX_UPLOAD_SIZE_MB=200)
+    def test_stats_exposes_upload_limit_for_frontend_validation(self):
+        response = self.client.get("/api/stats/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["max_upload_size_mb"], 200)
+
     def test_api_returns_counts_for_realistic_unlabeled_content(self):
         source = (
             "云南中烟工业有限责任公司与红云红河烟草（集团）有限责任公司签订合同，"
