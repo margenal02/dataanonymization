@@ -9,7 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PPNLP_HOME=/opt/paddlenlp \
     UIE_MODEL=uie-micro
 
-RUN if [ -n "$DEBIAN_MIRROR" ]; then \
+RUN echo "[后端构建 1/4] 配置 Debian 镜像并安装系统依赖" \
+    && if [ -n "$DEBIAN_MIRROR" ]; then \
         sed -i \
           -e "s|https://deb.debian.org/debian-security|${DEBIAN_MIRROR}-security|g" \
           -e "s|http://deb.debian.org/debian-security|${DEBIAN_MIRROR}-security|g" \
@@ -22,10 +23,13 @@ RUN if [ -n "$DEBIAN_MIRROR" ]; then \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN python -m pip install --no-cache-dir --index-url "$PIP_INDEX_URL" --upgrade pip==26.2.1 \
-    && python -m pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r requirements.txt
+RUN echo "[后端构建 2/4] 更新 pip" \
+    && python -m pip install --no-cache-dir --index-url "$PIP_INDEX_URL" --upgrade pip==26.2.1 \
+    && echo "[后端构建 3/4] 从选定镜像安装 Django、PaddlePaddle 与 PaddleNLP" \
+    && python -m pip install --no-cache-dir --index-url "$PIP_INDEX_URL" --progress-bar on -r requirements.txt
 COPY . .
-RUN python /app/prefetch_uie.py \
+RUN echo "[后端构建 4/4] 下载、转换并自检 UIE-micro 模型" \
+    && python /app/prefetch_uie.py \
     && chmod +x /app/entrypoint.sh
 
 EXPOSE 8000
