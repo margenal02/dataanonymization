@@ -110,6 +110,39 @@ _TOBACCO_PROVINCE_ORG_ALIAS_RE = rf"(?:{_PROVINCE_SHORT_ALT})(?:中烟|复烤)"
 _KNOWN_REBAKE_FACTORY_ALIASES = ("陆良厂", "遵义厂", "毕节厂")
 _KNOWN_REBAKE_FACTORY_ALIAS_RE = "|".join(map(re.escape, _KNOWN_REBAKE_FACTORY_ALIASES))
 
+# Chinese commonly omits a repeated head noun in coordinated organization
+# names: “陆良、泸西、石林三厂” means three factories, while only the
+# final item carries “三厂”.  This grammar cannot be handled by a regular
+# organization-suffix rule because the first items are bare place names.
+_SHARED_FACTORY_BASE = r"[\u4e00-\u9fff]{2,10}?"
+# A Chinese comma often separates whole clauses, so treating it as an item
+# separator can span two unrelated sentences.  The omission grammar requested
+# here is specifically signalled by the enumeration comma (顿号).
+_SHARED_FACTORY_SEPARATOR = r"\s*、\s*"
+_SHARED_FACTORY_SUFFIX = r"烟叶复烤厂|复烤厂|卷烟厂|厂"
+_SHARED_FACTORY_LIST_RE = re.compile(
+    rf"(?:"
+    rf"(?P<items_count>{_SHARED_FACTORY_BASE}"
+    rf"(?:{_SHARED_FACTORY_SEPARATOR}{_SHARED_FACTORY_BASE})+?)"
+    rf"(?P<count>(?:等\s*)?[一二两三四五六七八九十百\d]+\s*(?:家|个|座)?)"
+    rf"(?P<suffix_count>{_SHARED_FACTORY_SUFFIX})"
+    rf"|"
+    rf"(?P<items_plain>{_SHARED_FACTORY_BASE}"
+    rf"(?:{_SHARED_FACTORY_SEPARATOR}{_SHARED_FACTORY_BASE})+)"
+    rf"(?P<suffix_plain>{_SHARED_FACTORY_SUFFIX})"
+    rf")"
+)
+_SHARED_FACTORY_SEPARATOR_RE = re.compile(_SHARED_FACTORY_SEPARATOR)
+_SHARED_FACTORY_LEADING_MARKERS = (
+    "分别包括", "分别涉及", "分别为", "分别是", "后文统称", "下文统称", "服务于", "分布于",
+    "先后走访", "先后调研", "包括", "涉及", "涵盖", "下辖", "所属", "走访", "调研",
+    "覆盖", "委托", "对接", "联系", "来自", "位于", "前往", "统称", "简称",
+    "根据", "按照", "针对", "关于", "依托", "联合", "协同", "与", "同", "对", "向", "赴", "由",
+)
+_SHARED_FACTORY_NON_NAMES = {
+    "我们", "同时", "项目", "工作", "研究", "研发", "生产", "管理", "技术", "服务",
+}
+
 _TOBACCO_ORG_ALIASES = (
     "中国烟草", "山东中烟", "云南中烟", "贵州中烟", "四川中烟", "重庆中烟", "湖南中烟",
     "湖北中烟", "河南中烟", "安徽中烟", "福建中烟", "广东中烟", "广西中烟", "陕西中烟",
@@ -337,6 +370,102 @@ def _clean_organization(value):
             cleaned = tail
             break
     return cleaned
+
+
+def _clean_shared_factory_base(value, first=False):
+    """Return the name-bearing part of one coordinated factory list item."""
+    cleaned = re.sub(r"\s+", "", value or "").strip("、，,；;:：")
+    cleaned = cleaned.removesuffix("等")
+    for suffix in ("烟叶复烤厂", "复烤厂", "卷烟厂", "厂"):
+        if cleaned.endswith(suffix) and len(cleaned) - len(suffix) >= 2:
+            cleaned = cleaned[:-len(suffix)]
+            break
+    if first:
+        # A regex sees the clause before the first enumeration separator as a
+        # single item.  Remove common natural-language lead-ins conservatively.
+        marker_end = -1
+        for marker in _SHARED_FACTORY_LEADING_MARKERS:
+            position = cleaned.rfind(marker)
+            if position >= 0 and len(cleaned) - position - len(marker) >= 2:
+                marker_end = max(marker_end, position + len(marker))
+        if marker_end >= 0:
+            cleaned = cleaned[marker_end:]
+    if (
+        not 2 <= len(cleaned) <= 10
+        or not re.fullmatch(r"[\u4e00-\u9fff]+", cleaned)
+        or cleaned in _SHARED_FACTORY_NON_NAMES
+    ):
+        return ""
+    return cleaned
+
+
+def _shared_factory_mentions(text):
+    """Find bare names governed by a factory suffix at the end of a list.
+
+    Returned spans cover only the name-bearing words.  Count markers, list
+    punctuation and the shared suffix remain untouched during anonymization.
+    """
+    mentions = []
+    seen = set()
+    for view, indexes in _matching_views(text):
+        for list_match in _SHARED_FACTORY_LIST_RE.finditer(view):
+            items_group = "items_count" if list_match.group("items_count") else "items_plain"
+            items = list_match.group(items_group)
+            suffix = list_match.group("suffix_count") or list_match.group("suffix_plain")
+            item_start = list_match.start(items_group)
+            parts = []
+            cursor = 0
+            for separator in _SHARED_FACTORY_SEPARATOR_RE.finditer(items):
+                parts.append((cursor, separator.start(), items[cursor:separator.start()]))
+                cursor = separator.end()
+            parts.append((cursor, len(items), items[cursor:]))
+            if len(parts) < 2:
+                continue
+            compact_parts = [
+                re.sub(r"\s+", "", part[2]).removesuffix("等") for part in parts
+            ]
+            # In a fully expanded list such as
+            # “陆良复烤厂、泸西复烤厂、石林复烤厂”, the final suffix belongs
+            # to the last name rather than being omitted from earlier names.
+            if (
+                not list_match.group("count")
+                and all(part.endswith(suffix) for part in compact_parts[:-1])
+            ):
+                continue
+            expression_span = _source_span(text, indexes, *list_match.span())
+            if not expression_span:
+                continue
+            for part_index, (part_start, part_end, raw_part) in enumerate(parts):
+                # An item that already repeats the suffix is a normal full name;
+                # leave it to the ordinary organization recognizer.
+                compact_part = re.sub(r"\s+", "", raw_part).removesuffix("等")
+                if compact_part.endswith(("烟叶复烤厂", "复烤厂", "卷烟厂", "厂")):
+                    continue
+                base = _clean_shared_factory_base(raw_part, first=part_index == 0)
+                if not base:
+                    continue
+                base_offset = raw_part.rfind(base)
+                if base_offset < 0:
+                    continue
+                start_in_view = item_start + part_start + base_offset
+                end_in_view = start_in_view + len(base)
+                span = _source_span(text, indexes, start_in_view, end_in_view)
+                if not span:
+                    continue
+                key = (span[0], span[1], base)
+                if key in seen:
+                    continue
+                seen.add(key)
+                mentions.append({
+                    "start": span[0],
+                    "end": span[1],
+                    "text": span[2],
+                    "normalized": base,
+                    "suffix": suffix,
+                    "expression_start": expression_span[0],
+                    "expression_end": expression_span[1],
+                })
+    return mentions
 
 
 def _is_likely_person_name(value):
@@ -622,6 +751,9 @@ class MappingBuilder:
     def _pattern_candidates(self, text):
         candidates = []
         seen = set()
+        shared_factory_mentions = (
+            _shared_factory_mentions(text) if "organization" in self.enabled else []
+        )
         for view, indexes in _matching_views(text):
             for category in self.enabled:
                 for pattern in PATTERNS.get(category, []):
@@ -679,6 +811,35 @@ class MappingBuilder:
                             if key not in seen:
                                 seen.add(key)
                                 candidates.append(key)
+
+        if shared_factory_mentions:
+            # A generic suffix pattern can otherwise consume the last shorthand
+            # item together with “三厂”.  Prefer the grammar-aware name spans so
+            # enumeration punctuation, counts and the shared suffix stay intact.
+            protected_spans = [
+                (mention["start"], mention["end"])
+                for mention in shared_factory_mentions
+            ]
+            candidates = [
+                candidate
+                for candidate in candidates
+                if not (
+                    candidate[2] == "organization"
+                    and any(
+                        candidate[0] < protected_end
+                        and candidate[1] > protected_start
+                        and (candidate[0], candidate[1]) != (protected_start, protected_end)
+                        for protected_start, protected_end in protected_spans
+                    )
+                )
+            ]
+            for mention in shared_factory_mentions:
+                key = (
+                    mention["start"], mention["end"], "organization", mention["normalized"],
+                )
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(key)
 
         stripped = text.strip()
         if "person" in self.enabled:
@@ -819,6 +980,22 @@ def _derived_organization_aliases(full_name):
     return list(dict.fromkeys(alias for alias in aliases if alias != full_name))
 
 
+def _factory_distinctive_prefixes(full_name):
+    """Return prefixes which may carry a shared factory suffix in a list."""
+    prefixes = []
+    for suffix in ("烟叶复烤厂", "复烤厂", "卷烟厂", "厂"):
+        if not full_name.endswith(suffix):
+            continue
+        prefix = full_name[:-len(suffix)].strip()
+        if len(prefix) >= 2:
+            prefixes.append(prefix)
+            for province in _PROVINCE_SHORTS:
+                if prefix.startswith(province) and len(prefix) - len(province) >= 2:
+                    prefixes.append(prefix[len(province):])
+        break
+    return list(dict.fromkeys(prefixes))
+
+
 def _has_distinct_alias_occurrence(text, full_name, alias):
     """Return true only when an alias occurs outside the full-name span."""
     return any(
@@ -840,12 +1017,44 @@ def suggest_organization_alias_groups(builder, text):
     for original, token in list(builder.original_to_token.items()):
         if builder.token_categories.get(token) == "organization":
             organizations.append(original)
+    organization_by_key = {
+        normalized_entity_key(original): original for original in organizations
+    }
+    contextual_aliases = {}
+    for mention in _shared_factory_mentions(text):
+        key = normalized_entity_key(mention["normalized"])
+        if not key:
+            continue
+        contextual_aliases[key] = {
+            "alias": organization_by_key.get(key, mention["normalized"]),
+            "suffix": mention["suffix"],
+        }
     groups = []
     seen_pairs = set()
     for full_name in sorted(organizations, key=len, reverse=True):
+        suggestions = []
         for alias in _derived_organization_aliases(full_name):
-            if not _has_distinct_alias_occurrence(text, full_name, alias):
+            if _has_distinct_alias_occurrence(text, full_name, alias):
+                suggestions.append((
+                    alias,
+                    f"“{alias}”符合“{full_name}”的行业简称规则",
+                    0.92,
+                ))
+        prefix_keys = {
+            normalized_entity_key(prefix)
+            for prefix in _factory_distinctive_prefixes(full_name)
+        }
+        for key in prefix_keys:
+            context = contextual_aliases.get(key)
+            if not context:
                 continue
+            alias = context["alias"]
+            suggestions.append((
+                alias,
+                f"“{alias}”位于顿号并列的后置“{context['suffix']}”省略表达中",
+                0.94,
+            ))
+        for alias, reason, confidence in suggestions:
             pair = (full_name, alias)
             if pair in seen_pairs:
                 continue
@@ -858,8 +1067,8 @@ def suggest_organization_alias_groups(builder, text):
                 "category": "organization",
                 "canonical": full_name,
                 "members": [full_name, alias],
-                "reason": f"“{alias}”符合“{full_name}”的行业简称规则",
-                "confidence": 0.92,
+                "reason": reason,
+                "confidence": confidence,
                 "accepted": False,
             })
     return groups

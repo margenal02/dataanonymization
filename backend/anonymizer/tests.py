@@ -156,6 +156,65 @@ class MappingBuilderTests(TestCase):
             ("陆良复烤厂", "陆良厂"),
         }.issubset(pairs))
 
+    def test_recognizes_factory_names_with_one_shared_trailing_suffix(self):
+        source = "陆良、泸西、石林厂联合开展技术改造。"
+        builder = MappingBuilder("shared-factory", ["organization"])
+
+        anonymized = builder.anonymize(source)
+
+        for abbreviation in ("陆良", "泸西", "石林"):
+            self.assertIn(abbreviation, builder.original_to_token)
+            self.assertNotIn(abbreviation, anonymized)
+        self.assertIn("、", anonymized)
+        self.assertIn("厂联合开展技术改造", anonymized)
+        self.assertEqual(builder.counts(), {"单位": 3})
+        self.assertEqual(restore_text(anonymized, builder.export()), source)
+
+    def test_preserves_factory_count_and_colloquial_grammar_while_masking_names(self):
+        source = "公司先后走访陆良、泸西、石林等3家复烤厂，毕节、曲靖两厂同时参与。"
+        builder = MappingBuilder("factory-count", ["organization"])
+
+        anonymized = builder.anonymize(source)
+
+        for abbreviation in ("陆良", "泸西", "石林", "毕节", "曲靖"):
+            self.assertIn(abbreviation, builder.original_to_token)
+            self.assertNotIn(abbreviation, anonymized)
+        self.assertIn("等3家复烤厂", anonymized)
+        self.assertIn("两厂同时参与", anonymized)
+        self.assertEqual(restore_text(anonymized, builder.export()), source)
+
+    def test_suggests_full_names_for_contextual_shared_suffix_abbreviations(self):
+        source = (
+            "陆良复烤厂、泸西复烤厂、石林复烤厂完成改造，"
+            "后文统称陆良、泸西、石林三厂。"
+        )
+        builder = MappingBuilder("shared-groups", ["organization"])
+        builder.discover(source)
+
+        groups = suggest_organization_alias_groups(builder, source)
+        pairs = {(group["canonical"], group["members"][1]) for group in groups}
+
+        self.assertTrue({
+            ("陆良复烤厂", "陆良"),
+            ("泸西复烤厂", "泸西"),
+            ("石林复烤厂", "石林"),
+        }.issubset(pairs))
+        for group in groups:
+            if group["members"][1] in {"陆良", "泸西", "石林"}:
+                self.assertIn("顿号并列", group["reason"])
+
+    def test_explicit_factory_list_is_not_misread_as_suffix_omission(self):
+        source = "陆良复烤厂、泸西复烤厂、石林复烤厂联合开展工作。"
+        builder = MappingBuilder("full-factory-list", ["organization"])
+
+        anonymized = builder.anonymize(source)
+
+        self.assertEqual(
+            set(builder.original_to_token),
+            {"陆良复烤厂", "泸西复烤厂", "石林复烤厂"},
+        )
+        self.assertEqual(restore_text(anonymized, builder.export()), source)
+
     def test_cleans_sentence_prefix_before_rebake_company_name(self):
         source = "遵义复烤厂中心实验室为贵州烟叶复烤有限责任公司中心实验室。"
         builder = MappingBuilder("clean-org", ["organization"])
