@@ -11,6 +11,8 @@ class TaskSerializer(serializers.ModelSerializer):
     recognition_mode = serializers.SerializerMethodField()
     uie_detected_count = serializers.SerializerMethodField()
     uie_rejected_count = serializers.SerializerMethodField()
+    processing_progress = serializers.SerializerMethodField()
+    ocr_page_count = serializers.SerializerMethodField()
 
     class Meta:
         model = AnonymizationTask
@@ -19,6 +21,7 @@ class TaskSerializer(serializers.ModelSerializer):
             "entity_counts", "error_message", "created_at", "updated_at",
             "anonymized_download_url", "restored_download_url", "stored_files",
             "recognition_mode", "uie_detected_count", "uie_rejected_count",
+            "processing_progress", "ocr_page_count",
         ]
 
     def _url(self, task, kind):
@@ -45,6 +48,12 @@ class TaskSerializer(serializers.ModelSerializer):
 
     def get_uie_rejected_count(self, task):
         return int((task.options or {}).get("uie_rejected_count", 0))
+
+    def get_processing_progress(self, task):
+        return (task.options or {}).get("processing_progress") or {}
+
+    def get_ocr_page_count(self, task):
+        return int((task.options or {}).get("ocr_page_count", 0))
 
     def get_stored_files(self, task):
         return {

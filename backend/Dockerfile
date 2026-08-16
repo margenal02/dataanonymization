@@ -18,7 +18,11 @@ RUN echo "[后端构建 1/4] 配置 Debian 镜像并安装系统依赖" \
           -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
           /etc/apt/sources.list.d/debian.sources; \
     fi \
-    && apt-get update && apt-get install -y --no-install-recommends curl libgomp1 \
+    && apt-get update && apt-get install -y --no-install-recommends \
+      curl libgomp1 poppler-utils tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng \
+    && command -v pdftoppm >/dev/null \
+    && tesseract --list-langs 2>/dev/null | grep -qx chi_sim \
+    && tesseract --list-langs 2>/dev/null | grep -qx eng \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
