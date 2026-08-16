@@ -1929,7 +1929,60 @@ function Test-WslRestartRequiredResult($Result) {
         return $true
     }
     $outputText = [string]::Join("`n", @($Result.Output))
-    return $outputText -match 'WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED'
+    return $outputText -match 'WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED|HCS_E_HYPERV_NOT_INSTALLED|0x80370102'
+}
+
+function Test-WslHypervisorUnavailableResult($Result) {
+    if ($null -eq $Result) { return $false }
+    $outputText = [string]::Join("`n", @($Result.Output))
+    return $outputText -match '(?i)HCS_E_HYPERV_NOT_INSTALLED|0x80370102|HYPERV_NOT_INSTALLED|未启用虚拟化|virtualization[^\r\n]*(not enabled|disabled)|hypervisor[^\r\n]*(not installed|not running)'
+}
+
+function Get-SystemBootIdentity {
+    try {
+        $system = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 10 -ErrorAction Stop |
+            Select-Object -First 1
+        if ($system -and $system.LastBootUpTime) {
+            return ([DateTime]$system.LastBootUpTime).ToUniversalTime().Ticks.ToString()
+        }
+    } catch {
+        Write-Warning "无法读取 Windows 启动时间：$($_.Exception.Message)"
+    }
+    return ''
+}
+
+function Stop-ForWslHypervisorRestart {
+    param(
+        $Result,
+        [string]$Operation = '启动 WSL2'
+    )
+    if (-not (Test-WslHypervisorUnavailableResult $Result)) { return $false }
+
+    $currentBootIdentity = Get-SystemBootIdentity
+    $repairBootIdentity = ''
+    if (Test-Path -LiteralPath $hypervisorRepairMarkerPath) {
+        $repairBootIdentity = [string](Get-Content -LiteralPath $hypervisorRepairMarkerPath `
+            -Raw -ErrorAction SilentlyContinue)
+        $repairBootIdentity = $repairBootIdentity.Trim()
+    }
+    if ($currentBootIdentity -and $repairBootIdentity -and $currentBootIdentity -ne $repairBootIdentity) {
+        throw "$Operation 失败：Windows 已在自动修复后重启，但 WSL2 虚拟机监控程序仍不可用。请在 BIOS/UEFI 中启用 Intel VT-x/AMD-V；如果本 Windows 运行在 Hyper-V、VMware 或云主机虚拟机内，还必须由宿主机管理员开启嵌套虚拟化，然后重新运行脚本。"
+    }
+
+    Write-Warning '检测到 WSL2 虚拟机监控程序尚未启动，正在启用 Windows hypervisor 自动启动。'
+    $bcdResult = Invoke-NativeCommand -FilePath 'bcdedit.exe' `
+        -ArgumentList @('/set', '{current}', 'hypervisorlaunchtype', 'auto') `
+        -DisplayOutput -Activity '启用 Windows hypervisor 自动启动' `
+        -ProgressStart 42 -ProgressEnd 42 -CommandTimeoutSeconds 30
+    if ($bcdResult.ExitCode -ne 0) {
+        throw "$Operation 失败，且无法设置 hypervisorlaunchtype=Auto。请确认使用管理员 PowerShell，并检查启动配置或组织安全策略。"
+    }
+    if ($currentBootIdentity) {
+        Set-Content -LiteralPath $hypervisorRepairMarkerPath -Value $currentBootIdentity `
+            -Encoding Ascii -Force
+    }
+    Stop-ForRestart -Reason '已启用 Windows hypervisor 自动启动，WSL2 需要在下次开机后继续安装'
+    return $true
 }
 
 function Install-OfficialWslMsi([string]$Architecture, [int]$ProgressStart, [int]$ProgressEnd) {
@@ -2197,6 +2250,7 @@ if (-not (Test-Administrator)) {
 $resolvedProject = [IO.Path]::GetFullPath($ProjectPath)
 $runtimeDirectory = Join-Path $resolvedProject '.runtime'
 New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
+$hypervisorRepairMarkerPath = Join-Path $runtimeDirectory 'wsl-hypervisor-repair.boot'
 $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logPath = Join-Path $runtimeDirectory 'install-support-latest.log'
 $archiveLogPath = Join-Path $runtimeDirectory ("install-wsl-docker-$runTimestamp.log")
@@ -2659,6 +2713,7 @@ try {
         Write-Host "WSL 未安装或低于 $MinimumWslVersion，开始安装/更新。" -ForegroundColor Yellow
         $wslResult = Invoke-WslOfficialDownload -Operation Update -Architecture $architecture `
             -ProgressStart 25 -ProgressEnd 40
+        if (Stop-ForWslHypervisorRestart -Result $wslResult -Operation '更新 WSL 运行时') { return }
         if (Test-WslRestartRequiredResult $wslResult) {
             Stop-ForRestart -Reason 'WSL 运行时已安装并等待系统完成配置'
             return
@@ -2677,6 +2732,7 @@ try {
     }
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-default-version', '2') `
         -DisplayOutput -Activity '设置默认 WSL 版本为 2' -ProgressStart 40 -ProgressEnd 42
+    if (Stop-ForWslHypervisorRestart -Result $wslResult -Operation '设置 WSL2 默认版本') { return }
     if (Test-WslRestartRequiredResult $wslResult) {
         Stop-ForRestart -Reason 'WSL2 组件仍在等待系统重启'
         return
@@ -2687,6 +2743,7 @@ try {
         $wslResult = Invoke-WslOfficialDownload -Operation Install -Distribution $DistroName `
             -Architecture $architecture `
             -ProgressStart 42 -ProgressEnd 57
+        if (Stop-ForWslHypervisorRestart -Result $wslResult -Operation "安装 $DistroName") { return }
         if (Test-WslRestartRequiredResult $wslResult) {
             Stop-ForRestart -Reason "$DistroName 安装所需的 WSL2 组件仍在等待系统重启"
             return
@@ -2704,6 +2761,7 @@ try {
     if ($distroGeneration -ne 2) {
         $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' -ArgumentList @('--set-version', $DistroName, '2') `
             -DisplayOutput -Activity "将 $DistroName 转换为 WSL2" -ProgressStart 57 -ProgressEnd 62
+        if (Stop-ForWslHypervisorRestart -Result $wslResult -Operation "将 $DistroName 转换为 WSL2") { return }
         if ($wslResult.ExitCode -ne 0) { throw "无法把 $DistroName 转换为 WSL2。" }
     } else {
         Write-Host "$DistroName 已是 WSL2，跳过版本转换。" -ForegroundColor Green
@@ -2712,7 +2770,9 @@ try {
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
         -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'bash', '-lc', 'true') `
         -DisplayOutput -Activity "初始化 $DistroName" -ProgressStart 62 -ProgressEnd 65
+    if (Stop-ForWslHypervisorRestart -Result $wslResult -Operation "初始化 $DistroName") { return }
     if ($wslResult.ExitCode -ne 0) { throw "$DistroName 初始化失败。" }
+    Remove-Item -LiteralPath $hypervisorRepairMarkerPath -Force -ErrorAction SilentlyContinue
 
     $linuxProject = ConvertTo-WslPath -Distribution $DistroName -WindowsPath $resolvedProject
     $bootstrapPath = Join-Path $runtimeDirectory 'wsl-bootstrap.sh'
