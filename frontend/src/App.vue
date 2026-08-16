@@ -50,14 +50,14 @@ const processingProgress = ref(null)
 const selectedCategories = ref(['organization', 'person', 'product', 'location', 'phone', 'id_card', 'email', 'address'])
 
 const categoryOptions = [
-  { key: 'organization', label: '单位 / 部门' },
-  { key: 'person', label: '人员姓名' },
-  { key: 'product', label: '品牌 / 产品' },
-  { key: 'location', label: '产区 / 地点' },
-  { key: 'phone', label: '联系电话' },
-  { key: 'id_card', label: '证件号码' },
-  { key: 'email', label: '电子邮箱' },
-  { key: 'address', label: '地址信息' }
+  { key: 'organization', label: '单位 / 部门', icon: 'building' },
+  { key: 'person', label: '人员姓名', icon: 'person' },
+  { key: 'product', label: '品牌 / 产品', icon: 'product' },
+  { key: 'location', label: '产区 / 地点', icon: 'location' },
+  { key: 'phone', label: '联系电话', icon: 'phone' },
+  { key: 'id_card', label: '证件号码', icon: 'id_card' },
+  { key: 'email', label: '电子邮箱', icon: 'email' },
+  { key: 'address', label: '地址信息', icon: 'address' }
 ]
 const labelCategoryOptions = [...categoryOptions, { key: 'custom', label: '其他敏感项' }]
 
@@ -65,11 +65,11 @@ const completedTasks = computed(() => tasks.value.filter(task => ['completed', '
 const selectedTask = computed(() => tasks.value.find(task => task.id === selectedTaskId.value))
 const maxUploadSizeMb = computed(() => Number(stats.value.max_upload_size_mb) || 200)
 const pageMeta = computed(() => ({
-  workspace: ['数据处理台', '文件级敏感信息匿名化与安全恢复'],
-  history: ['处理记录', '查看并下载历史处理结果'],
-  analytics: ['质量洞察', '量化识别质量、人工复核与数据运营指标'],
-  labels: ['训练标注工作台', '机器预标、人工校正并沉淀本地训练集'],
-  guide: ['使用说明', '了解安全、可逆的数据处理流程']
+  workspace: ['数据处理台', '安全处理、人工复核、可逆恢复'],
+  history: ['处理记录', '文件状态与结果管理'],
+  analytics: ['质量洞察', '识别质量与处理效率'],
+  labels: ['训练标注', '机器预标与人工校正'],
+  guide: ['使用说明', '三步完成安全数据处理']
 })[nav.value] || ['数据处理台', '文件级敏感信息匿名化与安全恢复'])
 const filteredReviewEntities = computed(() => {
   const query = reviewQuery.value.trim().toLocaleLowerCase('zh-CN')
@@ -523,27 +523,27 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
     <aside class="sidebar">
       <div class="brand">
         <span class="brand-mark"><AppIcon name="shield-check" :size="27" /></span>
-        <span><strong>隐数盾</strong><small>烟草行业数据安全平台</small></span>
+        <span><strong>隐数盾</strong><small>数据安全平台</small></span>
       </div>
 
       <div class="side-label">工作空间</div>
       <nav class="side-nav">
-        <button :class="{ active: nav === 'workspace' }" @click="nav = 'workspace'">
-          <AppIcon name="layout" /> 数据处理台
+        <button title="数据处理台" :class="{ active: nav === 'workspace' }" @click="nav = 'workspace'">
+          <span class="nav-icon"><AppIcon name="layout" /></span><span class="nav-text">处理台</span>
         </button>
-        <button :class="{ active: nav === 'history' }" @click="nav = 'history'; refreshData()">
-          <AppIcon name="history" /> 处理记录
+        <button title="处理记录" :class="{ active: nav === 'history' }" @click="nav = 'history'; refreshData()">
+          <span class="nav-icon"><AppIcon name="history" /></span><span class="nav-text">记录</span>
           <span v-if="tasks.length" class="nav-count">{{ tasks.length }}</span>
         </button>
-        <button :class="{ active: nav === 'analytics' }" @click="nav = 'analytics'; refreshData()">
-          <AppIcon name="chart" /> 质量洞察
+        <button title="质量洞察" :class="{ active: nav === 'analytics' }" @click="nav = 'analytics'; refreshData()">
+          <span class="nav-icon"><AppIcon name="chart" /></span><span class="nav-text">洞察</span>
         </button>
-        <button :class="{ active: nav === 'labels' }" @click="nav = 'labels'; refreshLabels(); refreshTrainingDocuments()">
-          <AppIcon name="info" /> 训练标注
+        <button title="训练标注" :class="{ active: nav === 'labels' }" @click="nav = 'labels'; refreshLabels(); refreshTrainingDocuments()">
+          <span class="nav-icon"><AppIcon name="info" /></span><span class="nav-text">训练</span>
           <span v-if="trainingLabels.length" class="nav-count">{{ trainingLabels.length }}</span>
         </button>
-        <button :class="{ active: nav === 'guide' }" @click="nav = 'guide'">
-          <AppIcon name="book" /> 使用说明
+        <button title="使用说明" :class="{ active: nav === 'guide' }" @click="nav = 'guide'">
+          <span class="nav-icon"><AppIcon name="book" /></span><span class="nav-text">指南</span>
         </button>
       </nav>
 
@@ -560,7 +560,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
           <h1>{{ pageMeta[0] }}</h1>
           <p>{{ pageMeta[1] }}</p>
         </div>
-        <div class="industry-badge"><AppIcon name="building" :size="17" /> 烟草行业专用</div>
+        <div class="platform-badge"><span class="status-orbit"><i></i></span><AppIcon name="shield-check" :size="19" /><span><strong>数据安全平台</strong><small>本地服务已连接</small></span></div>
       </header>
 
       <div class="content-area">
@@ -570,26 +570,33 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
         </div>
         <template v-if="nav === 'workspace'">
           <section class="stats-grid">
-            <article><span>累计处理</span><strong>{{ stats.tasks }}</strong><small>个文件任务</small></article>
-            <article><span>已确认敏感信息</span><strong>{{ stats.entity_occurrences ?? stats.entities }}</strong><small>处全文替换</small></article>
-            <article><span>已生成正式版</span><strong>{{ stats.restored }}</strong><small>个恢复文件</small></article>
+            <article><span class="metric-icon mint"><AppIcon name="file-lock" :size="25" /></span><div><span>累计任务</span><strong>{{ stats.tasks }}</strong><small>文件</small></div><i class="metric-wave"></i></article>
+            <article><span class="metric-icon blue"><AppIcon name="scan" :size="25" /></span><div><span>敏感信息</span><strong>{{ stats.entity_occurrences ?? stats.entities }}</strong><small>处</small></div><i class="metric-wave"></i></article>
+            <article><span class="metric-icon gold"><AppIcon name="restore" :size="25" /></span><div><span>正式输出</span><strong>{{ stats.restored }}</strong><small>文件</small></div><i class="metric-wave"></i></article>
+          </section>
+
+          <section class="process-path" aria-label="数据处理流程">
+            <div class="active"><span><AppIcon name="upload" :size="22" /></span><strong>上传</strong></div><i></i>
+            <div><span><AppIcon name="scan" :size="22" /></span><strong>识别</strong></div><i></i>
+            <div><span><AppIcon name="check" :size="22" /></span><strong>复核</strong></div><i></i>
+            <div><span><AppIcon name="download" :size="22" /></span><strong>输出</strong></div>
           </section>
 
           <div class="mode-switch">
             <button :class="{ active: mode === 'anonymize' }" @click="selectMode('anonymize')">
-              <span class="switch-icon"><AppIcon name="file-lock" /></span>
-              <span><strong>数据匿名</strong><small>隐藏单位、人名等敏感信息</small></span>
+              <span class="switch-icon"><AppIcon name="file-lock" :size="27" /></span>
+              <span><strong>数据匿名</strong><small>发现并隐藏敏感信息</small></span><b>开始</b>
             </button>
             <button :class="{ active: mode === 'restore' }" @click="selectMode('restore')">
-              <span class="switch-icon"><AppIcon name="restore" /></span>
-              <span><strong>数据反匿名</strong><small>恢复 AI 处理后的正式文件</small></span>
+              <span class="switch-icon"><AppIcon name="restore" :size="27" /></span>
+              <span><strong>数据反匿名</strong><small>恢复匿名信息并正式输出</small></span><b>恢复</b>
             </button>
           </div>
 
           <section v-if="mode === 'anonymize'" class="work-card">
             <div class="card-heading">
-              <span class="step-number">01</span>
-              <div><h2>上传待脱敏文件</h2><p>系统将识别文件中的敏感信息并替换为稳定匿名标记</p></div>
+              <span class="step-number"><AppIcon name="upload" :size="23" /></span>
+              <div><small class="heading-kicker">STEP 01</small><h2>上传待脱敏文件</h2><p>选择文件，系统自动提取并高亮敏感信息</p></div>
             </div>
 
             <label
@@ -617,7 +624,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                 <div class="category-grid">
                   <label v-for="category in categoryOptions" :key="category.key" class="category-check">
                     <input v-model="selectedCategories" type="checkbox" :value="category.key" />
-                    <span><AppIcon name="check" :size="13" /> {{ category.label }}</span>
+                    <span><i><AppIcon :name="category.icon" :size="21" /></i><b>{{ category.label }}</b><em><AppIcon name="check" :size="15" /></em></span>
                   </label>
                 </div>
               </div>
@@ -630,7 +637,8 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
 
             <div class="uie-settings">
               <div class="uie-heading">
-                <div><strong>UIE-base 智能识别方式</strong><small>规则负责精确匹配，UIE-base 补充识别人名、单位、产品、产区和地址；扫描 PDF 先使用 PP-StructureV3 精简 OCR</small></div>
+                <span class="uie-icon"><AppIcon name="sparkle" :size="24" /></span>
+                <div><strong>智能识别引擎</strong><small>规则 + UIE-base + 本地 OCR</small></div>
                 <span class="model-state" :class="{ loaded: modelRuntime.resident_loaded, unavailable: !modelRuntime.available }">
                   {{ !modelRuntime.available ? '模型服务不可用' : modelRuntime.resident_loaded ? '模型已常驻' : '模型未占用内存' }}
                 </span>
@@ -638,11 +646,11 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               <div class="uie-mode-grid">
                 <label :class="{ active: uieMode === 'on_demand' }">
                   <input type="radio" name="uieMode" value="on_demand" :checked="uieMode === 'on_demand'" :disabled="modelModeLoading" @change="selectUieMode('on_demand')" />
-                  <span><b>临时调用（推荐）</b><small>OCR 完成并释放后再加载 UIE-base，处理结束立即释放约 2～4 GB 内存；每次会增加冷启动等待时间。</small></span>
+                  <AppIcon name="sparkle" :size="22" /><span><b>临时调用 <em>推荐</em></b><small>节省内存 · 单次加载</small></span>
                 </label>
                 <label :class="{ active: uieMode === 'resident' }">
                   <input type="radio" name="uieMode" value="resident" :checked="uieMode === 'resident'" :disabled="modelModeLoading" @change="selectUieMode('resident')" />
-                  <span><b>模型常驻</b><small>首次加载后保留在内存，后续文件更快；空闲时仍持续占用约 2～4 GB 内存，建议至少 32 GB 系统内存。</small></span>
+                  <AppIcon name="database" :size="22" /><span><b>模型常驻</b><small>响应更快 · 占用 2～4 GB</small></span>
                 </label>
               </div>
               <div v-if="modelModeLoading" class="model-loading"><span class="spinner-border spinner-border-sm"></span> 正在切换模型运行方式，请稍候…</div>
@@ -665,8 +673,8 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
 
           <section v-else class="work-card">
             <div class="card-heading">
-              <span class="step-number amber">02</span>
-              <div><h2>恢复正式文件</h2><p>使用原任务的加密映射，将 AI 处理稿中的匿名标记恢复为正式信息</p></div>
+              <span class="step-number amber"><AppIcon name="restore" :size="23" /></span>
+              <div><small class="heading-kicker">RESTORE</small><h2>恢复正式文件</h2><p>关联原任务并上传处理稿，安全恢复正式信息</p></div>
             </div>
 
             <div class="restore-layout">
@@ -766,7 +774,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                     <span><button @click="selectAllReviewCandidates">全选</button><button @click="clearReviewCandidates">清空</button></span>
                   </div>
                   <div class="review-filters">
-                    <input v-model="reviewQuery" class="form-control" placeholder="搜索字段或匿名代码" />
+                    <label class="search-field"><AppIcon name="search" :size="17" /><input v-model="reviewQuery" class="form-control" placeholder="搜索字段或匿名代码" /></label>
                     <select v-model="reviewCategoryFilter" class="form-select">
                       <option value="all">全部类型</option>
                       <option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option>
@@ -858,8 +866,8 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
           <section class="training-explain">
             <span><AppIcon name="info" :size="25" /></span>
             <div>
-              <h2>文档预标 + 人工校正 + 本地训练数据</h2>
-              <p>上传样本文档后由规则与 UIE-base 机器预标，人工在全文中确认、改类型或补标。保存后词条立即进入本地精确识别；带上下文和字符位置的样本用于后续 UIE-base 权重微调。</p>
+              <small class="heading-kicker">HUMAN IN THE LOOP</small><h2>训练标注闭环</h2>
+              <p>机器预标 → 人工校正 → 本地训练集</p>
             </div>
             <div class="training-count"><strong>{{ trainingLabels.length }}</strong><small>有效标签</small><strong>{{ trainingExampleCount }}</strong><small>训练样本</small></div>
           </section>
@@ -868,8 +876,8 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
             <div class="annotation-upload">
               <div><h2>上传训练文档</h2><p>支持与脱敏任务相同的格式；原文、预标和人工结果均只在本机保存，敏感内容加密入库</p></div>
               <label class="annotation-file"><input type="file" accept=".xls,.docx,.pdf,.ofd,.txt" @change="fileFromTrainingEvent" /><span>{{ trainingDocumentFile?.name || '选择样本文档' }}</span></label>
-              <button class="btn primary-btn" :disabled="trainingDocumentLoading || !trainingDocumentFile" @click="uploadTrainingDocument"><span v-if="trainingDocumentLoading" class="spinner-border spinner-border-sm"></span> 机器预标</button>
-              <a class="btn light-btn" href="/api/training/export/">导出 UIE JSONL 训练集</a>
+              <button class="btn primary-btn" :disabled="trainingDocumentLoading || !trainingDocumentFile" @click="uploadTrainingDocument"><span v-if="trainingDocumentLoading" class="spinner-border spinner-border-sm"></span><AppIcon v-else name="scan" :size="18" /> 机器预标</button>
+              <a class="btn light-btn" href="/api/training/export/"><AppIcon name="download" :size="18" /> 导出训练集</a>
             </div>
             <div v-if="trainingDocuments.length" class="training-documents">
               <article v-for="document in trainingDocuments" :key="document.id" :class="{ active: activeTrainingDocument?.id === document.id }">
@@ -949,7 +957,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
         <template v-else>
           <section class="guide-hero">
             <span><AppIcon name="shield-check" :size="34" /></span>
-            <div><h2>安全可逆的三步处理流程</h2><p>敏感原文不进入外部 AI 服务，正式信息只在本地恢复。</p></div>
+            <div><small class="heading-kicker">SECURE WORKFLOW</small><h2>安全可逆的三步流程</h2><p>原文不出本机，映射加密保存。</p></div>
           </section>
           <section class="guide-grid">
             <article><b>1</b><AppIcon name="file-lock" :size="27" /><h3>本地匿名</h3><p>上传原始文件，系统识别单位、人名、证件等信息，替换为稳定匿名标记。</p></article>
@@ -959,7 +967,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
           <section class="guide-details">
             <h3>使用建议</h3>
             <ul>
-              <li>自动识别前，建议在“指定敏感词”中补充烟草专卖局、卷烟厂、供应商和人员名单。</li>
+              <li>自动识别前，可在“指定敏感词”中补充业务单位、部门、供应商和人员名单。</li>
               <li>“临时调用”在 OCR 子进程退出后加载 UIE-base，并在任务结束后释放约 2～4 GB 内存；“模型常驻”建议至少 32 GB 系统内存。</li>
               <li>新增或修改的识别标签会加密保存并立即加入本地词库，同时形成后续批量微调所需的训练样本。</li>
               <li>扫描 PDF 会自动调用 PP-StructureV3 精简 OCR，并显示渲染、模型加载、当前页和百分比；PDF 处理结果会重新排版，复杂公文建议优先使用 DOCX。</li>

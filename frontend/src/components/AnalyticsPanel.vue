@@ -38,10 +38,10 @@ function statusClass(key) {
   </section>
 
   <section class="analytics-kpis">
-    <article><small>任务完成率</small><strong>{{ stats.completion_rate || 0 }}%</strong><span>{{ stats.completed || 0 }} / {{ stats.tasks || 0 }} 个任务</span></article>
-    <article><small>候选采纳率</small><strong>{{ review.candidate_acceptance_rate || 0 }}%</strong><span>人工采纳 {{ review.selected_count || 0 }} 个候选</span></article>
-    <article><small>人工补漏</small><strong>{{ review.manual_added_count || 0 }}</strong><span>用于评估模型召回短板</span></article>
-    <article><small>平均识别耗时</small><strong>{{ performance.average_recognition_seconds || 0 }}s</strong><span>{{ performance.measured_tasks || 0 }} 个任务有测量值</span></article>
+    <article><i class="kpi-visual green"><AppIcon name="check" :size="24" /></i><div><small>任务完成率</small><strong>{{ stats.completion_rate || 0 }}%</strong><span>{{ stats.completed || 0 }} / {{ stats.tasks || 0 }} 个任务</span></div></article>
+    <article><i class="kpi-visual blue"><AppIcon name="scan" :size="24" /></i><div><small>候选采纳率</small><strong>{{ review.candidate_acceptance_rate || 0 }}%</strong><span>人工采纳 {{ review.selected_count || 0 }} 项</span></div></article>
+    <article><i class="kpi-visual gold"><AppIcon name="sparkle" :size="24" /></i><div><small>人工补漏</small><strong>{{ review.manual_added_count || 0 }}</strong><span>召回优化线索</span></div></article>
+    <article><i class="kpi-visual violet"><AppIcon name="history" :size="24" /></i><div><small>平均识别耗时</small><strong>{{ performance.average_recognition_seconds || 0 }}s</strong><span>{{ performance.measured_tasks || 0 }} 个样本</span></div></article>
   </section>
 
   <div class="analytics-grid">

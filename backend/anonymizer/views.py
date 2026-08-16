@@ -477,12 +477,12 @@ def health(request):
             cursor.fetchone()
     except Exception:
         return Response(
-            {"status": "unavailable", "service": "烟草行业数据脱敏系统", "database": "unavailable"},
+            {"status": "unavailable", "service": "数据安全平台", "database": "unavailable"},
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
     return Response({
         "status": "ok",
-        "service": "烟草行业数据脱敏系统",
+        "service": "数据安全平台",
         "database": "ok",
         "time": timezone.now(),
     })
