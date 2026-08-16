@@ -158,25 +158,26 @@ def _replace_text_nodes(text_nodes, transform):
 
 
 def _transform_docx_xml_parts(document, transform):
-    """Process text boxes and other Word text that python-docx does not expose as paragraphs."""
-    seen_paragraphs = set()
+    """Process all visible Word and DrawingML text containers.
+
+    WPS and PDF-to-Word conversions often store later pages or text boxes as
+    DrawingML ``a:p/a:t`` nodes.  ``python-docx`` paragraph APIs and the old
+    ``w:p/w:t`` traversal cannot see those nodes even though Word renders them
+    normally, which previously produced apparently page-based recognition
+    cutoffs.  Package parts are unique, so no object-id based de-duplication is
+    needed (and lxml wrapper ids are not a stable XML identity).
+    """
     for part in document.part.package.parts:
         root = getattr(part, "element", None)
         if root is None:
             root = getattr(part, "_element", None)
         if root is None or not hasattr(root, "iter"):
             continue
-        for paragraph in root.iter(qn("w:p")):
-            paragraph_id = id(paragraph)
-            if paragraph_id in seen_paragraphs:
-                continue
-            seen_paragraphs.add(paragraph_id)
-            text_nodes = list(paragraph.iter(qn("w:t")))
-            if not text_nodes:
-                continue
-            original = "".join(node.text or "" for node in text_nodes)
-            if original:
-                _replace_text_nodes(text_nodes, transform)
+        for container_tag, text_tag in ((qn("w:p"), qn("w:t")), (qn("a:p"), qn("a:t"))):
+            for paragraph in root.iter(container_tag):
+                text_nodes = list(paragraph.iter(text_tag))
+                if text_nodes and any(node.text for node in text_nodes):
+                    _replace_text_nodes(text_nodes, transform)
 
 
 def process_docx(source, destination, transform):

@@ -314,6 +314,30 @@ class FileProcessorTests(TestCase):
         self.assertIn("王建国", restored_text)
         self.assertIn("中国烟草总公司", restored_text)
 
+    def test_docx_drawingml_text_from_converted_later_pages_is_processed(self):
+        source = self.directory / "drawingml.docx"
+        document = Document()
+        paragraph = document.add_paragraph("前两页普通正文")
+        drawing = parse_xml(
+            f'<w:drawing {nsdecls("w", "a")}>'
+            '<a:p><a:r><a:t>第三页单位：贵州烟叶复烤有限责任公司，与江苏中烟联合研究</a:t></a:r></a:p>'
+            '</w:drawing>'
+        )
+        paragraph._p.append(drawing)
+        document.save(source)
+
+        anonymized, restored = self._roundtrip(source, ".docx")
+        anonymized_text = "".join(
+            node.text or "" for node in Document(anonymized)._element.xpath(".//a:t")
+        )
+        restored_text = "".join(
+            node.text or "" for node in Document(restored)._element.xpath(".//a:t")
+        )
+        self.assertNotIn("贵州烟叶复烤有限责任公司", anonymized_text)
+        self.assertNotIn("江苏中烟", anonymized_text)
+        self.assertIn("贵州烟叶复烤有限责任公司", restored_text)
+        self.assertIn("江苏中烟", restored_text)
+
     def test_xls_roundtrip(self):
         source = self.directory / "sample.xls"
         book = xlwt.Workbook()
@@ -443,6 +467,67 @@ class TaskApiTests(TestCase):
         self.assertIn("中国烟草总公司", restored)
         self.assertIn("张三", restored)
         self.assertIn("AI补充内容", restored)
+
+    @override_settings(UIE_ENABLED=False)
+    def test_docx_review_and_output_include_entities_after_third_page(self):
+        buffer = io.BytesIO()
+        document = Document()
+        document.add_paragraph("第一页单位：中国烟草总公司。")
+        document.add_page_break()
+        document.add_paragraph("第二页为普通说明文字。")
+        document.add_page_break()
+        third_page = document.add_paragraph("第三页开头。")
+        drawing = parse_xml(
+            f'<w:drawing {nsdecls("w", "a")}>'
+            '<a:p><a:r><a:t>遵义复烤厂中心实验室为贵州烟叶复烤有限责任公司中心实验室，'
+            '与江苏中烟共计开展技术研究。</a:t></a:r></a:p>'
+            '</w:drawing>'
+        )
+        third_page._p.append(drawing)
+        document.add_page_break()
+        document.add_paragraph("第四页：贵州毕节复烤厂持续推进技术改造。")
+        document.save(buffer)
+        upload = SimpleUploadedFile(
+            "多页复烤报告.docx",
+            buffer.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+        created = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["organization"]),
+            "review_required": "true",
+        })
+        self.assertEqual(created.status_code, 201, created.content)
+        task_id = created.json()["id"]
+        review = self.client.get(f"/api/tasks/{task_id}/review/").json()
+        preview_text = "\n".join(section["text"] for section in review["preview"])
+        for expected in ("贵州烟叶复烤有限责任公司", "江苏中烟", "贵州毕节复烤厂"):
+            self.assertIn(expected, preview_text)
+        selected = [
+            {"token": item["token"], "text": item["text"], "category": item["category"]}
+            for item in review["entities"]
+        ]
+
+        confirmed = self.client.post(
+            f"/api/tasks/{task_id}/review/",
+            {"selected_entities": selected},
+            content_type="application/json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.content)
+        download = self.client.get(confirmed.json()["task"]["anonymized_download_url"])
+        result_document = Document(io.BytesIO(b"".join(download.streaming_content)))
+        output_text = "".join(
+            node.text or "" for node in result_document._element.xpath(".//w:t | .//a:t")
+        )
+        for sensitive in (
+            "中国烟草总公司",
+            "遵义复烤厂",
+            "贵州烟叶复烤有限责任公司",
+            "江苏中烟",
+            "贵州毕节复烤厂",
+        ):
+            self.assertNotIn(sensitive, output_text)
 
     @override_settings(MAX_UPLOAD_SIZE_MB=1)
     def test_rejects_oversized_upload_with_json_detail(self):

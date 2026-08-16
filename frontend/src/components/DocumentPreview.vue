@@ -23,7 +23,7 @@ function segments(section) {
   let cursor = 0
   for (const span of [...(section.spans || [])].sort((a, b) => a.start - b.start)) {
     if (span.start > cursor) result.push({ text: section.text.slice(cursor, span.start), plain: true })
-    const key = `${span.token}::${span.text}`
+    const key = `${span.token}::${span.entity_text || span.text}`
     const entity = entityMap.value[key]
     result.push({
       text: section.text.slice(span.start, span.end),
