@@ -6,10 +6,19 @@ from pathlib import Path
 
 
 PROTOCOL_PREFIX = "__PPSTRUCTURE__"
+_UNUSED_CHART_MODEL = "PP-Chart2Table"
 
 
 def _emit(payload):
     print(PROTOCOL_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def _layout_pipeline_class():
+    from paddlex.inference.pipelines.layout_parsing.pipeline_v2 import (
+        _LayoutParsingPipelineV2,
+    )
+
+    return _LayoutParsingPipelineV2
 
 
 def _build_pipeline():
@@ -17,27 +26,44 @@ def _build_pipeline():
     # PaddleOCR model after a scanned PDF has finished processing.
     from paddleocr import PPStructureV3
 
-    return PPStructureV3(
-        device=os.getenv("PPSTRUCTURE_DEVICE", "cpu"),
-        layout_detection_model_name=os.getenv("PPSTRUCTURE_LAYOUT_MODEL", "PP-DocLayout-S"),
-        text_detection_model_name=os.getenv(
-            "PPSTRUCTURE_TEXT_DETECTION_MODEL", "PP-OCRv5_mobile_det"
-        ),
-        text_recognition_model_name=os.getenv(
-            "PPSTRUCTURE_TEXT_RECOGNITION_MODEL", "PP-OCRv5_mobile_rec"
-        ),
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        use_seal_recognition=False,
-        use_table_recognition=False,
-        use_formula_recognition=False,
-        use_chart_recognition=False,
-        use_region_detection=False,
-        format_block_content=False,
-        enable_mkldnn=True,
-        cpu_threads=max(1, min(16, int(os.getenv("PPSTRUCTURE_CPU_THREADS", "8")))),
-    )
+    # PaddleX 3.3.13 initializes PP-Chart2Table unconditionally even when
+    # use_chart_recognition=False. Intercept only that unused model while the
+    # pinned PP-StructureV3 pipeline is created, then immediately restore the
+    # vendor method. This keeps the lite worker to layout + mobile OCR models.
+    layout_pipeline_class = _layout_pipeline_class()
+    original_create_model = layout_pipeline_class.create_model
+
+    def create_lite_model(instance, config, *args, **kwargs):
+        if isinstance(config, dict) and config.get("model_name") == _UNUSED_CHART_MODEL:
+            return None
+        return original_create_model(instance, config, *args, **kwargs)
+
+    layout_pipeline_class.create_model = create_lite_model
+    try:
+        return PPStructureV3(
+            device=os.getenv("PPSTRUCTURE_DEVICE", "cpu"),
+            layout_detection_model_name=os.getenv(
+                "PPSTRUCTURE_LAYOUT_MODEL", "PP-DocLayout-S"
+            ),
+            text_detection_model_name=os.getenv(
+                "PPSTRUCTURE_TEXT_DETECTION_MODEL", "PP-OCRv5_mobile_det"
+            ),
+            text_recognition_model_name=os.getenv(
+                "PPSTRUCTURE_TEXT_RECOGNITION_MODEL", "PP-OCRv5_mobile_rec"
+            ),
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            use_seal_recognition=False,
+            use_table_recognition=False,
+            use_formula_recognition=False,
+            use_chart_recognition=False,
+            use_region_detection=False,
+            enable_mkldnn=False,
+            cpu_threads=max(1, min(16, int(os.getenv("PPSTRUCTURE_CPU_THREADS", "8")))),
+        )
+    finally:
+        layout_pipeline_class.create_model = original_create_model
 
 
 def _result_payload(result):
@@ -82,7 +108,6 @@ def _recognize(pipeline, image_path):
         use_formula_recognition=False,
         use_chart_recognition=False,
         use_region_detection=False,
-        format_block_content=False,
     )
     result = next(iter(output), None)
     return _extract_text(result) if result is not None else ""

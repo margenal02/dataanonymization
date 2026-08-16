@@ -434,13 +434,26 @@ run_compose_build() {
     local service="$1"
     local description="$2"
     local build_log="${PROJECT_DIR}/.runtime/docker-build-${service}.log"
+    local build_status
     mkdir -p "${PROJECT_DIR}/.runtime"
     : >"$build_log"
     log "${description}；BuildKit 明细实时写入 ${build_log}"
     printf '[%s] 开始构建 %s\n' "$(date '+%F %T')" "$service" | tee -a "$build_log"
-    COMPOSE_ANSI=never BUILDKIT_PROGRESS=plain \
-        docker compose build "$service" 2>&1 | tee -a "$build_log"
-    printf '[%s] %s 构建完成\n' "$(date '+%F %T')" "$service" | tee -a "$build_log"
+    if COMPOSE_ANSI=never BUILDKIT_PROGRESS=plain \
+        docker compose build "$service" 2>&1 | tee -a "$build_log"; then
+        printf '[%s] %s 构建完成\n' "$(date '+%F %T')" "$service" | tee -a "$build_log"
+        return 0
+    fi
+
+    build_status="${PIPESTATUS[0]}"
+    if [[ -z "$build_status" || "$build_status" -eq 0 ]]; then
+        build_status=1
+    fi
+    printf '\n[%s] %s 构建失败（退出码 %s）。关键错误如下：\n' \
+        "$(date '+%F %T')" "$service" "$build_status" | tee -a "$build_log" >&2
+    tail -n 100 "$build_log" >&2
+    printf '完整构建日志：%s\n' "$build_log" >&2
+    return "$build_status"
 }
 
 deploy_application() {

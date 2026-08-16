@@ -3,6 +3,8 @@ import json
 import os
 import sys
 
+from .paddlenlp_compat import ensure_aistudio_download_compatibility
+
 
 PROTOCOL_PREFIX = "__UIE__"
 SCHEMA_BY_CATEGORY = {
@@ -34,6 +36,7 @@ def _schema(categories):
 
 
 def _load_engine():
+    ensure_aistudio_download_compatibility()
     from paddlenlp import Taskflow
     from paddlenlp.utils.log import logger
 

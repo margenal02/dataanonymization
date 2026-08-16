@@ -3,6 +3,7 @@ import json
 import shutil
 import tempfile
 import zipfile
+from types import ModuleType
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,8 +22,10 @@ from reportlab.pdfgen import canvas
 from .file_processors import ProcessingError, process_file
 from .crypto import decrypt_mapping
 from .models import AnonymizationTask, RecognitionLabel, TrainingExample
+from .paddlenlp_compat import ensure_aistudio_download_compatibility
 from .ppstructure_worker import _build_pipeline as build_ppstructure_pipeline
 from .ppstructure_worker import _extract_text as extract_ppstructure_text
+from .ppstructure_worker import _recognize as recognize_with_ppstructure
 from .recognizer import MappingBuilder, restore_text
 from .training_data import decrypt_label
 from .uie_runtime import UIEProcessingError, _manager_url
@@ -634,14 +637,28 @@ class TaskApiTests(TestCase):
 class PPStructureWorkerTests(TestCase):
     def test_builds_only_the_lite_ppstructure_modules(self):
         captured = {}
+        created_models = []
+
+        class FakeLayoutPipeline:
+            def create_model(self, config, *args, **kwargs):
+                created_models.append(config["model_name"])
+                return config["model_name"]
 
         class FakeModule:
             @staticmethod
             def PPStructureV3(**kwargs):
                 captured.update(kwargs)
+                pipeline = FakeLayoutPipeline()
+                captured["chart_model"] = pipeline.create_model(
+                    {"model_name": "PP-Chart2Table"}
+                )
+                captured["layout_model"] = pipeline.create_model(
+                    {"model_name": "PP-DocLayout-S"}
+                )
                 return object()
 
-        with patch.dict("sys.modules", {"paddleocr": FakeModule()}):
+        with patch("anonymizer.ppstructure_worker._layout_pipeline_class", return_value=FakeLayoutPipeline), \
+                patch.dict("sys.modules", {"paddleocr": FakeModule()}):
             build_ppstructure_pipeline()
 
         self.assertEqual(captured["layout_detection_model_name"], "PP-DocLayout-S")
@@ -653,6 +670,28 @@ class PPStructureWorkerTests(TestCase):
             "use_chart_recognition", "use_region_detection",
         ):
             self.assertFalse(captured[option], option)
+        self.assertFalse(captured["enable_mkldnn"])
+        self.assertNotIn("format_block_content", captured)
+        self.assertIsNone(captured["chart_model"])
+        self.assertEqual(captured["layout_model"], "PP-DocLayout-S")
+        self.assertEqual(created_models, ["PP-DocLayout-S"])
+        self.assertEqual(
+            FakeLayoutPipeline().create_model({"model_name": "PP-Chart2Table"}),
+            "PP-Chart2Table",
+        )
+
+    def test_prediction_uses_only_paddleocr_332_supported_options(self):
+        captured = {}
+
+        class FakePipeline:
+            def predict(self, **kwargs):
+                captured.update(kwargs)
+                return []
+
+        recognize_with_ppstructure(FakePipeline(), Path("check.png"))
+
+        self.assertEqual(captured["input"], "check.png")
+        self.assertNotIn("format_block_content", captured)
 
     def test_extracts_layout_order_and_keeps_text_outside_layout_blocks(self):
         class FakeResult:
@@ -674,6 +713,20 @@ class PPStructureWorkerTests(TestCase):
 
 
 class UIEWorkerTests(TestCase):
+    def test_adds_guarded_legacy_aistudio_download_symbol(self):
+        fake_package = ModuleType("aistudio_sdk")
+        fake_hub = ModuleType("aistudio_sdk.hub")
+        fake_package.hub = fake_hub
+
+        with patch.dict(
+            "sys.modules",
+            {"aistudio_sdk": fake_package, "aistudio_sdk.hub": fake_hub},
+        ):
+            self.assertTrue(ensure_aistudio_download_compatibility())
+            self.assertFalse(ensure_aistudio_download_compatibility())
+            with self.assertRaisesRegex(RuntimeError, "已移除旧版 download API"):
+                fake_hub.download(repo_id="unused")
+
     @override_settings(UIE_MANAGER_URL="file:///tmp/model.sock")
     def test_model_manager_rejects_non_loopback_url(self):
         with self.assertRaises(UIEProcessingError):

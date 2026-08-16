@@ -2,6 +2,8 @@ import os
 import threading
 from pathlib import Path
 
+from anonymizer.paddlenlp_compat import ensure_aistudio_download_compatibility
+
 
 def cache_size(path):
     try:
@@ -24,6 +26,7 @@ def report_cache_growth(path, stop_event):
 
 def main():
     print("[UIE 模型 1/3] 正在加载 PaddleNLP 运行组件", flush=True)
+    ensure_aistudio_download_compatibility()
     from paddlenlp import Taskflow
     from paddlenlp.utils.log import logger
 
