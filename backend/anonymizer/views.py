@@ -33,6 +33,8 @@ from .recognizer import (
     DEFAULT_CATEGORIES,
     MappingBuilder,
     build_restorer,
+    contains_equivalent,
+    registered_match_spans,
     suggest_organization_alias_groups,
 )
 from .serializers import TaskSerializer
@@ -207,35 +209,34 @@ def _select_model_entities(builder, entities):
 def _build_review_contexts(mapping, text_chunks, file_type, filename_stem, model_metadata, custom_keys):
     contexts = {}
     token_categories = mapping.get("token_categories", {})
-    for token, original in mapping.get("token_to_original", {}).items():
-        if not token.startswith("【"):
-            continue
+    for original, token in mapping.get("original_to_token", {}).items():
         category = token_categories.get(token, "custom")
         key = (original, category)
         occurrences = []
         for index, chunk in enumerate(text_chunks):
-            start_at = 0
-            while len(occurrences) < 3:
-                position = chunk.find(original, start_at)
-                if position < 0:
-                    break
+            for match in registered_match_spans(chunk, {original: token}):
+                position = match["start"]
+                end = match["end"]
                 prefix = re.sub(r"\s+", " ", chunk[max(0, position - 70):position]).strip()
-                suffix = re.sub(r"\s+", " ", chunk[position + len(original):position + len(original) + 70]).strip()
+                suffix = re.sub(r"\s+", " ", chunk[end:end + 70]).strip()
                 occurrences.append({
                     "prefix": prefix,
-                    "match": original,
+                    "match": match["text"],
                     "suffix": suffix,
                     "location": f"第 {index + 1} 页" if file_type == "pdf" else f"文本片段 {index + 1}",
                 })
-                start_at = position + max(1, len(original))
+                if len(occurrences) >= 3:
+                    break
             if len(occurrences) >= 3:
                 break
-        if not occurrences and original in filename_stem:
-            position = filename_stem.find(original)
+        filename_matches = registered_match_spans(filename_stem, {original: token})
+        if not occurrences and filename_matches:
+            filename_match = filename_matches[0]
+            position = filename_match["start"]
             occurrences.append({
                 "prefix": filename_stem[:position],
-                "match": original,
-                "suffix": filename_stem[position + len(original):],
+                "match": filename_match["text"],
+                "suffix": filename_stem[filename_match["end"]:],
                 "location": "文件名",
             })
         model_info = model_metadata.get(key, {})
@@ -255,11 +256,6 @@ def _build_review_preview(mapping, text_chunks, file_type, filename_stem):
         if token.startswith("【")
     }
     token_categories = mapping.get("token_categories", {})
-    values = sorted(
-        ((original, token) for original, token in original_to_token.items() if original and token.startswith("【")),
-        key=lambda item: len(item[0]),
-        reverse=True,
-    )
     sections = []
     source_sections = [
         {
@@ -272,30 +268,16 @@ def _build_review_preview(mapping, text_chunks, file_type, filename_stem):
         source_sections.insert(0, {"location": "文件名", "text": filename_stem})
     for section_index, section in enumerate(source_sections):
         text = section["text"]
-        candidates = []
-        for original, token in values:
-            start_at = 0
-            while True:
-                position = text.find(original, start_at)
-                if position < 0:
-                    break
-                candidates.append({
-                    "start": position,
-                    "end": position + len(original),
-                    "text": original,
-                    "token": token,
-                    "category": token_categories.get(token, "custom"),
-                })
-                start_at = position + max(1, len(original))
-        occupied = bytearray(len(text))
         spans = []
-        for candidate in sorted(candidates, key=lambda item: (-(item["end"] - item["start"]), item["start"])):
-            if occupied.find(1, candidate["start"], candidate["end"]) >= 0:
-                continue
-            occupied[candidate["start"]:candidate["end"]] = b"\x01" * (
-                candidate["end"] - candidate["start"]
-            )
-            spans.append(candidate)
+        for match in registered_match_spans(text, original_to_token):
+            spans.append({
+                "start": match["start"],
+                "end": match["end"],
+                "text": match["text"],
+                "entity_text": match["entity_text"],
+                "token": match["token"],
+                "category": token_categories.get(match["token"], "custom"),
+            })
         sections.append({
             "index": section_index,
             "location": section["location"],
@@ -313,6 +295,7 @@ def _process_task(
     excluded_entities=None,
     await_review=False,
     accepted_alias_groups=None,
+    previous_mapping=None,
 ):
     processing_started = time.monotonic()
     options = dict(task.options or {})
@@ -347,14 +330,20 @@ def _process_task(
     searchable_text = "\n".join(recognition_chunks)
     matching_custom = [
         item for item in combined_custom
-        if str(item.get("text", "")).strip() and str(item.get("text", "")).strip() in searchable_text
+        if str(item.get("text", "")).strip()
+        and contains_equivalent(searchable_text, str(item.get("text", "")).strip())
     ]
     custom_keys = {
         (str(item.get("text", "")).strip(), item.get("category", "custom"))
         for item in matching_custom
     }
     builder = MappingBuilder(
-        str(task.id), categories, matching_custom, excluded_entities=excluded_entities,
+        str(task.id),
+        categories,
+        matching_custom,
+        excluded_entities=excluded_entities,
+        previous_mapping=previous_mapping,
+        token_namespace=settings.ANONYMIZATION_NAMESPACE,
     )
     for text_chunk in recognition_chunks:
         builder.discover(text_chunk)
@@ -419,6 +408,7 @@ def _process_task(
             output_path.unlink(missing_ok=True)
 
     mapping = builder.export()
+    mapping["machine_scope"] = "local-encrypted-mapping"
     mapping["review_exclusions"] = list(excluded_entities or [])
     mapping["review_contexts"] = _build_review_contexts(
         mapping,
@@ -430,6 +420,14 @@ def _process_task(
     )
     mapping["review_preview"] = _build_review_preview(mapping, text_chunks, task.file_type, filename_stem)
     mapping["alias_suggestions"] = applied_alias_groups or alias_suggestions
+    if not await_review:
+        save_task_custom_entities([
+            {
+                "text": original,
+                "category": mapping.get("token_categories", {}).get(token, "custom"),
+            }
+            for original, token in mapping.get("original_to_token", {}).items()
+        ])
     review_metrics = dict(options.get("review_metrics") or {})
     if await_review:
         review_metrics.update({
@@ -456,6 +454,7 @@ def _process_task(
     task.entity_counts = builder.counts()
     task.task_name = _task_name(anonymized_stem)
     task.options = options
+    task.options["anonymization_namespace"] = settings.ANONYMIZATION_NAMESPACE
     task.options["review_required"] = bool(options.get("review_required", await_review))
     task.options["review_confirmed"] = not await_review
     task.options["processing_progress"] = {
@@ -835,7 +834,7 @@ def _review_entities(mapping):
     for section in mapping.get("review_preview", []):
         section_text = str(section.get("text", ""))
         for span in section.get("spans", []):
-            text = str(span.get("text", ""))
+            text = str(span.get("entity_text") or span.get("text", ""))
             token = str(span.get("token", ""))
             key = (token, text)
             occurrence_counts[key] += 1
@@ -845,7 +844,7 @@ def _review_entities(mapping):
             end = int(span.get("end", start))
             occurrence_index[key].append({
                 "prefix": re.sub(r"\s+", " ", section_text[max(0, start - 70):start]).strip(),
-                "match": text,
+                "match": str(span.get("text", text)),
                 "suffix": re.sub(r"\s+", " ", section_text[end:end + 70]).strip(),
                 "location": section.get("location", "原文"),
             })
@@ -984,14 +983,14 @@ def task_review(request, task_id):
     }.values())
 
     try:
-        confirmed_semantic_entities = [
+        confirmed_entities = [
             {"text": text, "category": category}
             for (token, text), category in selected_by_key.items()
-            if category in {"organization", "person", "product", "location", "address"}
+            if category in {*DEFAULT_CATEGORIES, "custom"}
         ]
         save_task_custom_entities(list({
             (item["category"], item["text"]): item
-            for item in [*additions, *confirmed_semantic_entities]
+            for item in [*additions, *confirmed_entities]
         }.values()))
         previous_exclusions = [
             item for item in mapping.get("review_exclusions", []) if isinstance(item, dict)
@@ -1033,6 +1032,7 @@ def task_review(request, task_id):
             excluded_entities,
             await_review=False,
             accepted_alias_groups=accepted_alias_groups,
+            previous_mapping=mapping,
         )
         if removals:
             record_rejected_entities(removals, task.id)

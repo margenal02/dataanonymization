@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 
@@ -77,6 +78,11 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 REQUIRE_HUMAN_REVIEW = os.getenv("REQUIRE_HUMAN_REVIEW", "1") == "1"
 FILE_UPLOAD_MAX_MEMORY_SIZE = 5 * 1024 * 1024
 MAPPING_ENCRYPTION_KEY = os.getenv("MAPPING_ENCRYPTION_KEY", SECRET_KEY)
+ANONYMIZATION_NAMESPACE = os.getenv("ANONYMIZATION_NAMESPACE", "").strip().upper()
+if not ANONYMIZATION_NAMESPACE:
+    ANONYMIZATION_NAMESPACE = hashlib.sha256(
+        f"data-security-platform\0{MAPPING_ENCRYPTION_KEY}".encode("utf-8")
+    ).hexdigest()[:8].upper()
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "30"))
 UIE_ENABLED = os.getenv("UIE_ENABLED", "0") == "1"
 UIE_MODEL = os.getenv("UIE_MODEL", "uie-base")

@@ -16,6 +16,7 @@ class TaskSerializer(serializers.ModelSerializer):
     review_required = serializers.SerializerMethodField()
     review_confirmed = serializers.SerializerMethodField()
     review_candidate_count = serializers.SerializerMethodField()
+    anonymization_namespace = serializers.SerializerMethodField()
 
     class Meta:
         model = AnonymizationTask
@@ -26,6 +27,7 @@ class TaskSerializer(serializers.ModelSerializer):
             "recognition_mode", "uie_detected_count", "uie_rejected_count",
             "processing_progress", "ocr_page_count",
             "review_required", "review_confirmed", "review_candidate_count",
+            "anonymization_namespace",
         ]
 
     def _url(self, task, kind):
@@ -72,6 +74,9 @@ class TaskSerializer(serializers.ModelSerializer):
         if "candidate_count" in metrics:
             return int(metrics.get("candidate_count", 0))
         return sum(task.entity_counts.values()) if isinstance(task.entity_counts, dict) else 0
+
+    def get_anonymization_namespace(self, task):
+        return str((task.options or {}).get("anonymization_namespace", ""))
 
     def get_stored_files(self, task):
         return {

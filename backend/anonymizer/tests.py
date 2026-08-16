@@ -20,7 +20,7 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen import canvas
 
 from .file_processors import ProcessingError, process_file
-from .crypto import decrypt_mapping
+from .crypto import decrypt_mapping, encrypt_mapping
 from .models import AnonymizationTask, RecognitionLabel, TrainingDocument, TrainingExample
 from .paddlenlp_compat import ensure_aistudio_download_compatibility
 from .ppstructure_worker import _build_pipeline as build_ppstructure_pipeline
@@ -34,6 +34,13 @@ from .views import _select_model_entities
 
 
 class MappingBuilderTests(TestCase):
+    @override_settings(MAPPING_ENCRYPTION_KEY="machine-a-secret")
+    def test_encrypted_mapping_cannot_be_opened_with_another_machine_key(self):
+        ciphertext = encrypt_mapping({"token_to_original": {"【LOCAL-人001】": "张三"}})
+        with override_settings(MAPPING_ENCRYPTION_KEY="machine-b-secret"):
+            with self.assertRaisesRegex(ValueError, "部署密钥"):
+                decrypt_mapping(ciphertext)
+
     def test_detects_tobacco_entities_and_restores_exactly(self):
         source = "单位：中国烟草总公司\n联系人：张三\n电话：13800138000"
         builder = MappingBuilder("abcd1234")
@@ -173,6 +180,50 @@ class MappingBuilderTests(TestCase):
         self.assertNotIn("138 0013 8000", anonymized)
         self.assertEqual(builder.counts(), {"单位": 1, "人名": 1, "电话": 1})
         self.assertEqual(restore_text(anonymized, builder.export()), source)
+
+    def test_replaces_all_normalized_variants_with_one_token_without_rewriting_sentences(self):
+        builder = MappingBuilder(
+            "consistent",
+            ["organization"],
+            [{"text": "陆良复烤厂", "category": "organization"}],
+            token_namespace="LOCAL88",
+        )
+        source = "甲方为陆良复烤厂；复核仍由陆\u200b良 复 烤 厂负责，其他句子保持不变。"
+
+        anonymized = builder.anonymize_registered(source)
+        token = builder.original_to_token["陆良复烤厂"]
+
+        self.assertEqual(token, "【LOCAL88-单001】")
+        self.assertEqual(anonymized.count(token), 2)
+        self.assertIn("；复核仍由", anonymized)
+        self.assertIn("负责，其他句子保持不变。", anonymized)
+
+    def test_reprocessing_keeps_active_tokens_and_old_files_restorable(self):
+        first = MappingBuilder("stable", ["organization"], token_namespace="LOCAL88")
+        first.register("甲单位", "organization")
+        first.register("乙单位", "organization")
+        first_output = first.anonymize_registered("甲单位与乙单位联合发布。")
+        first_mapping = first.export()
+
+        second = MappingBuilder(
+            "stable",
+            ["organization"],
+            previous_mapping=first_mapping,
+            token_namespace="LOCAL88",
+        )
+        second.register("乙单位", "organization")
+        second.register("丙单位", "organization")
+        second_mapping = second.export()
+
+        self.assertEqual(
+            second.original_to_token["乙单位"],
+            first.original_to_token["乙单位"],
+        )
+        self.assertEqual(restore_text(first_output, second_mapping), "甲单位与乙单位联合发布。")
+        self.assertNotEqual(
+            second.original_to_token["丙单位"],
+            first.original_to_token["甲单位"],
+        )
 
     def test_does_not_treat_common_status_words_as_people(self):
         source = "审核状态：合格\n审批意见：同意\n项目\n方案\n申请\n费用\n单价\n说明\n文件\n安全\n管理"
@@ -358,6 +409,7 @@ class TaskApiTests(TestCase):
         self.override = override_settings(
             MEDIA_ROOT=self.media_directory,
             MAPPING_ENCRYPTION_KEY="test-mapping-key",
+            ANONYMIZATION_NAMESPACE="TESTHOST",
             REQUIRE_HUMAN_REVIEW=False,
         )
         self.override.enable()
@@ -627,7 +679,58 @@ class TaskApiTests(TestCase):
         self.assertEqual(confirmed.status_code, 200, confirmed.content)
         download = self.client.get(confirmed.json()["task"]["anonymized_download_url"])
         anonymized = b"".join(download.streaming_content).decode("utf-8")
-        self.assertEqual(anonymized.count("【单001】"), 3)
+        self.assertEqual(anonymized.count("【TESTHOST-单001】"), 3)
+
+    @override_settings(UIE_ENABLED=False)
+    def test_review_saves_every_confirmed_category_and_keeps_old_output_restorable(self):
+        source = "单位：中国烟草总公司。电话：13800138000。邮箱：local@example.com。密语火种。"
+        upload = SimpleUploadedFile("一致性测试.txt", source.encode("utf-8"), content_type="text/plain")
+        created = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["organization", "phone", "email"]),
+            "review_required": "true",
+        })
+        self.assertEqual(created.status_code, 201, created.content)
+        task_id = created.json()["id"]
+
+        first_review = self.client.get(f"/api/tasks/{task_id}/review/").json()
+        first_selected = [
+            {"token": item["token"], "text": item["text"], "category": item["category"]}
+            for item in first_review["entities"]
+        ]
+        first_confirmed = self.client.post(
+            f"/api/tasks/{task_id}/review/",
+            {"selected_entities": first_selected},
+            content_type="application/json",
+        )
+        self.assertEqual(first_confirmed.status_code, 200, first_confirmed.content)
+        first_url = first_confirmed.json()["task"]["anonymized_download_url"]
+        first_download = self.client.get(first_url)
+        first_filename = Path(AnonymizationTask.objects.get(id=task_id).anonymized_file.name).name
+        first_content = b"".join(first_download.streaming_content)
+
+        saved_categories = set(RecognitionLabel.objects.values_list("category", flat=True))
+        self.assertTrue({"organization", "phone", "email"}.issubset(saved_categories))
+        for label in RecognitionLabel.objects.all():
+            self.assertNotIn(decrypt_label(label), label.text_ciphertext)
+
+        second_review = self.client.get(f"/api/tasks/{task_id}/review/").json()
+        second_selected = [
+            {"token": item["token"], "text": item["text"], "category": item["category"]}
+            for item in second_review["entities"]
+        ]
+        corrected = self.client.post(
+            f"/api/tasks/{task_id}/review/",
+            {"selected_entities": second_selected, "additions": "敏感项|密语火种"},
+            content_type="application/json",
+        )
+        self.assertEqual(corrected.status_code, 200, corrected.content)
+
+        restore_upload = SimpleUploadedFile(first_filename, first_content, content_type="text/plain")
+        restored = self.client.post(f"/api/tasks/{task_id}/restore/", {"file": restore_upload})
+        self.assertEqual(restored.status_code, 200, restored.content)
+        restored_download = self.client.get(restored.json()["restored_download_url"])
+        self.assertEqual(b"".join(restored_download.streaming_content).decode("utf-8"), source)
 
     @override_settings(UIE_ENABLED=False)
     def test_training_document_machine_prelabel_human_save_and_jsonl_export(self):
@@ -722,7 +825,7 @@ class TaskApiTests(TestCase):
         task = AnonymizationTask.objects.get(id=task_data["id"])
         anonymized_name = Path(task.anonymized_file.name).name
         self.assertNotIn("潘富昆", anonymized_name)
-        self.assertIn("ANON_人", anonymized_name)
+        self.assertIn("ANON_TESTHOST-人", anonymized_name)
         self.assertEqual(task_data["display_name"], anonymized_name)
         self.assertNotIn("潘富昆", task_data["task_name"])
 

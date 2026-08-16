@@ -702,7 +702,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               </label>
             </div>
 
-            <div class="notice-box"><AppIcon name="alert" :size="18" /><span>请勿修改形如 <code>【单001】</code>、<code>【人001】</code> 的匿名标记，否则对应信息将无法恢复。</span></div>
+            <div class="notice-box"><AppIcon name="alert" :size="18" /><span>匿名代码带有本机命名标识，例如 <code>【{{ selectedTask?.anonymization_namespace || '本机标识' }}-单001】</code>。请勿拆分或改写；恢复还必须使用本机加密映射。</span></div>
             <div class="action-row justify-content-end">
               <button class="btn restore-btn" :disabled="loading || !selectedTaskId || !restoreFile" @click="submitRestore">
                 <span v-if="loading" class="spinner-border spinner-border-sm"></span>
@@ -718,6 +718,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               <h3>{{ result.status === 'review' ? '候选识别完成，请人工确认' : result.status === 'restored' ? '正式文件已生成' : '文件脱敏完成' }}</h3>
               <p>{{ result.code }} · {{ result.task_name }}</p>
               <div v-if="result.status !== 'restored'" class="entity-tags">
+                <span v-if="result.anonymization_namespace">本机标识 {{ result.anonymization_namespace }}</span>
                 <span v-for="(count, label) in result.entity_counts" :key="label">{{ label }} {{ count }}</span>
                 <span v-if="result.uie_detected_count">UIE 补充 {{ result.uie_detected_count }}</span>
                 <span v-if="result.uie_rejected_count">已过滤低置信/冲突 {{ result.uie_rejected_count }}</span>
@@ -744,7 +745,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
             </div>
             <div v-if="reviewLoading" class="review-loading"><span class="spinner-border spinner-border-sm"></span> 正在读取或重新处理文件…</div>
             <template v-else>
-              <div class="review-warning">{{ result?.status === 'review' ? '尚未开放脱敏文件下载。只有确认过的候选项和人工补录项会进入脱敏结果。' : '重新校正会更新匿名映射；已有反匿名上传稿和正式文件将作废。' }}</div>
+              <div class="review-warning">{{ result?.status === 'review' ? '尚未开放脱敏文件下载。只有确认过的候选项和人工补录项会进入脱敏结果。' : '重新校正会生成新版脱敏文件，同时保留旧匿名编号的恢复能力；已有反匿名上传稿和正式输出会清除，请重新生成。' }}</div>
               <DocumentPreview
                 class="review-document-preview"
                 :sections="reviewData.preview"
@@ -805,7 +806,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                 <div>
                   <label class="form-label app-label">补充漏识别内容 <small>每行一个</small></label>
                   <textarea v-model="reviewAdditions" class="form-control review-textarea" placeholder="单位|山东中烟&#10;产品|文山雨露&#10;产区|文山&#10;人名|张三"></textarea>
-                  <p class="form-hint">人工确认的单位、人名、产品、产区和地址以及补录内容会立即加入加密本地词库；勾掉的误识别会保存为加密否决样本，供后续微调评测。</p>
+                  <p class="form-hint">每个勾选确认的字段（包括电话、证件、邮箱和自定义项）都会立即成为本机加密标签；勾掉的误识别会保存为加密否决样本，供后续微调评测。</p>
                 </div>
               </div>
               <div class="review-footer">
@@ -969,7 +970,8 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
             <ul>
               <li>自动识别前，可在“指定敏感词”中补充业务单位、部门、供应商和人员名单。</li>
               <li>“临时调用”在 OCR 子进程退出后加载 UIE-base，并在任务结束后释放约 2～4 GB 内存；“模型常驻”建议至少 32 GB 系统内存。</li>
-              <li>新增或修改的识别标签会加密保存并立即加入本地词库，同时形成后续批量微调所需的训练样本。</li>
+              <li>人工确认的每个字段都会加密保存并立即加入本地词库，同时形成后续批量微调所需的训练样本。</li>
+              <li>匿名代码包含由本机映射密钥派生的安装标识；校正任务会保留历史匿名编号，旧脱敏稿仍可关联原任务恢复。</li>
               <li>扫描 PDF 会自动调用 PP-StructureV3 精简 OCR，并显示渲染、模型加载、当前页和百分比；PDF 处理结果会重新排版，复杂公文建议优先使用 DOCX。</li>
               <li>生产部署时必须修改环境文件中的 Django 密钥、映射加密密钥和数据库密码。</li>
               <li>AI 处理过程中不得删除、拆分或改写全角书名号包裹的匿名标记。</li>

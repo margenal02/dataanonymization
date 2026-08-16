@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from collections import Counter
 
 
@@ -322,6 +323,85 @@ def _normalize_detected_value(value):
     return re.sub(r"\s+", " ", str(value or "")).strip(" ，,；;。.!！、/：:")
 
 
+def _normalized_match_view(value):
+    """Return a comparison view plus indexes back to the untouched source.
+
+    Office XML, PDF extraction and OCR frequently represent the same visible
+    value with full-width characters, zero-width controls or inserted spaces.
+    Those differences must not decide whether an already confirmed entity is
+    masked.  The index map lets callers replace only the original source span;
+    surrounding wording and formatting are never regenerated.
+    """
+    normalized = []
+    indexes = []
+    for index, character in enumerate(str(value or "")):
+        for output in unicodedata.normalize("NFKC", character):
+            if output.isspace() or unicodedata.category(output) == "Cf":
+                continue
+            normalized.append(output.casefold())
+            indexes.append(index)
+    return "".join(normalized), indexes
+
+
+def normalized_entity_key(value):
+    return _normalized_match_view(value)[0]
+
+
+def contains_equivalent(text, value):
+    key = normalized_entity_key(value)
+    return bool(key and key in normalized_entity_key(text))
+
+
+def registered_match_spans(text, original_to_token):
+    """Locate registered entities despite harmless extraction differences.
+
+    Matches are longest-first and non-overlapping.  Each returned span points
+    to the exact characters in ``text`` so callers can preserve all content
+    outside the sensitive field.
+    """
+    source = str(text or "")
+    view, indexes = _normalized_match_view(source)
+    if not view or not indexes:
+        return []
+    by_key = {}
+    for original, token in (original_to_token or {}).items():
+        key = normalized_entity_key(original)
+        if key and key not in by_key:
+            by_key[key] = (original, token)
+    candidates = []
+    for key, (original, token) in sorted(by_key.items(), key=lambda item: len(item[0]), reverse=True):
+        start_at = 0
+        while True:
+            start = view.find(key, start_at)
+            if start < 0:
+                break
+            end = start + len(key)
+            source_start = indexes[start]
+            source_end = indexes[end - 1] + 1
+            candidates.append({
+                "start": source_start,
+                "end": source_end,
+                "text": source[source_start:source_end],
+                "entity_text": original,
+                "token": token,
+                "normalized_length": len(key),
+            })
+            start_at = start + max(1, len(key))
+    occupied = bytearray(len(source))
+    selected = []
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (-item["normalized_length"], item["start"], -(item["end"] - item["start"])),
+    ):
+        if occupied.find(1, candidate["start"], candidate["end"]) >= 0:
+            continue
+        occupied[candidate["start"]:candidate["end"]] = b"\x01" * (
+            candidate["end"] - candidate["start"]
+        )
+        selected.append(candidate)
+    return sorted(selected, key=lambda item: item["start"])
+
+
 def _is_likely_product(value):
     compact = re.sub(r"\s+", "", value)
     if compact in _PRODUCT_STOPWORDS or not 2 <= len(compact) <= 60:
@@ -352,20 +432,50 @@ def _person_names_from_list(value):
 
 
 class MappingBuilder:
-    def __init__(self, task_salt, enabled_categories=None, custom_entities=None, excluded_entities=None):
+    def __init__(
+        self,
+        task_salt,
+        enabled_categories=None,
+        custom_entities=None,
+        excluded_entities=None,
+        previous_mapping=None,
+        token_namespace="",
+    ):
         self.task_salt = task_salt.upper()[:4]
+        self.token_namespace = re.sub(r"[^A-Z0-9]", "", str(token_namespace or "").upper())[:10]
         self.enabled = tuple(dict.fromkeys(enabled_categories or DEFAULT_CATEGORIES))
         self.excluded_entities = {
-            (_normalize_detected_value(item.get("text")), item.get("category"))
+            (normalized_entity_key(item.get("text")), item.get("category"))
             for item in (excluded_entities or [])
-            if isinstance(item, dict) and _normalize_detected_value(item.get("text"))
+            if isinstance(item, dict) and normalized_entity_key(item.get("text"))
         }
         self.original_to_token = {}
         self.token_to_original = {}
         self.token_categories = {}
         self.alias_to_canonical = {}
         self.counters = Counter()
-        self._replacement_pattern = None
+        self._previous_mapping = previous_mapping or {}
+        self._historical_token_to_original = dict(self._previous_mapping.get("token_to_original", {}))
+        self._historical_token_categories = dict(self._previous_mapping.get("token_categories", {}))
+        self._restore_only_tokens = {}
+        self._restore_only_categories = {}
+        self._previous_tokens_by_key = {}
+        self._used_tokens = set()
+        previous_originals = self._previous_mapping.get("original_to_token") or {
+            original: token
+            for token, original in self._historical_token_to_original.items()
+            if str(token).startswith("【")
+        }
+        for original, token in previous_originals.items():
+            category = self._historical_token_categories.get(token, "custom")
+            key = normalized_entity_key(original)
+            if key:
+                self._previous_tokens_by_key[(key, category)] = token
+        for token, category in self._historical_token_categories.items():
+            code = TOKEN_CODES.get(category, TOKEN_CODES["custom"])
+            match = re.search(rf"{re.escape(code)}(\d+)】$", str(token))
+            if match:
+                self.counters[category] = max(self.counters[category], int(match.group(1)))
         for item in custom_entities or []:
             text = item.get("text", "").strip()
             category = item.get("category", "custom")
@@ -374,23 +484,35 @@ class MappingBuilder:
 
     def register(self, original, category):
         original = original.strip()
+        match_key = normalized_entity_key(original)
+        existing = next((
+            token for known, token in self.original_to_token.items()
+            if normalized_entity_key(known) == match_key
+        ), None)
         if (
             len(original) < 2
-            or original in self.original_to_token
+            or not match_key
             or "【" in original
-            or (original, category) in self.excluded_entities
+            or (match_key, category) in self.excluded_entities
         ):
             return self.original_to_token.get(original)
+        if existing:
+            return existing
         # Overlapping values may be valid in different places (for example “文山” is
         # a production area while “文山雨露” is a product).  Replacement is applied
         # longest-first, so keeping both does not corrupt the longer value.
-        self.counters[category] += 1
-        code = TOKEN_CODES.get(category, TOKEN_CODES["custom"])
-        token = f"【{code}{self.counters[category]:03d}】"
+        previous_token = self._previous_tokens_by_key.get((match_key, category))
+        if previous_token:
+            token = previous_token
+        else:
+            self.counters[category] += 1
+            code = TOKEN_CODES.get(category, TOKEN_CODES["custom"])
+            prefix = f"{self.token_namespace}-" if self.token_namespace else ""
+            token = f"【{prefix}{code}{self.counters[category]:03d}】"
+        self._used_tokens.add(token)
         self.original_to_token[original] = token
         self.token_to_original[token] = original
         self.token_categories[token] = category
-        self._replacement_pattern = None
         return token
 
     def validate_detected(self, original, category):
@@ -415,7 +537,7 @@ class MappingBuilder:
         elif category == "product":
             if not _is_likely_product(value):
                 return None
-        if (value, category) in self.excluded_entities:
+        if (normalized_entity_key(value), category) in self.excluded_entities:
             return None
         return value
 
@@ -452,6 +574,9 @@ class MappingBuilder:
             self.original_to_token[alias] = canonical_token
             self.alias_to_canonical[alias] = canonical
         for token in removed_tokens:
+            if token in self.token_to_original:
+                self._restore_only_tokens[token] = self.token_to_original[token]
+                self._restore_only_categories[token] = self.token_categories.get(token, category)
             self.token_categories.pop(token, None)
             self.token_to_original.pop(token, None)
             # Counters are monotonic identifiers. Decrementing here could make
@@ -548,26 +673,21 @@ class MappingBuilder:
             self.register(value, category)
 
     def _replace_registered(self, text, filename=False):
-        originals = sorted(self.original_to_token, key=len, reverse=True)
-        if not originals:
+        matches = registered_match_spans(text, self.original_to_token)
+        if not matches:
             return text
-        if self._replacement_pattern is None:
-            self._replacement_pattern = re.compile(
-                "|".join(re.escape(original) for original in originals)
-            )
-        pattern = self._replacement_pattern
-
-        def replacement(match):
-            original = match.group(0)
-            content_token = self.original_to_token[original]
+        result = text
+        for match in reversed(matches):
+            original = match["entity_text"]
+            content_token = match["token"]
             if not filename:
-                return content_token
-            filename_token = f"ANON_{content_token[1:-1]}"
-            self.token_to_original[filename_token] = self.token_to_original.get(content_token, original)
-            self.token_categories[filename_token] = self.token_categories[content_token]
-            return filename_token
-
-        return pattern.sub(replacement, text)
+                replacement = content_token
+            else:
+                replacement = f"ANON_{content_token[1:-1]}"
+                self.token_to_original[replacement] = self.token_to_original.get(content_token, original)
+                self.token_categories[replacement] = self.token_categories[content_token]
+            result = result[:match["start"]] + replacement + result[match["end"]:]
+        return result
 
     def anonymize(self, text):
         if not text:
@@ -600,20 +720,24 @@ class MappingBuilder:
         return self._replace_registered(stem, filename=True)
 
     def export(self):
+        token_to_original = dict(self._historical_token_to_original)
+        token_to_original.update(self._restore_only_tokens)
+        token_to_original.update(self.token_to_original)
+        token_categories = dict(self._historical_token_categories)
+        token_categories.update(self._restore_only_categories)
+        token_categories.update(self.token_categories)
         return {
-            "version": 3,
-            "token_to_original": self.token_to_original,
-            "token_categories": self.token_categories,
+            "version": 4,
+            "namespace": self.token_namespace,
+            "token_to_original": token_to_original,
+            "token_categories": token_categories,
             "original_to_token": self.original_to_token,
             "alias_to_canonical": self.alias_to_canonical,
+            "active_tokens": sorted(set(self.original_to_token.values())),
         }
 
     def counts(self):
-        active = Counter(
-            category
-            for token, category in self.token_categories.items()
-            if token.startswith("【")
-        )
+        active = Counter(self.token_categories.get(token, "custom") for token in set(self.original_to_token.values()))
         return {CATEGORY_LABELS.get(key, key): value for key, value in active.items()}
 
 
