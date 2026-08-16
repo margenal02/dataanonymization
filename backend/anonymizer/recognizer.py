@@ -99,6 +99,17 @@ _PROVINCE = (
     r"西藏自治区|宁夏回族自治区|新疆维吾尔自治区|香港特别行政区|澳门特别行政区"
 )
 
+_PROVINCE_SHORTS = (
+    "北京", "天津", "上海", "重庆", "河北", "山西", "辽宁", "吉林", "黑龙江", "江苏",
+    "浙江", "安徽", "福建", "江西", "山东", "河南", "湖北", "湖南", "广东", "海南",
+    "四川", "贵州", "云南", "陕西", "甘肃", "青海", "台湾", "内蒙古", "广西", "西藏",
+    "宁夏", "新疆", "香港", "澳门",
+)
+_PROVINCE_SHORT_ALT = "|".join(map(re.escape, sorted(_PROVINCE_SHORTS, key=len, reverse=True)))
+_TOBACCO_PROVINCE_ORG_ALIAS_RE = rf"(?:{_PROVINCE_SHORT_ALT})(?:中烟|复烤)"
+_KNOWN_REBAKE_FACTORY_ALIASES = ("陆良厂", "遵义厂", "毕节厂")
+_KNOWN_REBAKE_FACTORY_ALIAS_RE = "|".join(map(re.escape, _KNOWN_REBAKE_FACTORY_ALIASES))
+
 _TOBACCO_ORG_ALIASES = (
     "中国烟草", "山东中烟", "云南中烟", "贵州中烟", "四川中烟", "重庆中烟", "湖南中烟",
     "湖北中烟", "河南中烟", "安徽中烟", "福建中烟", "广东中烟", "广西中烟", "陕西中烟",
@@ -130,6 +141,14 @@ _PRODUCT_STOPWORDS = {
 
 PATTERNS = {
     "organization": [
+        # 省级行业简称及常用复烤厂简称可独立出现，不要求先出现全称。
+        re.compile(rf"({_TOBACCO_PROVINCE_ORG_ALIAS_RE})"),
+        re.compile(rf"({_KNOWN_REBAKE_FACTORY_ALIAS_RE})"),
+        # 优先提取干净的复烤公司全称，避免通用后缀规则连带句子前缀。
+        re.compile(
+            rf"((?:{_PROVINCE_SHORT_ALT})烟叶复烤(?:集团)?"
+            rf"(?:有限责任公司|股份有限公司|有限公司))"
+        ),
         # 烟草行业常见的多层级全称优先，避免只截取到中间的“烟草公司”。
         re.compile(
             r"([\u4e00-\u9fff]{2,16}(?:省|市|自治区)?烟草公司"
@@ -248,6 +267,10 @@ _ORG_ABBREVIATION_SUFFIXES = (
     ("有限公司", "公司"),
 )
 
+_ORG_LEGAL_SUFFIXES = (
+    "有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "集团公司", "公司",
+)
+
 
 def _is_cjk_or_ascii_word(character):
     return bool(character and ("\u4e00" <= character <= "\u9fff" or character.isalnum()))
@@ -302,6 +325,17 @@ def _clean_organization(value):
         previous = cleaned
         cleaned = _ORG_LEADING_NOISE.sub("", cleaned).strip()
     cleaned = re.sub(r"^[与同向及、\s]+", "", cleaned)
+    # 通用后缀规则可能连带自然语言前缀，例如
+    # “中心实验室为贵州烟叶复烤有限责任公司”。如果连接词后的内容
+    # 本身已是完整单位，则只保留单位名称。
+    for marker in ("交由", "委托给", "相较于", "对于", "由", "为", "与", "同", "向"):
+        position = cleaned.rfind(marker)
+        if position < 0:
+            continue
+        tail = cleaned[position + len(marker):].strip()
+        if len(tail) >= 3 and tail.endswith(_ORG_LEGAL_SUFFIXES):
+            cleaned = tail
+            break
     return cleaned
 
 
@@ -759,6 +793,40 @@ def restore_text(text, mapping):
     return build_restorer(mapping)(text)
 
 
+def _derived_organization_aliases(full_name):
+    aliases = []
+    for suffix, short_suffix in _ORG_ABBREVIATION_SUFFIXES:
+        if not full_name.endswith(suffix):
+            continue
+        prefix = full_name[:-len(suffix)].strip()
+        if len(prefix) >= 2:
+            aliases.append(f"{prefix}{short_suffix}")
+            for province in _PROVINCE_SHORTS:
+                if prefix.startswith(province) and len(prefix) - len(province) >= 2:
+                    aliases.append(f"{prefix[len(province):]}{short_suffix}")
+
+    for province in _PROVINCE_SHORTS:
+        if (
+            full_name.startswith(f"{province}烟叶复烤")
+            and full_name.endswith(_ORG_LEGAL_SUFFIXES)
+        ):
+            aliases.append(f"{province}复烤")
+        if (
+            full_name.startswith(f"{province}中烟工业")
+            and full_name.endswith(_ORG_LEGAL_SUFFIXES)
+        ):
+            aliases.append(f"{province}中烟")
+    return list(dict.fromkeys(alias for alias in aliases if alias != full_name))
+
+
+def _has_distinct_alias_occurrence(text, full_name, alias):
+    """Return true only when an alias occurs outside the full-name span."""
+    return any(
+        match["token"] == "alias"
+        for match in registered_match_spans(text, {full_name: "full", alias: "alias"})
+    )
+
+
 def suggest_organization_alias_groups(builder, text):
     """Register and return conservative full-name/abbreviation suggestions.
 
@@ -775,12 +843,8 @@ def suggest_organization_alias_groups(builder, text):
     groups = []
     seen_pairs = set()
     for full_name in sorted(organizations, key=len, reverse=True):
-        for suffix, short_suffix in _ORG_ABBREVIATION_SUFFIXES:
-            if not full_name.endswith(suffix):
-                continue
-            prefix = full_name[:-len(suffix)].strip()
-            alias = f"{prefix}{short_suffix}"
-            if len(prefix) < 2 or alias == full_name or alias not in text:
+        for alias in _derived_organization_aliases(full_name):
+            if not _has_distinct_alias_occurrence(text, full_name, alias):
                 continue
             pair = (full_name, alias)
             if pair in seen_pairs:
@@ -794,7 +858,7 @@ def suggest_organization_alias_groups(builder, text):
                 "category": "organization",
                 "canonical": full_name,
                 "members": [full_name, alias],
-                "reason": f"“{alias}”与“{full_name}”具有相同主体词和单位后缀",
+                "reason": f"“{alias}”符合“{full_name}”的行业简称规则",
                 "confidence": 0.92,
                 "accepted": False,
             })

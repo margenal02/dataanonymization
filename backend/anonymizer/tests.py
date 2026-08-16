@@ -26,7 +26,7 @@ from .paddlenlp_compat import ensure_aistudio_download_compatibility
 from .ppstructure_worker import _build_pipeline as build_ppstructure_pipeline
 from .ppstructure_worker import _extract_text as extract_ppstructure_text
 from .ppstructure_worker import _recognize as recognize_with_ppstructure
-from .recognizer import MappingBuilder, restore_text
+from .recognizer import MappingBuilder, restore_text, suggest_organization_alias_groups
 from .training_data import decrypt_label
 from .uie_runtime import UIEProcessingError, _manager_url
 from .uie_worker import _predict
@@ -123,6 +123,47 @@ class MappingBuilderTests(TestCase):
         self.assertEqual(anonymized.count(token), 2)
         self.assertEqual(builder.counts(), {"单位": 1})
         self.assertEqual(restore_text(anonymized, builder.export()), "陆良复烤厂安排陆良复烤厂复核。")
+
+    def test_recognizes_industry_abbreviations_without_full_names(self):
+        source = "陆良厂与云南复烤、贵州复烤、河北中烟联合开展技术研究。"
+        builder = MappingBuilder("industry-alias", ["organization"])
+
+        anonymized = builder.anonymize(source)
+
+        for abbreviation in ("陆良厂", "云南复烤", "贵州复烤", "河北中烟"):
+            self.assertNotIn(abbreviation, anonymized)
+            self.assertIn(abbreviation, builder.original_to_token)
+        self.assertEqual(builder.counts(), {"单位": 4})
+        self.assertEqual(restore_text(anonymized, builder.export()), source)
+
+    def test_suggests_rebake_and_china_tobacco_full_name_aliases(self):
+        source = (
+            "云南烟叶复烤有限责任公司简称云南复烤；"
+            "贵州烟叶复烤有限责任公司简称贵州复烤；"
+            "河北中烟工业有限责任公司简称河北中烟；"
+            "陆良复烤厂后文简称陆良厂。"
+        )
+        builder = MappingBuilder("industry-groups", ["organization"])
+        builder.discover(source)
+
+        groups = suggest_organization_alias_groups(builder, source)
+        pairs = {(group["canonical"], group["members"][1]) for group in groups}
+
+        self.assertTrue({
+            ("云南烟叶复烤有限责任公司", "云南复烤"),
+            ("贵州烟叶复烤有限责任公司", "贵州复烤"),
+            ("河北中烟工业有限责任公司", "河北中烟"),
+            ("陆良复烤厂", "陆良厂"),
+        }.issubset(pairs))
+
+    def test_cleans_sentence_prefix_before_rebake_company_name(self):
+        source = "遵义复烤厂中心实验室为贵州烟叶复烤有限责任公司中心实验室。"
+        builder = MappingBuilder("clean-org", ["organization"])
+
+        builder.discover(source)
+
+        self.assertIn("贵州烟叶复烤有限责任公司", builder.original_to_token)
+        self.assertNotIn("中心实验室为贵州烟叶复烤有限责任公司", builder.original_to_token)
 
     def test_alias_merge_does_not_reuse_an_active_token_number(self):
         builder = MappingBuilder("alias-sequence", ["organization"])
