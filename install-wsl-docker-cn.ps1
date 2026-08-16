@@ -22,12 +22,12 @@ $OutputEncoding = $utf8NoBom
 $script:InstallProgressActive = $false
 $script:InstallProgressCells = 0
 $MinimumBuild = 19041
-$MinimumLogicalProcessors = 4
-$RecommendedLogicalProcessors = 6
-$MinimumMemoryGB = 8
-$RecommendedMemoryGB = 16
-$MinimumDiskGB = 30
-$RecommendedDiskGB = 40
+$MinimumLogicalProcessors = 8
+$RecommendedLogicalProcessors = 12
+$MinimumMemoryGB = 16
+$RecommendedMemoryGB = 32
+$MinimumDiskGB = 50
+$RecommendedDiskGB = 80
 $MinimumWslVersion = [version]'0.67.6'
 $MinimumDockerVersion = '24.0'
 $MaximumDockerVersion = '30.0'
@@ -330,26 +330,32 @@ write_secure_environment() {
         set_env_value DEBIAN_MIRROR "${APT_MIRROR}/debian"
         set_env_value UIE_ENABLED "1"
         set_env_value REQUIRE_HUMAN_REVIEW "1"
-        set_env_value UIE_MODEL "uie-micro"
+        set_env_value UIE_MODEL "uie-base"
         set_env_value UIE_POSITION_PROB "0.45"
         set_env_value UIE_PERSON_PROB "0.70"
         set_env_value UIE_ORGANIZATION_PROB "0.55"
         set_env_value UIE_ADDRESS_PROB "0.60"
         set_env_value UIE_LOCATION_PROB "0.60"
         set_env_value UIE_PRODUCT_PROB "0.60"
-        set_env_value UIE_BATCH_SIZE "2"
+        set_env_value UIE_BATCH_SIZE "1"
         set_env_value UIE_MAX_SEQ_LEN "512"
         set_env_value UIE_MAX_TOTAL_CHARS "500000"
-        set_env_value UIE_START_TIMEOUT_SECONDS "180"
-        set_env_value UIE_REQUEST_TIMEOUT_SECONDS "600"
+        set_env_value UIE_START_TIMEOUT_SECONDS "600"
+        set_env_value UIE_REQUEST_TIMEOUT_SECONDS "1800"
         set_env_value PDF_OCR_ENABLED "1"
-        set_env_value PDF_OCR_LANGUAGES "chi_sim+eng"
         set_env_value PDF_OCR_DPI "180"
         set_env_value PDF_OCR_MAX_IMAGE_DIMENSION "3508"
         set_env_value PDF_OCR_MIN_TEXT_CHARS "12"
         set_env_value PDF_OCR_MAX_PAGES "300"
         set_env_value PDF_OCR_MAX_TOTAL_CHARS "500000"
         set_env_value PDF_OCR_PAGE_TIMEOUT_SECONDS "180"
+        set_env_value PPSTRUCTURE_DEVICE "cpu"
+        set_env_value PPSTRUCTURE_CPU_THREADS "8"
+        set_env_value PPSTRUCTURE_LAYOUT_MODEL "PP-DocLayout-S"
+        set_env_value PPSTRUCTURE_TEXT_DETECTION_MODEL "PP-OCRv5_mobile_det"
+        set_env_value PPSTRUCTURE_TEXT_RECOGNITION_MODEL "PP-OCRv5_mobile_rec"
+        set_env_value PPSTRUCTURE_START_TIMEOUT_SECONDS "600"
+        sed -i '/^PDF_OCR_LANGUAGES=/d' "$env_file"
         current_upload_limit="$(sed -n 's/^MAX_UPLOAD_SIZE_MB=//p' "$env_file" | tail -n 1 | tr -d '\r')"
         if [[ -z "$current_upload_limit" || "$current_upload_limit" == "50" ]]; then
             set_env_value MAX_UPLOAD_SIZE_MB "200"
@@ -381,26 +387,31 @@ PIP_INDEX_URL=${PYPI_MIRROR}
 NPM_REGISTRY=${NPM_MIRROR}
 DEBIAN_MIRROR=${APT_MIRROR}/debian
 UIE_ENABLED=1
-UIE_MODEL=uie-micro
+UIE_MODEL=uie-base
 UIE_POSITION_PROB=0.45
 UIE_PERSON_PROB=0.70
 UIE_ORGANIZATION_PROB=0.55
 UIE_ADDRESS_PROB=0.60
 UIE_LOCATION_PROB=0.60
 UIE_PRODUCT_PROB=0.60
-UIE_BATCH_SIZE=2
+UIE_BATCH_SIZE=1
 UIE_MAX_SEQ_LEN=512
 UIE_MAX_TOTAL_CHARS=500000
-UIE_START_TIMEOUT_SECONDS=180
-UIE_REQUEST_TIMEOUT_SECONDS=600
+UIE_START_TIMEOUT_SECONDS=600
+UIE_REQUEST_TIMEOUT_SECONDS=1800
 PDF_OCR_ENABLED=1
-PDF_OCR_LANGUAGES=chi_sim+eng
 PDF_OCR_DPI=180
 PDF_OCR_MAX_IMAGE_DIMENSION=3508
 PDF_OCR_MIN_TEXT_CHARS=12
 PDF_OCR_MAX_PAGES=300
 PDF_OCR_MAX_TOTAL_CHARS=500000
 PDF_OCR_PAGE_TIMEOUT_SECONDS=180
+PPSTRUCTURE_DEVICE=cpu
+PPSTRUCTURE_CPU_THREADS=8
+PPSTRUCTURE_LAYOUT_MODEL=PP-DocLayout-S
+PPSTRUCTURE_TEXT_DETECTION_MODEL=PP-OCRv5_mobile_det
+PPSTRUCTURE_TEXT_RECOGNITION_MODEL=PP-OCRv5_mobile_rec
+PPSTRUCTURE_START_TIMEOUT_SECONDS=600
 EOF
     chmod 600 "$env_file"
 }
@@ -446,8 +457,8 @@ deploy_application() {
     cd "$PROJECT_DIR"
     progress 15 "步骤 3/11：拉取 MySQL 与 Nginx 基础镜像"
     retry docker compose pull db nginx
-    progress 30 "步骤 4/11：构建 Django 与 UIE-micro 后端镜像（含模型下载）"
-    run_compose_build backend '构建后端：系统依赖 → Python 依赖 → UIE-micro 模型下载与自检'
+    progress 30 "步骤 4/11：构建 Django、PP-StructureV3 精简 OCR 与 UIE-base 后端镜像"
+    run_compose_build backend '构建后端：系统依赖 → Python 依赖 → 精简 OCR 与 UIE-base 模型下载、自检'
     progress 48 "步骤 5/11：构建 Vue 前端镜像"
     run_compose_build frontend '构建前端：Node 依赖 → Vue 编译 → Nginx 静态镜像'
 
@@ -2507,9 +2518,9 @@ try {
     )
     $results | Format-Table -AutoSize
     Write-Host ''
-    Write-Host 'UIE-micro 配置说明：' -ForegroundColor Cyan
-    Write-Host "  最低配置：$MinimumLogicalProcessors 个逻辑核心、$MinimumMemoryGB GB 内存、$MinimumDiskGB GB 可用空间（建议选择临时调用）。"
-    Write-Host "  建议配置：$RecommendedLogicalProcessors 个及以上逻辑核心、$RecommendedMemoryGB GB 内存、$RecommendedDiskGB GB 可用 SSD 空间（适合模型常驻）。"
+    Write-Host 'PP-StructureV3 精简模式 + UIE-base 配置说明：' -ForegroundColor Cyan
+    Write-Host "  最低配置：$MinimumLogicalProcessors 个逻辑核心、$MinimumMemoryGB GB 内存、$MinimumDiskGB GB 可用空间（UIE 必须选择临时调用）。"
+    Write-Host "  建议配置：$RecommendedLogicalProcessors 个及以上逻辑核心、$RecommendedMemoryGB GB 内存、$RecommendedDiskGB GB 可用 SSD 空间。"
 
     $blocking = New-Object System.Collections.Generic.List[string]
     if ($build -lt $MinimumBuild) { $blocking.Add("Windows Build $build 低于 $MinimumBuild，请先运行 Windows Update。") }
@@ -2532,7 +2543,7 @@ try {
     if (-not $selectedContainerMirror) { $blocking.Add('DaoCloud 和 Docker Hub 官方地址均不可访问。') }
 
     if ($logicalProcessors -and $logicalProcessors -lt $RecommendedLogicalProcessors -and $logicalProcessors -ge $MinimumLogicalProcessors) {
-        Write-Warning "CPU 低于建议值 $RecommendedLogicalProcessors 个逻辑核心，UIE-micro 推理可能较慢。"
+        Write-Warning "CPU 低于建议值 $RecommendedLogicalProcessors 个逻辑核心，精简 OCR 与 UIE-base 推理可能较慢。"
     }
     if ($memoryGB -lt $RecommendedMemoryGB -and $memoryGB -ge $MinimumMemoryGB) {
         Write-Warning "内存低于常驻模式建议值 $RecommendedMemoryGB GB，请优先选择【临时调用】。"

@@ -21,6 +21,8 @@ from reportlab.pdfgen import canvas
 from .file_processors import ProcessingError, process_file
 from .crypto import decrypt_mapping
 from .models import AnonymizationTask, RecognitionLabel, TrainingExample
+from .ppstructure_worker import _build_pipeline as build_ppstructure_pipeline
+from .ppstructure_worker import _extract_text as extract_ppstructure_text
 from .recognizer import MappingBuilder, restore_text
 from .training_data import decrypt_label
 from .uie_runtime import UIEProcessingError, _manager_url
@@ -286,14 +288,14 @@ class FileProcessorTests(TestCase):
         self.assertIn("张三", "".join(page.extract_text() or "" for page in __import__('pypdf').PdfReader(restored).pages))
 
     @override_settings(PDF_OCR_ENABLED=True)
-    @patch("anonymizer.file_processors._ocr_pdf_page")
-    def test_scanned_pdf_uses_local_ocr_and_reports_progress(self, ocr_page):
+    @patch("anonymizer.file_processors._ocr_pdf_pages")
+    def test_scanned_pdf_uses_local_ocr_and_reports_progress(self, ocr_pages):
         source = self.directory / "scanned.pdf"
         pdf = canvas.Canvas(str(source), pagesize=A4)
         pdf.rect(50, 700, 300, 80)
         pdf.showPage()
         pdf.save()
-        ocr_page.return_value = self.source_text
+        ocr_pages.return_value = {0: self.source_text}
         progress = []
         builder = MappingBuilder("scan123")
         anonymized = self.directory / "scanned-anonymized.pdf"
@@ -305,7 +307,7 @@ class FileProcessorTests(TestCase):
             progress_callback=progress.append,
         )
 
-        ocr_page.assert_called_once_with(source, 1)
+        self.assertEqual(ocr_pages.call_args.args[:3], (source, [0], 1))
         extracted = "".join(page.extract_text() or "" for page in __import__('pypdf').PdfReader(anonymized).pages)
         self.assertNotIn("中国烟草总公司", extracted)
         self.assertNotIn("张三", extracted)
@@ -379,9 +381,9 @@ class TaskApiTests(TestCase):
         self.assertEqual(response.json()["max_upload_size_mb"], 200)
 
     @override_settings(UIE_ENABLED=False, PDF_OCR_ENABLED=True)
-    @patch("anonymizer.file_processors._ocr_pdf_page")
-    def test_scanned_pdf_api_exposes_ocr_page_count_and_completed_progress(self, ocr_page):
-        ocr_page.return_value = "单位：中国烟草总公司\n联系人：张三"
+    @patch("anonymizer.file_processors._ocr_pdf_pages")
+    def test_scanned_pdf_api_exposes_ocr_page_count_and_completed_progress(self, ocr_pages):
+        ocr_pages.return_value = {0: "单位：中国烟草总公司\n联系人：张三"}
         buffer = io.BytesIO()
         pdf = canvas.Canvas(buffer, pagesize=A4)
         pdf.rect(50, 700, 300, 80)
@@ -554,7 +556,7 @@ class TaskApiTests(TestCase):
     @patch("anonymizer.views.set_runtime_mode")
     @patch("anonymizer.views.runtime_status")
     def test_model_runtime_control_api(self, status_mock, set_mode):
-        status_mock.return_value = {"enabled": True, "available": True, "model": "uie-micro", "resident_loaded": True}
+        status_mock.return_value = {"enabled": True, "available": True, "model": "uie-base", "resident_loaded": True}
         response = self.client.post("/api/model/runtime/", {"mode": "resident"}, content_type="application/json")
         self.assertEqual(response.status_code, 200, response.content)
         set_mode.assert_called_once_with("resident")
@@ -627,6 +629,48 @@ class TaskApiTests(TestCase):
         response = self.client.post("/api/tasks/", {"file": upload})
         self.assertEqual(response.status_code, 400)
         self.assertIn("不安全", response.json()["detail"])
+
+
+class PPStructureWorkerTests(TestCase):
+    def test_builds_only_the_lite_ppstructure_modules(self):
+        captured = {}
+
+        class FakeModule:
+            @staticmethod
+            def PPStructureV3(**kwargs):
+                captured.update(kwargs)
+                return object()
+
+        with patch.dict("sys.modules", {"paddleocr": FakeModule()}):
+            build_ppstructure_pipeline()
+
+        self.assertEqual(captured["layout_detection_model_name"], "PP-DocLayout-S")
+        self.assertEqual(captured["text_detection_model_name"], "PP-OCRv5_mobile_det")
+        self.assertEqual(captured["text_recognition_model_name"], "PP-OCRv5_mobile_rec")
+        for option in (
+            "use_doc_orientation_classify", "use_doc_unwarping", "use_textline_orientation",
+            "use_seal_recognition", "use_table_recognition", "use_formula_recognition",
+            "use_chart_recognition", "use_region_detection",
+        ):
+            self.assertFalse(captured[option], option)
+
+    def test_extracts_layout_order_and_keeps_text_outside_layout_blocks(self):
+        class FakeResult:
+            json = {
+                "res": {
+                    "parsing_res_list": [
+                        {"block_label": "title", "block_content": "山东中烟"},
+                        {"block_label": "text", "block_content": "联系人：潘富昆"},
+                    ],
+                    "overall_ocr_res": {
+                        "rec_texts": ["山东中烟", "联系人：潘富昆", "表格内单位：云南中烟"]
+                    },
+                }
+            }
+
+        text = extract_ppstructure_text(FakeResult())
+
+        self.assertEqual(text, "山东中烟\n联系人：潘富昆\n表格内单位：云南中烟")
 
 
 class UIEWorkerTests(TestCase):

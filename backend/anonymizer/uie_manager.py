@@ -13,9 +13,9 @@ from .uie_worker import PROTOCOL_PREFIX
 
 MODEL_LOCK = threading.Lock()
 RESIDENT_WORKER = None
-MODEL_NAME = os.getenv("UIE_MODEL", "uie-micro")
-START_TIMEOUT = int(os.getenv("UIE_START_TIMEOUT_SECONDS", "180"))
-REQUEST_TIMEOUT = int(os.getenv("UIE_REQUEST_TIMEOUT_SECONDS", "600"))
+MODEL_NAME = os.getenv("UIE_MODEL", "uie-base")
+START_TIMEOUT = int(os.getenv("UIE_START_TIMEOUT_SECONDS", "600"))
+REQUEST_TIMEOUT = int(os.getenv("UIE_REQUEST_TIMEOUT_SECONDS", "1800"))
 
 
 class ModelWorker:
@@ -37,7 +37,7 @@ class ModelWorker:
         ready = self._next_message(START_TIMEOUT)
         if ready.get("event") != "ready":
             self.close()
-            raise RuntimeError(ready.get("detail", "UIE-micro 模型未能完成初始化。"))
+            raise RuntimeError(ready.get("detail", "UIE-base 模型未能完成初始化。"))
 
     def _read_stdout(self):
         try:
@@ -50,25 +50,25 @@ class ModelWorker:
                 except json.JSONDecodeError:
                     continue
         finally:
-            self.messages.put({"event": "error", "detail": "UIE-micro 模型进程已退出。"})
+            self.messages.put({"event": "error", "detail": "UIE-base 模型进程已退出。"})
 
     def _next_message(self, timeout):
         try:
             return self.messages.get(timeout=timeout)
         except queue.Empty as exc:
-            raise TimeoutError("UIE-micro 模型响应超时。") from exc
+            raise TimeoutError("UIE-base 模型响应超时。") from exc
 
     def predict(self, payload):
         if self.process.poll() is not None:
-            raise RuntimeError("UIE-micro 模型进程未运行。")
+            raise RuntimeError("UIE-base 模型进程未运行。")
         message = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
         self.process.stdin.write(message.encode("utf-8"))
         self.process.stdin.flush()
         response = self._next_message(REQUEST_TIMEOUT)
         if response.get("event") == "error":
-            raise RuntimeError(response.get("detail", "UIE-micro 识别失败。"))
+            raise RuntimeError(response.get("detail", "UIE-base 识别失败。"))
         if response.get("event") != "result":
-            raise RuntimeError("UIE-micro 返回了无法识别的响应。")
+            raise RuntimeError("UIE-base 返回了无法识别的响应。")
         return response.get("entities", [])
 
     def close(self):

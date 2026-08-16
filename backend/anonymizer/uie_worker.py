@@ -41,9 +41,9 @@ def _load_engine():
     return Taskflow(
         "information_extraction",
         schema=["人名"],
-        model=os.getenv("UIE_MODEL", "uie-micro"),
+        model=os.getenv("UIE_MODEL", "uie-base"),
         device_id=-1,
-        batch_size=max(1, int(os.getenv("UIE_BATCH_SIZE", "2"))),
+        batch_size=max(1, int(os.getenv("UIE_BATCH_SIZE", "1"))),
         position_prob=float(os.getenv("UIE_POSITION_PROB", "0.45")),
         max_seq_len=max(128, int(os.getenv("UIE_MAX_SEQ_LEN", "512"))),
     )
@@ -56,9 +56,8 @@ def _predict(engine, payload):
     if not texts or not schema:
         return []
     entities = []
-    # uie-micro has materially better recall when each flat schema is queried
-    # separately; asking the smallest model for four labels at once can return
-    # no spans even when the same labels succeed individually.
+    # Query one flat schema at a time. This preserves per-category confidence
+    # handling and avoids cross-label competition in tobacco-domain documents.
     for requested_schema in schema:
         engine.set_schema([requested_schema])
         raw_results = engine(texts)
@@ -89,15 +88,15 @@ def serve():
     try:
         engine = _load_engine()
     except Exception as exc:
-        _emit({"event": "error", "detail": f"UIE-micro 模型加载失败：{exc}"})
+        _emit({"event": "error", "detail": f"UIE-base 模型加载失败：{exc}"})
         return 1
-    _emit({"event": "ready", "model": os.getenv("UIE_MODEL", "uie-micro")})
+    _emit({"event": "ready", "model": os.getenv("UIE_MODEL", "uie-base")})
     for line in sys.stdin:
         try:
             payload = json.loads(line)
             _emit({"event": "result", "entities": _predict(engine, payload)})
         except Exception as exc:
-            _emit({"event": "error", "detail": f"UIE-micro 识别失败：{exc}"})
+            _emit({"event": "error", "detail": f"UIE-base 识别失败：{exc}"})
     return 0
 
 

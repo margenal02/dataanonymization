@@ -8,15 +8,15 @@
 |---|---:|---:|
 | Windows | Windows 10 2004（Build 19041）或 Windows 11 | 安装最新累积更新 |
 | 体系结构 | 64 位 X64 或 Arm64 | X64 |
-| CPU | 已启用虚拟化，至少 4 个逻辑核心 | 6 个及以上逻辑核心 |
-| 内存 | 8 GB（使用 UIE 临时调用） | 16 GB 及以上（适合模型常驻） |
-| 项目盘剩余空间 | 30 GB | 40 GB 及以上 SSD 空间 |
+| CPU | 已启用虚拟化，至少 8 个逻辑核心 | 12 个及以上逻辑核心 |
+| 内存 | 16 GB（UIE-base 临时调用） | 32 GB 及以上 |
+| 项目盘剩余空间 | 50 GB | 80 GB 及以上 SSD 空间 |
 | 网络 | 能访问 Microsoft WSL 服务及所配置国内镜像 | 稳定宽带 |
 | 端口 | TCP 5291 未被其他程序占用 | 仅向可信内网开放 |
 
 Windows 10 家庭版、专业版、企业版和教育版只要达到上述版本并支持 WSL2，均可使用。WSL 本身是 Windows 签名系统组件，仍从 Microsoft 官方服务安装；Ubuntu APT、Docker CE 和 PyPI 会在清华、阿里云、USTC、华为云、腾讯云、北外 BFSU 与南京大学 NJU 之间实测并选择最快可用源。npm 会在 npmmirror、华为云和腾讯云中选择最快候选，国内候选全部不可用时再回退官方源；应用基础容器也优先使用中国大陆镜像。
 
-脚本默认部署 Ubuntu 24.04、Python 3.12、Django 5.2、PaddlePaddle 3.3、UIE-micro、MySQL 8.4、Node.js 22 和 Nginx 1.27。Python 3.12 是当前 UIE/Paddle CPU 依赖的已验证版本。组件兼容范围如下：
+脚本默认部署 Ubuntu 24.04、Python 3.12、Django 5.2、PaddlePaddle 3.3、PP-StructureV3 精简 OCR、UIE-base、MySQL 8.4、Node.js 22 和 Nginx 1.27。Python 3.12 是当前 UIE/Paddle CPU 依赖的已验证版本。组件兼容范围如下：
 
 | 组件 | 支持范围 | 已符合范围时 | 低于范围时 | 高于范围时 |
 |---|---|---|---|---|
@@ -27,7 +27,7 @@ Windows 10 家庭版、专业版、企业版和教育版只要达到上述版本
 
 上述上限是安装脚本采用的保守自动部署边界，并不表示更高版本一定不能运行。超出上限时停止，是为了避免安装脚本在未验证的新主版本上修改现有环境。
 
-最开始的系统资源检测会显示 `系统检测 1/10` 至 `系统检测 10/10`，依次检查 Windows 版本、内存与逻辑核心数、虚拟化、项目磁盘、端口 5291、两个 Windows 功能，并为软件包、npm 和容器镜像选择可用来源。检测表会同时展示 UIE-micro 的最低配置（4 个逻辑核心、8 GB 内存、30 GB 空间）和建议配置（6 个及以上逻辑核心、16 GB 内存、40 GB SSD 空间）；内存在 8～15 GB 时脚本会建议在 Web 页面使用“临时调用”。WMI 与端口单项最长等待 15 秒，DISM Windows 功能检查单项最长等待 45 秒；镜像候选超时后自动尝试下一个，不再因为单个公共镜像不可访问而终止。每项开始、完成、失败及最终选择都会写入固定支持日志。
+最开始的系统资源检测会显示 `系统检测 1/10` 至 `系统检测 10/10`，依次检查 Windows 版本、内存与逻辑核心数、虚拟化、项目磁盘、端口 5291、两个 Windows 功能，并为软件包、npm 和容器镜像选择可用来源。检测表会同时展示“PP-StructureV3 精简模式 + UIE-base”的最低配置（8 个逻辑核心、16 GB 内存、50 GB 空间）和建议配置（12 个及以上逻辑核心、32 GB 内存、80 GB SSD 空间）；内存在 16～31 GB 时必须优先选择“临时调用”。WMI 与端口单项最长等待 15 秒，DISM Windows 功能检查单项最长等待 45 秒；镜像候选超时后自动尝试下一个，不再因为单个公共镜像不可访问而终止。每项开始、完成、失败及最终选择都会写入固定支持日志。
 
 选择继续安装后，现有环境检测会明确显示“WSL 运行时版本、WSL 发行版、发行版版本、Docker/Compose”四个子步骤。WSL 版本和发行版查询各最多等待 12 秒，Docker/Compose 查询最多等待 20 秒；命令超时会结束本次只读检测，按“未安装或版本不可识别”继续，不会无限停在“检测主机现有的 WSL、Ubuntu 与 Docker”。
 
@@ -112,11 +112,11 @@ Web 直连的进度由 HTTP 响应中的总大小和实际写入磁盘的字节�
 
 UIE 分类在基础候选阈值之外还会使用独立复核阈值：人名 `0.70`、单位 `0.55`、地址/产区/产品 `0.60`。安装脚本会为新旧 `.env` 写入 `UIE_PERSON_PROB`、`UIE_ORGANIZATION_PROB`、`UIE_ADDRESS_PROB`、`UIE_LOCATION_PROB` 和 `UIE_PRODUCT_PROB`；调整后重新运行脚本会恢复这些经过回归验证的默认值。
 
-首次执行“构建 Django 与 UIE-micro 后端镜像”时，会通过选中的 PyPI 镜像安装 PaddlePaddle/PaddleNLP，并下载约 90 MB 的 UIE-micro 模型文件和生成本地推理缓存；同时从所选 Debian 镜像安装 Poppler、Tesseract 及简体中文/英文语言包，用于扫描 PDF 自动 OCR。模型和 OCR 组件均封装进后端 Docker 镜像，业务任务执行时不需要把文件上传给外部服务，也不会为“临时调用”重新下载模型。该构建步骤通常比其他步骤耗时更长；4 核主机首次构建可能需要 10～30 分钟，重复安装且代码、依赖未变化时 Docker 会复用缓存。
+首次执行“构建 Django、PP-StructureV3 精简 OCR 与 UIE-base 后端镜像”时，会通过选中的 PyPI 镜像安装 PaddlePaddle、PaddleOCR/PaddleX 和 PaddleNLP；PaddleX 模型源固定为中国大陆可访问的百度 BOS，并下载精简 OCR 模型与 UIE-base 推理缓存。精简 OCR 固定为 `PP-DocLayout-S`、`PP-OCRv5_mobile_det`、`PP-OCRv5_mobile_rec`，关闭表格、公式、印章、图表、文档矫正及区域检测。模型均封装进后端 Docker 镜像，业务任务执行时不需要把文件上传给外部服务，也不会为“临时调用”重新下载。该构建步骤通常比其他步骤耗时更长；8 核主机首次构建可能需要 15～40 分钟，重复安装且代码、依赖未变化时 Docker 会复用缓存。
 
-扫描 PDF 会显著占用 CPU，默认最长可处理 300 个 OCR 页面，页面渲染最长边限制为 3508 像素，单页渲染或识别超时为 180 秒。处理过程中 Web 页面会显示当前 OCR 页与百分比。安装脚本会把对应 `PDF_OCR_*` 参数写入新旧 `.env`，不会修改既有密码和密钥。
+扫描 PDF 会显著占用 CPU，默认最长可处理 300 个 OCR 页面，页面渲染最长边限制为 3508 像素，单页渲染或识别超时为 180 秒，首次加载 PP-StructureV3 最长等待 600 秒。处理过程中 Web 页面会显示渲染、模型加载、当前 OCR 页与百分比。安装脚本会把对应 `PDF_OCR_*` 和 `PPSTRUCTURE_*` 参数写入新旧 `.env`，不会修改既有密码和密钥。
 
-后端与前端构建强制使用 BuildKit 纯文本进度，因此安装窗口会在同一条总进度中显示当前 Docker 层、pip 下载包以及 UIE 模型的“加载运行组件、下载/转换、自检”子步骤。完整构建明细分别保存在 `.runtime/docker-build-backend.log` 和 `.runtime/docker-build-frontend.log`；窗口长时间没有变化时，可把对应文件与 `install-support-latest.log` 一并提供给维护人员。UIE 缓存进度显示已经写入磁盘的实际 MB，不用虚构百分比。
+后端与前端构建强制使用 BuildKit 纯文本进度，因此安装窗口会在同一条总进度中显示当前 Docker 层、pip 下载包，以及精简 OCR/UIE-base 的下载和自检子步骤。完整构建明细分别保存在 `.runtime/docker-build-backend.log` 和 `.runtime/docker-build-frontend.log`；窗口长时间没有变化时，可把对应文件与 `install-support-latest.log` 一并提供给维护人员。模型缓存进度只显示已经写入磁盘的实际 MB，不虚构下载百分比。
 
 ## 安全配置
 

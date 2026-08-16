@@ -18,7 +18,7 @@ const selectedTaskId = ref('')
 const dragging = ref('')
 const customEntities = ref('')
 const uieMode = ref(localStorage.getItem('uieMode') || 'on_demand')
-const modelRuntime = ref({ enabled: true, available: false, model: 'uie-micro', resident_loaded: false })
+const modelRuntime = ref({ enabled: true, available: false, model: 'uie-base', resident_loaded: false })
 const modelModeLoading = ref(false)
 const trainingLabels = ref([])
 const trainingExampleCount = ref(0)
@@ -108,7 +108,7 @@ async function refreshModelRuntime() {
   try {
     modelRuntime.value = await api.getModelRuntime()
   } catch (e) {
-    modelRuntime.value = { enabled: true, available: false, model: 'uie-micro', resident_loaded: false, detail: e.message }
+    modelRuntime.value = { enabled: true, available: false, model: 'uie-base', resident_loaded: false, detail: e.message }
   }
 }
 
@@ -457,7 +457,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
 
             <div class="uie-settings">
               <div class="uie-heading">
-                <div><strong>UIE-micro 智能识别方式</strong><small>规则负责精确匹配，UIE 补充识别人名、单位、产品、产区和地址</small></div>
+                <div><strong>UIE-base 智能识别方式</strong><small>规则负责精确匹配，UIE-base 补充识别人名、单位、产品、产区和地址；扫描 PDF 先使用 PP-StructureV3 精简 OCR</small></div>
                 <span class="model-state" :class="{ loaded: modelRuntime.resident_loaded, unavailable: !modelRuntime.available }">
                   {{ !modelRuntime.available ? '模型服务不可用' : modelRuntime.resident_loaded ? '模型已常驻' : '模型未占用内存' }}
                 </span>
@@ -465,11 +465,11 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               <div class="uie-mode-grid">
                 <label :class="{ active: uieMode === 'on_demand' }">
                   <input type="radio" name="uieMode" value="on_demand" :checked="uieMode === 'on_demand'" :disabled="modelModeLoading" @change="selectUieMode('on_demand')" />
-                  <span><b>临时调用（推荐）</b><small>每个文件加载一次，处理后立即释放约 0.9～1.5 GB 内存；每次会增加冷启动等待时间。</small></span>
+                  <span><b>临时调用（推荐）</b><small>OCR 完成并释放后再加载 UIE-base，处理结束立即释放约 2～4 GB 内存；每次会增加冷启动等待时间。</small></span>
                 </label>
                 <label :class="{ active: uieMode === 'resident' }">
                   <input type="radio" name="uieMode" value="resident" :checked="uieMode === 'resident'" :disabled="modelModeLoading" @change="selectUieMode('resident')" />
-                  <span><b>模型常驻</b><small>首次加载后保留在内存，后续文件更快；空闲时仍持续占用约 0.9～1.5 GB 内存。</small></span>
+                  <span><b>模型常驻</b><small>首次加载后保留在内存，后续文件更快；空闲时仍持续占用约 2～4 GB 内存，建议至少 32 GB 系统内存。</small></span>
                 </label>
               </div>
               <div v-if="modelModeLoading" class="model-loading"><span class="spinner-border spinner-border-sm"></span> 正在切换模型运行方式，请稍候…</div>
@@ -652,7 +652,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
             <span><AppIcon name="info" :size="25" /></span>
             <div>
               <h2>标签立即用于识别，修改历史沉淀为训练数据</h2>
-              <p>新增或修改标签后，系统会加密保存原值并立即加入本地精确词库；同时保留一条加密训练样本，供后续集中微调 UIE-micro。保存训练数据不等于每次立即重新训练模型，避免频繁训练造成卡顿和模型退化。</p>
+              <p>新增或修改标签后，系统会加密保存原值并立即加入本地精确词库；同时保留一条加密训练样本，供后续集中微调 UIE-base。保存训练数据不等于每次立即重新训练模型，避免频繁训练造成卡顿和模型退化。</p>
             </div>
             <div class="training-count"><strong>{{ trainingLabels.length }}</strong><small>有效标签</small><strong>{{ trainingExampleCount }}</strong><small>训练样本</small></div>
           </section>
@@ -706,9 +706,9 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
             <h3>使用建议</h3>
             <ul>
               <li>自动识别前，建议在“指定敏感词”中补充烟草专卖局、卷烟厂、供应商和人员名单。</li>
-              <li>“临时调用”在每个任务结束后释放 UIE 内存；“模型常驻”适合连续处理大量文件，但空闲时仍占用约 0.9～1.5 GB 内存。</li>
+              <li>“临时调用”在 OCR 子进程退出后加载 UIE-base，并在任务结束后释放约 2～4 GB 内存；“模型常驻”建议至少 32 GB 系统内存。</li>
               <li>新增或修改的识别标签会加密保存并立即加入本地词库，同时形成后续批量微调所需的训练样本。</li>
-              <li>扫描 PDF 会自动调用容器内简体中文+英文 OCR，并显示当前页和百分比；PDF 处理结果会重新排版，复杂公文建议优先使用 DOCX。</li>
+              <li>扫描 PDF 会自动调用 PP-StructureV3 精简 OCR，并显示渲染、模型加载、当前页和百分比；PDF 处理结果会重新排版，复杂公文建议优先使用 DOCX。</li>
               <li>生产部署时必须修改环境文件中的 Django 密钥、映射加密密钥和数据库密码。</li>
               <li>AI 处理过程中不得删除、拆分或改写全角书名号包裹的匿名标记。</li>
             </ul>

@@ -279,7 +279,7 @@ def _process_task(task, categories, uie_mode, combined_custom, excluded_entities
         builder.discover(text_chunk)
 
     if settings.UIE_ENABLED and set(categories) & {"person", "organization", "address", "location", "product"}:
-        report_progress({"percent": 60, "stage": "uie", "detail": "正在使用 UIE-micro 复核敏感信息"})
+        report_progress({"percent": 60, "stage": "uie", "detail": "正在使用 UIE-base 复核敏感信息"})
         model_entities, rejected_count = _select_model_entities(
             builder, predict_entities(recognition_chunks, categories, uie_mode)
         )

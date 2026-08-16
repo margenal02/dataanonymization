@@ -36,7 +36,7 @@ def main():
         engine = Taskflow(
             "information_extraction",
             schema=["人名"],
-            model=os.getenv("UIE_MODEL", "uie-micro"),
+            model=os.getenv("UIE_MODEL", "uie-base"),
             device_id=-1,
             batch_size=1,
             position_prob=0.45,
@@ -49,7 +49,7 @@ def main():
     print("[UIE 模型 3/3] 执行中文人名识别自检", flush=True)
     result = engine("联系人张三，单位中国烟草总公司。")
     if not result or not result[0].get("人名"):
-        raise RuntimeError("UIE-micro 模型自检没有返回结果。")
+        raise RuntimeError("UIE-base 模型自检没有返回结果。")
     print("[UIE 模型 3/3] 自检通过，模型已写入后端镜像", flush=True)
 
 

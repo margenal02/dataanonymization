@@ -21,7 +21,7 @@ def _manager_url(path):
         or parsed.query
         or parsed.fragment
     ):
-        raise UIEProcessingError("UIE-micro 管理地址必须是本机 HTTP 回环地址。")
+        raise UIEProcessingError("UIE-base 管理地址必须是本机 HTTP 回环地址。")
     port = parsed.port or 80
     return f"http://127.0.0.1:{port}{path}"
 
@@ -44,9 +44,9 @@ def _request(path, payload=None, timeout=10):
             detail = json.loads(exc.read().decode("utf-8")).get("detail")
         except Exception:
             detail = None
-        raise UIEProcessingError(detail or f"UIE-micro 服务返回错误 {exc.code}。") from exc
+        raise UIEProcessingError(detail or f"UIE-base 服务返回错误 {exc.code}。") from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise UIEProcessingError("UIE-micro 本地识别服务不可用，请查看后端日志。") from exc
+        raise UIEProcessingError("UIE-base 本地识别服务不可用，请查看后端日志。") from exc
 
 
 def predict_entities(texts, categories, mode):
@@ -83,7 +83,7 @@ def runtime_status():
 
 def set_runtime_mode(mode):
     if not settings.UIE_ENABLED:
-        raise UIEProcessingError("当前部署未启用 UIE-micro。")
+        raise UIEProcessingError("当前部署未启用 UIE-base。")
     if mode == "resident":
         return _request("/warmup", {}, timeout=settings.UIE_START_TIMEOUT_SECONDS)
     if mode == "on_demand":

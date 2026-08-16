@@ -7,7 +7,10 @@ ARG DEBIAN_MIRROR=
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PPNLP_HOME=/opt/paddlenlp \
-    UIE_MODEL=uie-micro
+    PADDLE_PDX_CACHE_HOME=/opt/paddlex \
+    PADDLE_PDX_MODEL_SOURCE=bos \
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=1 \
+    UIE_MODEL=uie-base
 
 RUN echo "[后端构建 1/4] 配置 Debian 镜像并安装系统依赖" \
     && if [ -n "$DEBIAN_MIRROR" ]; then \
@@ -19,20 +22,19 @@ RUN echo "[后端构建 1/4] 配置 Debian 镜像并安装系统依赖" \
           /etc/apt/sources.list.d/debian.sources; \
     fi \
     && apt-get update && apt-get install -y --no-install-recommends \
-      curl libgomp1 poppler-utils tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng \
+      curl libgomp1 libgl1 libglib2.0-0 poppler-utils \
     && command -v pdftoppm >/dev/null \
-    && tesseract --list-langs 2>/dev/null | grep -qx chi_sim \
-    && tesseract --list-langs 2>/dev/null | grep -qx eng \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
 RUN echo "[后端构建 2/4] 更新 pip" \
     && python -m pip install --no-cache-dir --index-url "$PIP_INDEX_URL" --upgrade pip==26.2.1 \
-    && echo "[后端构建 3/4] 从选定镜像安装 Django、PaddlePaddle 与 PaddleNLP" \
+    && echo "[后端构建 3/4] 从选定镜像安装 Django、PaddlePaddle、PaddleOCR 与 PaddleNLP" \
     && python -m pip install --no-cache-dir --index-url "$PIP_INDEX_URL" --progress-bar on -r requirements.txt
 COPY . .
-RUN echo "[后端构建 4/4] 下载、转换并自检 UIE-micro 模型" \
+RUN echo "[后端构建 4/4] 下载并自检 PP-StructureV3 精简模型与 UIE-base" \
+    && python /app/prefetch_ppstructure.py \
     && python /app/prefetch_uie.py \
     && chmod +x /app/entrypoint.sh
 
