@@ -181,7 +181,7 @@ docker compose up -d --build      # 更新并重建
 
 ### Ubuntu 安装报 `HCS_E_HYPERV_NOT_INSTALLED` 或 `0x80370102`
 
-这表示 Ubuntu 安装包通常已经下载完成，但 Windows hypervisor 尚未启动，并非下载源或网络失败。最新版脚本会识别该错误，自动执行 `bcdedit /set {current} hypervisorlaunchtype auto`、登记重启续跑并停在正确位置；保存工作后重启 Windows 即可，已下载文件不会重复下载。
+这表示 Ubuntu 安装包通常已经下载完成，但 Windows hypervisor 尚未启动，并非下载源或网络失败。最新版脚本会识别该错误，自动执行 `bcdedit /set hypervisorlaunchtype auto`、登记重启续跑并停在正确位置；保存工作后重启 Windows 即可，已下载文件不会重复下载。不要在 PowerShell 中直接输入未加引号的 `{current}`，否则花括号会被解释为脚本块，导致 BCDEdit 报“参数错误”。
 
 如果自动修复并重启后仍出现同一错误，脚本会停止再次重启，避免形成循环。此时请检查 BIOS/UEFI 的 Intel VT-x/AMD-V；如果 Windows 本身运行在 Hyper-V、VMware、VirtualBox 或云主机虚拟机内，还必须在宿主机上开启嵌套虚拟化。嵌套虚拟化只能由宿主机管理员配置，来宾 Windows 内的脚本无法绕过这一限制。
 

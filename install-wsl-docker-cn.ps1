@@ -1971,7 +1971,7 @@ function Stop-ForWslHypervisorRestart {
 
     Write-Warning '检测到 WSL2 虚拟机监控程序尚未启动，正在启用 Windows hypervisor 自动启动。'
     $bcdResult = Invoke-NativeCommand -FilePath 'bcdedit.exe' `
-        -ArgumentList @('/set', '{current}', 'hypervisorlaunchtype', 'auto') `
+        -ArgumentList @('/set', 'hypervisorlaunchtype', 'auto') `
         -DisplayOutput -Activity '启用 Windows hypervisor 自动启动' `
         -ProgressStart 42 -ProgressEnd 42 -CommandTimeoutSeconds 30
     if ($bcdResult.ExitCode -ne 0) {
