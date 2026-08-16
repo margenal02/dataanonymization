@@ -117,6 +117,19 @@ class MappingBuilderTests(TestCase):
         self.assertEqual(builder.counts(), {"单位": 1})
         self.assertEqual(restore_text(anonymized, builder.export()), "陆良复烤厂安排陆良复烤厂复核。")
 
+    def test_alias_merge_does_not_reuse_an_active_token_number(self):
+        builder = MappingBuilder("alias-sequence", ["organization"])
+        for name in ("甲单位", "乙单位", "丙单位"):
+            builder.register(name, "organization")
+        third_token = builder.original_to_token["丙单位"]
+
+        builder.merge_aliases("甲单位", ["甲单位", "乙单位"])
+        fourth_token = builder.register("丁单位", "organization")
+
+        self.assertNotEqual(fourth_token, third_token)
+        self.assertEqual(builder.token_to_original[third_token], "丙单位")
+        self.assertEqual(builder.token_to_original[fourth_token], "丁单位")
+
     def test_detects_tobacco_alias_product_and_location_without_false_person(self):
         source = "山东中烟在文山产区生产品牌：文山雨露。"
         builder = MappingBuilder("domain123")
@@ -540,6 +553,48 @@ class TaskApiTests(TestCase):
         self.assertNotIn("星辰一号", anonymized)
 
     @override_settings(UIE_ENABLED=False)
+    def test_quality_stats_track_review_decisions_without_exposing_sensitive_text(self):
+        source = "单位：中国烟草总公司。联系人：张三。内部密语火种。"
+        upload = SimpleUploadedFile("质量指标.txt", source.encode("utf-8"), content_type="text/plain")
+        created = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["organization", "person"]),
+            "review_required": "true",
+        })
+        self.assertEqual(created.status_code, 201, created.content)
+        task_id = created.json()["id"]
+        review = self.client.get(f"/api/tasks/{task_id}/review/").json()
+        person = next(item for item in review["entities"] if item["text"] == "张三")
+
+        confirmed = self.client.post(
+            f"/api/tasks/{task_id}/review/",
+            {
+                "selected_entities": [{"token": person["token"], "text": "张三", "category": "person"}],
+                "additions": "敏感项|密语火种",
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.content)
+
+        response = self.client.get("/api/stats/")
+        self.assertEqual(response.status_code, 200, response.content)
+        payload = response.json()
+        quality = payload["review_quality"]
+        self.assertEqual(quality["reviewed_tasks"], 1)
+        self.assertEqual(quality["selected_count"], 1)
+        self.assertGreaterEqual(quality["rejected_count"], 1)
+        self.assertEqual(quality["manual_added_count"], 1)
+        self.assertGreater(payload["performance"]["measured_tasks"], 0)
+        self.assertGreaterEqual(payload["entity_occurrences"], payload["entities"])
+        self.assertNotIn("张三", response.content.decode("utf-8"))
+        self.assertNotIn("密语火种", response.content.decode("utf-8"))
+
+    def test_health_checks_database_readiness(self):
+        response = self.client.get("/api/health/")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["database"], "ok")
+
+    @override_settings(UIE_ENABLED=False)
     def test_full_preview_marks_all_occurrences_and_suggests_reviewed_alias_merge(self):
         source = "委托单位：陆良复烤厂。后续由陆良厂负责，陆良厂提交报告。"
         upload = SimpleUploadedFile("陆良复烤厂报告.txt", source.encode("utf-8"), content_type="text/plain")
@@ -598,7 +653,11 @@ class TaskApiTests(TestCase):
         self.assertTrue(TrainingExample.objects.filter(action="annotated").exists())
         exported = self.client.get("/api/training/export/")
         self.assertEqual(exported.status_code, 200)
-        self.assertIn("result_list", exported.content.decode("utf-8"))
+        exported_text = b"".join(exported.streaming_content).decode("utf-8")
+        self.assertIn("result_list", exported_text)
+        self.assertIn('"prompt":"单位名称"', exported_text)
+        self.assertIn('"prompt":"人名"', exported_text)
+        self.assertIn('"result_list":[]', exported_text)
         self.assertTrue(TrainingDocument.objects.filter(id=document["id"]).exists())
         training_folder = Path(self.media_directory) / "training" / document["id"]
         self.assertTrue(training_folder.exists())

@@ -6,6 +6,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "local-dev-secret-key-change-me")
 DEBUG = os.getenv("DJANGO_DEBUG", "0") == "1"
+HTTPS_ENABLED = os.getenv("DJANGO_HTTPS", "0") == "1"
 ALLOWED_HOSTS = [host.strip() for host in os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if host.strip()]
 
 INSTALLED_APPS = [
@@ -100,6 +101,16 @@ PDF_OCR_PAGE_TIMEOUT_SECONDS = int(os.getenv("PDF_OCR_PAGE_TIMEOUT_SECONDS", "18
 PPSTRUCTURE_START_TIMEOUT_SECONDS = int(os.getenv("PPSTRUCTURE_START_TIMEOUT_SECONDS", "600"))
 
 CORS_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+X_FRAME_OPTIONS = "DENY"
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_SSL_REDIRECT = HTTPS_ENABLED
+SESSION_COOKIE_SECURE = HTTPS_ENABLED
+CSRF_COOKIE_SECURE = HTTPS_ENABLED
+SECURE_HSTS_SECONDS = int(os.getenv("DJANGO_HSTS_SECONDS", "31536000")) if HTTPS_ENABLED else 0
+SECURE_HSTS_INCLUDE_SUBDOMAINS = HTTPS_ENABLED and os.getenv("DJANGO_HSTS_INCLUDE_SUBDOMAINS", "0") == "1"
+SECURE_HSTS_PRELOAD = HTTPS_ENABLED and os.getenv("DJANGO_HSTS_PRELOAD", "0") == "1"
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
     "DEFAULT_PARSER_CLASSES": [
@@ -108,6 +119,6 @@ REST_FRAMEWORK = {
         "rest_framework.parsers.FormParser",
     ],
     "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.AnonRateThrottle"],
-    "DEFAULT_THROTTLE_RATES": {"anon": "180/minute"},
+    "DEFAULT_THROTTLE_RATES": {"anon": "180/minute", "uploads": "60/hour"},
     "NUM_PROXIES": 1,
 }

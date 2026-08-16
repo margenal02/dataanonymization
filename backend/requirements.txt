@@ -16,6 +16,11 @@ numpy==1.26.4
 protobuf==6.33.5
 paddlepaddle==3.3.1
 paddlenlp==3.0.0b4
+# paddle2onnx 2.1.0 hard-pins vulnerable onnx<=1.17.0. UIE inference does
+# not require its newer converter API; this compatible pair keeps the
+# PaddleNLP dependency available while fixing current ONNX advisories.
+paddle2onnx==1.3.1
+onnx==1.22.0
 ml_dtypes==0.5.4
 aistudio-sdk==0.3.9
 paddleocr==3.3.2

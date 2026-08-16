@@ -126,6 +126,8 @@ chmod 600 .env
 - `UIE_ORGANIZATION_PROB=0.55`；
 - `UIE_ADDRESS_PROB=0.60`、`UIE_LOCATION_PROB=0.60`、`UIE_PRODUCT_PROB=0.60`；
 - `DJANGO_DEBUG=0`；
+- 仅当上层反向代理已经提供 HTTPS 时设置 `DJANGO_HTTPS=1`，并确保传递 `X-Forwarded-Proto: https`；纯内网 HTTP 保持为 `0`；
+- `DJANGO_HSTS_INCLUDE_SUBDOMAINS` 与 `DJANGO_HSTS_PRELOAD` 默认保持 `0`。只有确认主域名及全部子域名长期、永久支持 HTTPS 后才能启用，因为浏览器 HSTS 预加载难以快速撤销；
 - `ALLOWED_HOSTS` 包含服务器 IP 或内部域名；
 - 镜像地址适用于当前网络；
 - 所有 `please-change-`、`local-dev-` 示例值均已替换；

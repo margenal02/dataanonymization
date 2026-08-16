@@ -1,7 +1,15 @@
 const API_ROOT = '/api'
 
 async function request(path, options = {}) {
-  const response = await fetch(`${API_ROOT}${path}`, options)
+  let response
+  try {
+    response = await fetch(`${API_ROOT}${path}`, {
+      ...options,
+      headers: { Accept: 'application/json', ...(options.headers || {}) }
+    })
+  } catch {
+    throw new Error('无法连接本地后端服务，请检查 Docker 容器状态并刷新页面。')
+  }
   let data = null
   try {
     const body = response.status === 204 ? '' : await response.text()
@@ -16,7 +24,13 @@ async function request(path, options = {}) {
     data = { detail: statusMessages[response.status] || `服务返回异常响应（HTTP ${response.status}）。` }
   }
   if (!response.ok) {
-    const error = new Error(data?.detail || data?.error_message || `请求失败（HTTP ${response.status}）。`)
+    const statusMessages = {
+      429: '操作过于频繁。为保护本机 CPU 与内存，文件处理暂时限流，请稍后再试。',
+      502: '后端服务暂时不可用，请稍后重试并查看容器日志。',
+      503: '模型、数据库或后端服务尚未就绪，请稍后重试。',
+      504: '文件处理超时，请拆分文件后重试。'
+    }
+    const error = new Error(statusMessages[response.status] || data?.detail || data?.error_message || `请求失败（HTTP ${response.status}）。`)
     error.data = data
     throw error
   }

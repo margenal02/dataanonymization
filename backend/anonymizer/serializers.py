@@ -68,6 +68,9 @@ class TaskSerializer(serializers.ModelSerializer):
         return bool((task.options or {}).get("review_confirmed", not self.get_review_required(task)))
 
     def get_review_candidate_count(self, task):
+        metrics = (task.options or {}).get("review_metrics") or {}
+        if "candidate_count" in metrics:
+            return int(metrics.get("candidate_count", 0))
         return sum(task.entity_counts.values()) if isinstance(task.entity_counts, dict) else 0
 
     def get_stored_files(self, task):

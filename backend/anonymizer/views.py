@@ -1,19 +1,25 @@
 import hashlib
 import json
+import logging
 import re
+import time
+from collections import Counter, defaultdict
+from datetime import timedelta
 from pathlib import Path
 
 from django.conf import settings
 from django.core.files import File
-from django.http import FileResponse, HttpResponse
+from django.db import connection
+from django.http import FileResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.decorators import api_view, parser_classes
+from rest_framework.decorators import api_view, parser_classes, throttle_classes
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from .crypto import decrypt_mapping, encrypt_mapping
+from .entity_schema import UIE_TRAINING_PROMPT_BY_CATEGORY
 from .file_processors import (
     ProcessingError,
     SUPPORTED_EXTENSIONS,
@@ -26,7 +32,7 @@ from .recognizer import (
     CATEGORY_LABELS,
     DEFAULT_CATEGORIES,
     MappingBuilder,
-    restore_text,
+    build_restorer,
     suggest_organization_alias_groups,
 )
 from .serializers import TaskSerializer
@@ -40,7 +46,11 @@ from .training_data import (
     save_task_custom_entities,
     update_label,
 )
+from .throttles import LocalUploadThrottle
 from .uie_runtime import UIEProcessingError, predict_entities, runtime_status, set_runtime_mode
+
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_name(name):
@@ -277,13 +287,14 @@ def _build_review_preview(mapping, text_chunks, file_type, filename_stem):
                     "category": token_categories.get(token, "custom"),
                 })
                 start_at = position + max(1, len(original))
-        occupied = set()
+        occupied = bytearray(len(text))
         spans = []
         for candidate in sorted(candidates, key=lambda item: (-(item["end"] - item["start"]), item["start"])):
-            positions = set(range(candidate["start"], candidate["end"]))
-            if positions & occupied:
+            if occupied.find(1, candidate["start"], candidate["end"]) >= 0:
                 continue
-            occupied.update(positions)
+            occupied[candidate["start"]:candidate["end"]] = b"\x01" * (
+                candidate["end"] - candidate["start"]
+            )
             spans.append(candidate)
         sections.append({
             "index": section_index,
@@ -303,6 +314,7 @@ def _process_task(
     await_review=False,
     accepted_alias_groups=None,
 ):
+    processing_started = time.monotonic()
     options = dict(task.options or {})
     task.status = AnonymizationTask.Status.PROCESSING
 
@@ -395,7 +407,7 @@ def _process_task(
             process_file(
                 task.input_file.path,
                 output_path,
-                builder.anonymize,
+                builder.anonymize_registered,
                 pdf_pages=pdf_pages,
                 progress_callback=report_progress,
             )
@@ -418,6 +430,28 @@ def _process_task(
     )
     mapping["review_preview"] = _build_review_preview(mapping, text_chunks, task.file_type, filename_stem)
     mapping["alias_suggestions"] = applied_alias_groups or alias_suggestions
+    review_metrics = dict(options.get("review_metrics") or {})
+    if await_review:
+        review_metrics.update({
+            "candidate_count": len(mapping.get("original_to_token", {})),
+            "candidate_occurrence_count": sum(
+                len(section.get("spans", [])) for section in mapping["review_preview"]
+            ),
+            "model_detected_count": model_entity_count,
+            "model_rejected_count": int(options.get("uie_rejected_count", 0)),
+            "alias_suggestion_count": len(alias_suggestions),
+            "recognized_at": timezone.now().isoformat(),
+        })
+        options["recognition_duration_ms"] = round((time.monotonic() - processing_started) * 1000)
+    else:
+        review_metrics.update({
+            "confirmed_entity_count": len(mapping.get("original_to_token", {})),
+            "confirmed_occurrence_count": sum(
+                len(section.get("spans", [])) for section in mapping["review_preview"]
+            ),
+        })
+        options["last_processing_duration_ms"] = round((time.monotonic() - processing_started) * 1000)
+    options["review_metrics"] = review_metrics
     task.mapping_ciphertext = encrypt_mapping(mapping)
     task.entity_counts = builder.counts()
     task.task_name = _task_name(anonymized_stem)
@@ -437,7 +471,21 @@ def _process_task(
 
 @api_view(["GET"])
 def health(request):
-    return Response({"status": "ok", "service": "烟草行业数据脱敏系统", "time": timezone.now()})
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+    except Exception:
+        return Response(
+            {"status": "unavailable", "service": "烟草行业数据脱敏系统", "database": "unavailable"},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return Response({
+        "status": "ok",
+        "service": "烟草行业数据脱敏系统",
+        "database": "ok",
+        "time": timezone.now(),
+    })
 
 
 @api_view(["GET", "POST"])
@@ -562,6 +610,7 @@ def _prepare_training_document(document):
 
 @api_view(["GET", "POST"])
 @parser_classes([MultiPartParser, FormParser])
+@throttle_classes([LocalUploadThrottle])
 def training_document_collection(request):
     if request.method == "GET":
         return Response({
@@ -583,6 +632,7 @@ def training_document_collection(request):
     try:
         _prepare_training_document(document)
     except Exception as exc:
+        logger.exception("Training document pre-label failed", extra={"document_id": str(document.id)})
         document.status = TrainingDocument.Status.FAILED
         document.error_message = str(exc) if isinstance(exc, (ProcessingError, UIEProcessingError, ValueError)) else "文档预标失败，请查看后端日志。"
         document.save(update_fields=["status", "error_message", "updated_at"])
@@ -646,44 +696,58 @@ def training_document_detail(request, document_id):
     return Response(_training_document_payload(document))
 
 
-@api_view(["GET"])
-def training_dataset_export(request):
-    lines = []
-    prompt_labels = {key: value for key, value in CATEGORY_LABELS.items()}
-    for document in TrainingDocument.objects.filter(status=TrainingDocument.Status.LABELED):
+def _training_dataset_lines():
+    documents = TrainingDocument.objects.filter(
+        status=TrainingDocument.Status.LABELED,
+    ).iterator(chunk_size=20)
+    for document in documents:
         if not document.preview_ciphertext or not document.annotations_ciphertext:
             continue
         preview = decrypt_mapping(document.preview_ciphertext).get("review_preview", [])
         entities = decrypt_mapping(document.annotations_ciphertext).get("entities", [])
         for section in preview:
             content = str(section.get("text", ""))
-            by_category = {}
+            if not content:
+                continue
+            by_category = defaultdict(list)
             for entity in entities:
-                text = str(entity.get("text", ""))
+                text = str(entity.get("text", "")).strip()
                 category = str(entity.get("category", "custom"))
+                if category not in UIE_TRAINING_PROMPT_BY_CATEGORY:
+                    continue
                 start_at = 0
                 while text:
                     start = content.find(text, start_at)
                     if start < 0:
                         break
-                    by_category.setdefault(category, []).append({
+                    by_category[category].append({
                         "text": text, "start": start, "end": start + len(text),
                     })
                     start_at = start + len(text)
-            for category, results in by_category.items():
-                lines.append(json.dumps({
+            # Include reviewed negative samples as empty result lists. These are
+            # required to teach UIE when a prompt has no answer in a section.
+            for category, prompt in UIE_TRAINING_PROMPT_BY_CATEGORY.items():
+                yield json.dumps({
                     "content": content,
-                    "prompt": prompt_labels.get(category, CATEGORY_LABELS["custom"]),
-                    "result_list": results,
-                }, ensure_ascii=False))
-    body = "\n".join(lines) + ("\n" if lines else "")
-    response = HttpResponse(body, content_type="application/jsonl; charset=utf-8")
+                    "prompt": prompt,
+                    "result_list": by_category.get(category, []),
+                }, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+@api_view(["GET"])
+def training_dataset_export(request):
+    response = StreamingHttpResponse(
+        _training_dataset_lines(),
+        content_type="application/jsonl; charset=utf-8",
+    )
     response["Content-Disposition"] = 'attachment; filename="uie-training-dataset.jsonl"'
+    response["X-Content-Type-Options"] = "nosniff"
     return response
 
 
 @api_view(["GET", "POST"])
 @parser_classes([MultiPartParser, FormParser])
+@throttle_classes([LocalUploadThrottle])
 def task_collection(request):
     if request.method == "GET":
         tasks = AnonymizationTask.objects.all()[:100]
@@ -732,6 +796,7 @@ def task_collection(request):
     try:
         _process_task(task, categories, uie_mode, combined_custom, await_review=review_required)
     except Exception as exc:
+        logger.exception("Anonymization task failed", extra={"task_id": str(task.id)})
         task.status = AnonymizationTask.Status.FAILED
         task.error_message = str(exc) if isinstance(exc, (ProcessingError, UIEProcessingError, ValueError)) else "文件处理失败，请检查文件是否损坏。"
         task.save(update_fields=["status", "error_message", "updated_at"])
@@ -765,30 +830,33 @@ def _review_entities(mapping):
         if isinstance(group, dict) and not group.get("accepted")
         for member in group.get("members", [])[1:]
     }
+    occurrence_index = defaultdict(list)
+    occurrence_counts = Counter()
+    for section in mapping.get("review_preview", []):
+        section_text = str(section.get("text", ""))
+        for span in section.get("spans", []):
+            text = str(span.get("text", ""))
+            token = str(span.get("token", ""))
+            key = (token, text)
+            occurrence_counts[key] += 1
+            if len(occurrence_index[key]) >= 3:
+                continue
+            start = int(span.get("start", 0))
+            end = int(span.get("end", start))
+            occurrence_index[key].append({
+                "prefix": re.sub(r"\s+", " ", section_text[max(0, start - 70):start]).strip(),
+                "match": text,
+                "suffix": re.sub(r"\s+", " ", section_text[end:end + 70]).strip(),
+                "location": section.get("location", "原文"),
+            })
+
     entities = []
     for text, token in original_to_token.items():
         if not token.startswith("【"):
             continue
         category = categories.get(token, "custom")
         context = context_map.get(token, {})
-        occurrences = []
-        for section in mapping.get("review_preview", []):
-            for span in section.get("spans", []):
-                if span.get("text") != text:
-                    continue
-                start = int(span.get("start", 0))
-                end = int(span.get("end", start))
-                section_text = str(section.get("text", ""))
-                occurrences.append({
-                    "prefix": re.sub(r"\s+", " ", section_text[max(0, start - 70):start]).strip(),
-                    "match": text,
-                    "suffix": re.sub(r"\s+", " ", section_text[end:end + 70]).strip(),
-                    "location": section.get("location", "原文"),
-                })
-                if len(occurrences) >= 3:
-                    break
-            if len(occurrences) >= 3:
-                break
+        occurrences = occurrence_index[(token, text)]
         entities.append({
             "key": f"{token}::{text}",
             "token": token,
@@ -798,6 +866,7 @@ def _review_entities(mapping):
             "source": "alias" if text in suggestion_members else context.get("source", "rule"),
             "probability": context.get("probability"),
             "occurrences": occurrences or context.get("occurrences", []),
+            "occurrence_count": occurrence_counts[(token, text)] or len(context.get("occurrences", [])),
             "canonical": aliases.get(text, text),
             "is_alias": text in aliases,
         })
@@ -831,6 +900,7 @@ def task_review(request, task_id):
         return Response(_review_payload(task, mapping, request))
 
     additions = _custom_entities(request.data.get("additions", ""))
+    manual_addition_count = len({(item.get("category"), item.get("text")) for item in additions})
     remove_tokens = request.data.get("remove_tokens", [])
     if not isinstance(remove_tokens, list):
         return Response({"detail": "误识别标记必须是列表。"}, status=status.HTTP_400_BAD_REQUEST)
@@ -872,10 +942,13 @@ def task_review(request, task_id):
 
     removals = []
     category_corrections = []
+    rejected_candidate_count = 0
     for text, token, old_category in entity_rows:
         selected_category = selected_by_key.get((token, text))
         if selected_category is None or selected_category != old_category:
             removals.append({"text": text, "category": old_category})
+        if selected_category is None:
+            rejected_candidate_count += 1
         if selected_category is not None and selected_category != old_category:
             category_corrections.append({
                 "text": text,
@@ -939,6 +1012,19 @@ def task_review(request, task_id):
             if item in DEFAULT_CATEGORIES
         ]
         uie_mode = (task.options or {}).get("uie_mode", "on_demand")
+        task_options = dict(task.options or {})
+        review_metrics = dict(task_options.get("review_metrics") or {})
+        review_metrics.update({
+            "candidate_count": len(entity_rows),
+            "selected_count": len(selected_by_key),
+            "rejected_count": rejected_candidate_count,
+            "category_corrected_count": len(category_corrections),
+            "manual_added_count": manual_addition_count,
+            "alias_accepted_count": len(accepted_alias_groups),
+            "reviewed_at": timezone.now().isoformat(),
+        })
+        task_options["review_metrics"] = review_metrics
+        task.options = task_options
         _process_task(
             task,
             categories,
@@ -958,6 +1044,7 @@ def task_review(request, task_id):
     except (ProcessingError, UIEProcessingError, ValueError) as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
     except Exception:
+        logger.exception("Review reprocessing failed", extra={"task_id": str(task.id)})
         return Response({"detail": "校正后重新处理失败，请查看后端日志。"}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
     return Response(_review_payload(
@@ -970,6 +1057,7 @@ def task_review(request, task_id):
 
 @api_view(["POST"])
 @parser_classes([MultiPartParser, FormParser])
+@throttle_classes([LocalUploadThrottle])
 def restore_task(request, task_id):
     task = get_object_or_404(AnonymizationTask, id=task_id)
     upload = request.FILES.get("file")
@@ -985,10 +1073,11 @@ def restore_task(request, task_id):
     task.restore_input_file.save(upload_name, upload, save=True)
     try:
         mapping = decrypt_mapping(task.mapping_ciphertext)
-        restored_upload_name = restore_text(upload_name, mapping)
+        restorer = build_restorer(mapping)
+        restored_upload_name = restorer(upload_name)
         output_name = _output_name(restored_upload_name, "正式版")
         output_path = Path(settings.MEDIA_ROOT) / "processing" / str(task.id) / output_name
-        process_file(task.restore_input_file.path, output_path, lambda text: restore_text(text, mapping))
+        process_file(task.restore_input_file.path, output_path, restorer)
         if task.restored_file:
             task.restored_file.delete(save=False)
         with output_path.open("rb") as handle:
@@ -998,6 +1087,7 @@ def restore_task(request, task_id):
         task.save()
         output_path.unlink(missing_ok=True)
     except Exception as exc:
+        logger.exception("Restore task failed", extra={"task_id": str(task.id)})
         task.error_message = str(exc) if isinstance(exc, (ProcessingError, ValueError)) else "反匿名处理失败，请检查文件格式。"
         task.save(update_fields=["error_message", "updated_at"])
         return Response({"detail": task.error_message}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
@@ -1026,15 +1116,83 @@ def download_task(request, task_id, kind):
 @api_view(["GET"])
 def stats(request):
     tasks = AnonymizationTask.objects.all()
+    task_rows = list(tasks.values("status", "file_type", "entity_counts", "options", "created_at"))
+    status_counts = Counter(row["status"] for row in task_rows)
+    file_type_counts = Counter((row["file_type"] or "unknown").upper() for row in task_rows)
+    entity_counts = Counter()
+    review_totals = Counter()
+    duration_values = []
+    confirmed_occurrences = 0
+    daily_counts = Counter()
+    for row in task_rows:
+        daily_counts[timezone.localtime(row["created_at"]).date().isoformat()] += 1
+        for label, count in (row["entity_counts"] or {}).items():
+            entity_counts[label] += int(count or 0)
+        options = row["options"] or {}
+        metrics = options.get("review_metrics") or {}
+        if "confirmed_occurrence_count" in metrics:
+            confirmed_occurrences += int(metrics.get("confirmed_occurrence_count", 0) or 0)
+        elif row["status"] in {AnonymizationTask.Status.COMPLETED, AnonymizationTask.Status.RESTORED}:
+            confirmed_occurrences += sum(int(value or 0) for value in (row["entity_counts"] or {}).values())
+        if metrics.get("reviewed_at"):
+            review_totals["reviewed_tasks"] += 1
+        for key in (
+            "candidate_count", "candidate_occurrence_count", "selected_count", "rejected_count",
+            "category_corrected_count", "manual_added_count", "alias_accepted_count",
+        ):
+            review_totals[key] += int(metrics.get(key, 0) or 0)
+        duration = options.get("recognition_duration_ms")
+        if isinstance(duration, (int, float)) and duration >= 0:
+            duration_values.append(float(duration))
+
+    total_tasks = len(task_rows)
+    completed_tasks = status_counts[AnonymizationTask.Status.COMPLETED] + status_counts[AnonymizationTask.Status.RESTORED]
+    candidate_total = review_totals["candidate_count"]
+    selected_total = review_totals["selected_count"]
+    today = timezone.localdate()
+    trend = [
+        {"date": (today - timedelta(days=offset)).isoformat(), "count": daily_counts[(today - timedelta(days=offset)).isoformat()]}
+        for offset in range(6, -1, -1)
+    ]
+    training_status_counts = {
+        choice: TrainingDocument.objects.filter(status=choice).count()
+        for choice, _ in TrainingDocument.Status.choices
+    }
     totals = {
-        "tasks": tasks.count(),
-        "completed": tasks.filter(status__in=["completed", "restored"]).count(),
-        "restored": tasks.filter(status="restored").count(),
-        "entities": 0,
+        "tasks": total_tasks,
+        "completed": completed_tasks,
+        "restored": status_counts[AnonymizationTask.Status.RESTORED],
+        "failed": status_counts[AnonymizationTask.Status.FAILED],
+        "pending_review": status_counts[AnonymizationTask.Status.REVIEW],
+        "entities": sum(entity_counts.values()),
+        "entity_occurrences": confirmed_occurrences,
         "training_examples": TrainingExample.objects.count(),
         "active_labels": RecognitionLabel.objects.filter(is_active=True).count(),
+        "training_documents": TrainingDocument.objects.count(),
         "max_upload_size_mb": settings.MAX_UPLOAD_SIZE_MB,
+        "completion_rate": round(completed_tasks * 100 / total_tasks, 1) if total_tasks else 0.0,
+        "status_distribution": [
+            {"key": key, "label": label, "count": status_counts[key]}
+            for key, label in AnonymizationTask.Status.choices
+        ],
+        "entity_distribution": [
+            {"label": label, "count": count}
+            for label, count in entity_counts.most_common()
+        ],
+        "file_type_distribution": [
+            {"label": label, "count": count}
+            for label, count in file_type_counts.most_common()
+        ],
+        "review_quality": {
+            **review_totals,
+            "candidate_acceptance_rate": round(selected_total * 100 / candidate_total, 1) if candidate_total else 0.0,
+        },
+        "performance": {
+            "measured_tasks": len(duration_values),
+            "average_recognition_seconds": round(sum(duration_values) / len(duration_values) / 1000, 1) if duration_values else 0.0,
+            "maximum_recognition_seconds": round(max(duration_values) / 1000, 1) if duration_values else 0.0,
+        },
+        "training_status": training_status_counts,
+        "seven_day_trend": trend,
     }
-    for counts in tasks.values_list("entity_counts", flat=True):
-        totals["entities"] += sum(counts.values()) if isinstance(counts, dict) else 0
     return Response(totals)

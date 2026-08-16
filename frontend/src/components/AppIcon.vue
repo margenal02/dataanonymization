@@ -50,6 +50,9 @@ defineProps({
     <template v-else-if="name === 'layout'">
       <rect width="18" height="18" x="3" y="3" rx="2" /><path d="M3 9h18M9 21V9" />
     </template>
+    <template v-else-if="name === 'chart'">
+      <path d="M3 3v18h18" /><path d="m7 16 4-5 3 3 5-7" />
+    </template>
     <template v-else-if="name === 'book'">
       <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V4H6.5A2.5 2.5 0 0 0 4 6.5z" /><path d="M4 6.5v13A2.5 2.5 0 0 0 6.5 22H20" />
     </template>
@@ -67,4 +70,3 @@ defineProps({
     </template>
   </svg>
 </template>
-

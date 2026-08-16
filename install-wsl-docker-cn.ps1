@@ -355,6 +355,10 @@ write_secure_environment() {
         set_env_value PPSTRUCTURE_TEXT_DETECTION_MODEL "PP-OCRv5_mobile_det"
         set_env_value PPSTRUCTURE_TEXT_RECOGNITION_MODEL "PP-OCRv5_mobile_rec"
         set_env_value PPSTRUCTURE_START_TIMEOUT_SECONDS "600"
+        grep -q '^DJANGO_HTTPS=' "$env_file" || set_env_value DJANGO_HTTPS "0"
+        grep -q '^DJANGO_HSTS_SECONDS=' "$env_file" || set_env_value DJANGO_HSTS_SECONDS "31536000"
+        grep -q '^DJANGO_HSTS_INCLUDE_SUBDOMAINS=' "$env_file" || set_env_value DJANGO_HSTS_INCLUDE_SUBDOMAINS "0"
+        grep -q '^DJANGO_HSTS_PRELOAD=' "$env_file" || set_env_value DJANGO_HSTS_PRELOAD "0"
         sed -i '/^PDF_OCR_LANGUAGES=/d' "$env_file"
         current_upload_limit="$(sed -n 's/^MAX_UPLOAD_SIZE_MB=//p' "$env_file" | tail -n 1 | tr -d '\r')"
         if [[ -z "$current_upload_limit" || "$current_upload_limit" == "50" ]]; then
@@ -375,6 +379,10 @@ MYSQL_DATABASE=data_anonymization
 MYSQL_USER=anonymizer
 MYSQL_PASSWORD=$(openssl rand -hex 32)
 DJANGO_DEBUG=0
+DJANGO_HTTPS=0
+DJANGO_HSTS_SECONDS=31536000
+DJANGO_HSTS_INCLUDE_SUBDOMAINS=0
+DJANGO_HSTS_PRELOAD=0
 ALLOWED_HOSTS=${allowed_hosts}
 MAX_UPLOAD_SIZE_MB=200
 REQUIRE_HUMAN_REVIEW=1

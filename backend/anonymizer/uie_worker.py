@@ -4,26 +4,10 @@ import os
 import sys
 
 from .paddlenlp_compat import ensure_aistudio_download_compatibility
+from .entity_schema import UIE_SCHEMA_BY_CATEGORY, UIE_SCHEMA_CATEGORY
 
 
 PROTOCOL_PREFIX = "__UIE__"
-SCHEMA_BY_CATEGORY = {
-    "person": ["人名"],
-    "organization": ["单位名称", "部门名称"],
-    "address": ["详细地址"],
-    "location": ["烟叶产区"],
-    "product": ["烟草品牌或产品名称"],
-}
-SCHEMA_CATEGORY = {
-    "人名": "person",
-    "单位名称": "organization",
-    "部门名称": "organization",
-    "详细地址": "address",
-    "烟叶产区": "location",
-    "烟草品牌或产品名称": "product",
-}
-
-
 def _emit(payload):
     print(PROTOCOL_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
 
@@ -31,7 +15,7 @@ def _emit(payload):
 def _schema(categories):
     result = []
     for category in categories:
-        result.extend(SCHEMA_BY_CATEGORY.get(category, []))
+        result.extend(UIE_SCHEMA_BY_CATEGORY.get(category, []))
     return list(dict.fromkeys(result))
 
 
@@ -67,7 +51,7 @@ def _predict(engine, payload):
         for text_index, item in enumerate(raw_results):
             if not isinstance(item, dict):
                 continue
-            category = SCHEMA_CATEGORY.get(requested_schema)
+            category = UIE_SCHEMA_CATEGORY.get(requested_schema)
             for match in item.get(requested_schema, []) or []:
                 value = str(match.get("text", "")).strip()
                 if not value:

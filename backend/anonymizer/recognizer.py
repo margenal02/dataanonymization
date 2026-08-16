@@ -365,6 +365,7 @@ class MappingBuilder:
         self.token_categories = {}
         self.alias_to_canonical = {}
         self.counters = Counter()
+        self._replacement_pattern = None
         for item in custom_entities or []:
             text = item.get("text", "").strip()
             category = item.get("category", "custom")
@@ -389,6 +390,7 @@ class MappingBuilder:
         self.original_to_token[original] = token
         self.token_to_original[token] = original
         self.token_categories[token] = category
+        self._replacement_pattern = None
         return token
 
     def validate_detected(self, original, category):
@@ -450,10 +452,10 @@ class MappingBuilder:
             self.original_to_token[alias] = canonical_token
             self.alias_to_canonical[alias] = canonical
         for token in removed_tokens:
-            old_category = self.token_categories.pop(token, None)
+            self.token_categories.pop(token, None)
             self.token_to_original.pop(token, None)
-            if old_category and self.counters[old_category] > 0:
-                self.counters[old_category] -= 1
+            # Counters are monotonic identifiers. Decrementing here could make
+            # a later entity reuse a number that another active token owns.
         self.token_to_original[canonical_token] = canonical
         self.token_categories[canonical_token] = category
         return canonical_token
@@ -534,26 +536,55 @@ class MappingBuilder:
         # Prefer the longest candidate when rules overlap (for example a full tobacco
         # company name that also contains a shorter generic “company” match).
         selected = []
-        occupied = set()
+        occupied = bytearray(len(text))
         for start, end, category, value in sorted(
             candidates, key=lambda item: (-(item[1] - item[0]), item[0], DEFAULT_CATEGORIES.index(item[2]))
         ):
-            positions = set(range(start, end))
-            if positions & occupied:
+            if occupied.find(1, start, end) >= 0:
                 continue
             selected.append((start, category, value))
-            occupied.update(positions)
+            occupied[start:end] = b"\x01" * (end - start)
         for _, category, value in sorted(selected, key=lambda item: item[0]):
             self.register(value, category)
+
+    def _replace_registered(self, text, filename=False):
+        originals = sorted(self.original_to_token, key=len, reverse=True)
+        if not originals:
+            return text
+        if self._replacement_pattern is None:
+            self._replacement_pattern = re.compile(
+                "|".join(re.escape(original) for original in originals)
+            )
+        pattern = self._replacement_pattern
+
+        def replacement(match):
+            original = match.group(0)
+            content_token = self.original_to_token[original]
+            if not filename:
+                return content_token
+            filename_token = f"ANON_{content_token[1:-1]}"
+            self.token_to_original[filename_token] = self.token_to_original.get(content_token, original)
+            self.token_categories[filename_token] = self.token_categories[content_token]
+            return filename_token
+
+        return pattern.sub(replacement, text)
 
     def anonymize(self, text):
         if not text:
             return text
         self.discover(text)
-        result = text
-        for original in sorted(self.original_to_token, key=len, reverse=True):
-            result = result.replace(original, self.original_to_token[original])
-        return result
+        return self._replace_registered(text)
+
+    def anonymize_registered(self, text):
+        """Replace only the mapping built during the discovery phase.
+
+        File processing first extracts and discovers every text section.  The
+        write phase must not run all recognition patterns again for every XML
+        node or spreadsheet cell.
+        """
+        if not text:
+            return text
+        return self._replace_registered(text)
 
     def anonymize_filename_stem(self, stem):
         """Anonymize a filename stem while reusing the document's reversible mapping."""
@@ -566,15 +597,7 @@ class MappingBuilder:
                     value = match.group(1)
                     if _is_likely_person_name(value):
                         self.register(value, "person")
-        result = stem
-        for original in sorted(self.original_to_token, key=len, reverse=True):
-            content_token = self.original_to_token[original]
-            filename_token = f"ANON_{content_token[1:-1]}"
-            result = result.replace(original, filename_token)
-            if filename_token in result:
-                self.token_to_original[filename_token] = self.token_to_original.get(content_token, original)
-                self.token_categories[filename_token] = self.token_categories[content_token]
-        return result
+        return self._replace_registered(stem, filename=True)
 
     def export(self):
         return {
@@ -586,14 +609,30 @@ class MappingBuilder:
         }
 
     def counts(self):
-        return {CATEGORY_LABELS.get(key, key): value for key, value in self.counters.items()}
+        active = Counter(
+            category
+            for token, category in self.token_categories.items()
+            if token.startswith("【")
+        )
+        return {CATEGORY_LABELS.get(key, key): value for key, value in active.items()}
+
+
+def build_restorer(mapping):
+    replacements = mapping.get("token_to_original", {})
+    if not replacements:
+        return lambda text: text
+    pattern = re.compile("|".join(re.escape(token) for token in sorted(replacements, key=len, reverse=True)))
+
+    def restore(text):
+        if not text:
+            return text
+        return pattern.sub(lambda match: replacements[match.group(0)], text)
+
+    return restore
 
 
 def restore_text(text, mapping):
-    result = text
-    for token, original in sorted(mapping.get("token_to_original", {}).items(), key=lambda item: len(item[0]), reverse=True):
-        result = result.replace(token, original)
-    return result
+    return build_restorer(mapping)(text)
 
 
 def suggest_organization_alias_groups(builder, text):
