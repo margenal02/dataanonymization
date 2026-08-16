@@ -14,7 +14,13 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from .crypto import decrypt_mapping, encrypt_mapping
-from .file_processors import ProcessingError, SUPPORTED_EXTENSIONS, process_file, validate_upload_content
+from .file_processors import (
+    ProcessingError,
+    SUPPORTED_EXTENSIONS,
+    extract_pdf_pages,
+    process_file,
+    validate_upload_content,
+)
 from .models import AnonymizationTask, RecognitionLabel, TrainingExample
 from .recognizer import CATEGORY_LABELS, DEFAULT_CATEGORIES, MappingBuilder, restore_text
 from .serializers import TaskSerializer
@@ -108,12 +114,11 @@ def _sha256(upload):
     return digest.hexdigest()
 
 
-def _collect_text_chunks(source, task_id):
+def _collect_text_chunks(source, task_id, progress_callback=None):
     chunks = []
     seen = set()
     total_chars = 0
     extension = Path(source).suffix.lower()
-    discovery_path = Path(settings.MEDIA_ROOT) / "processing" / str(task_id) / f"uie-discovery{extension}"
 
     def collect(text):
         nonlocal total_chars
@@ -129,11 +134,19 @@ def _collect_text_chunks(source, task_id):
         chunks.append(value)
         return text
 
+    if extension == ".pdf":
+        pdf_pages = extract_pdf_pages(source, progress_callback)
+        for page_text in pdf_pages:
+            collect(page_text)
+        return chunks, pdf_pages
+
+    discovery_path = Path(settings.MEDIA_ROOT) / "processing" / str(task_id) / f"uie-discovery{extension}"
+
     try:
         process_file(source, discovery_path, collect)
     finally:
         discovery_path.unlink(missing_ok=True)
-    return chunks
+    return chunks, None
 
 
 def _select_model_entities(builder, entities):
@@ -175,14 +188,37 @@ def _process_task(task, categories, uie_mode, combined_custom, excluded_entities
         str(task.id), categories, combined_custom, excluded_entities=excluded_entities,
     )
     options = dict(task.options or {})
+    task.status = AnonymizationTask.Status.PROCESSING
+
+    def report_progress(event):
+        progress = {
+            "percent": max(0, min(100, int(event.get("percent", 0)))),
+            "stage": str(event.get("stage", "processing")),
+            "detail": str(event.get("detail", "正在处理文件")),
+        }
+        for key in ("current_page", "pdf_page_count", "ocr_page_count"):
+            if key in event:
+                progress[key] = int(event[key])
+                options[key] = int(event[key])
+        options["processing_progress"] = progress
+        task.options = options
+        task.save(update_fields=["status", "options", "updated_at"])
+
+    report_progress({"percent": 2, "stage": "prepare", "detail": "文件已保存，正在检查内容结构"})
     model_entity_count = 0
+    pdf_pages = None
     if settings.UIE_ENABLED and set(categories) & {"person", "organization", "address", "location", "product"}:
-        text_chunks = _collect_text_chunks(task.input_file.path, task.id)
+        text_chunks, pdf_pages = _collect_text_chunks(
+            task.input_file.path,
+            task.id,
+            progress_callback=report_progress,
+        )
         filename_stem = Path(task.original_name).stem
         if filename_stem and filename_stem not in text_chunks:
             text_chunks.append(filename_stem)
         for text_chunk in text_chunks:
             builder.discover(text_chunk)
+        report_progress({"percent": 60, "stage": "uie", "detail": "正在使用 UIE-micro 复核敏感信息"})
         model_entities, rejected_count = _select_model_entities(
             builder, predict_entities(text_chunks, categories, uie_mode)
         )
@@ -195,8 +231,15 @@ def _process_task(task, categories, uie_mode, combined_custom, excluded_entities
     anonymized_stem = builder.anonymize_filename_stem(Path(task.original_name).stem)
     output_name = _output_name(task.original_name, "已脱敏", anonymized_stem)
     output_path = Path(settings.MEDIA_ROOT) / "processing" / str(task.id) / output_name
+    report_progress({"percent": 70, "stage": "write", "detail": "识别完成，正在生成脱敏文件"})
     try:
-        process_file(task.input_file.path, output_path, builder.anonymize)
+        process_file(
+            task.input_file.path,
+            output_path,
+            builder.anonymize,
+            pdf_pages=pdf_pages,
+            progress_callback=report_progress,
+        )
         if task.anonymized_file:
             task.anonymized_file.delete(save=False)
         with output_path.open("rb") as handle:
@@ -210,6 +253,11 @@ def _process_task(task, categories, uie_mode, combined_custom, excluded_entities
     task.entity_counts = builder.counts()
     task.task_name = _task_name(anonymized_stem)
     task.options = options
+    task.options["processing_progress"] = {
+        "percent": 100,
+        "stage": "completed",
+        "detail": "脱敏文件生成完成",
+    }
     task.error_message = ""
     task.status = AnonymizationTask.Status.COMPLETED
     task.save()

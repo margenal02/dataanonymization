@@ -110,7 +110,9 @@ Web 直连的进度由 HTTP 响应中的总大小和实际写入磁盘的字节�
 
 UIE 分类在基础候选阈值之外还会使用独立复核阈值：人名 `0.70`、单位 `0.55`、地址/产区/产品 `0.60`。安装脚本会为新旧 `.env` 写入 `UIE_PERSON_PROB`、`UIE_ORGANIZATION_PROB`、`UIE_ADDRESS_PROB`、`UIE_LOCATION_PROB` 和 `UIE_PRODUCT_PROB`；调整后重新运行脚本会恢复这些经过回归验证的默认值。
 
-首次执行“构建 Django 与 UIE-micro 后端镜像”时，会通过选中的 PyPI 镜像安装 PaddlePaddle/PaddleNLP，并下载约 90 MB 的 UIE-micro 模型文件和生成本地推理缓存。模型缓存被封装进后端 Docker 镜像，业务任务执行时不需要把文件上传给外部模型，也不会为“临时调用”重新下载模型。该构建步骤通常比其他步骤耗时更长；4 核主机首次构建可能需要 10～30 分钟，重复安装且代码、依赖未变化时 Docker 会复用缓存。
+首次执行“构建 Django 与 UIE-micro 后端镜像”时，会通过选中的 PyPI 镜像安装 PaddlePaddle/PaddleNLP，并下载约 90 MB 的 UIE-micro 模型文件和生成本地推理缓存；同时从所选 Debian 镜像安装 Poppler、Tesseract 及简体中文/英文语言包，用于扫描 PDF 自动 OCR。模型和 OCR 组件均封装进后端 Docker 镜像，业务任务执行时不需要把文件上传给外部服务，也不会为“临时调用”重新下载模型。该构建步骤通常比其他步骤耗时更长；4 核主机首次构建可能需要 10～30 分钟，重复安装且代码、依赖未变化时 Docker 会复用缓存。
+
+扫描 PDF 会显著占用 CPU，默认最长可处理 300 个 OCR 页面，页面渲染最长边限制为 3508 像素，单页渲染或识别超时为 180 秒。处理过程中 Web 页面会显示当前 OCR 页与百分比。安装脚本会把对应 `PDF_OCR_*` 参数写入新旧 `.env`，不会修改既有密码和密钥。
 
 后端与前端构建强制使用 BuildKit 纯文本进度，因此安装窗口会在同一条总进度中显示当前 Docker 层、pip 下载包以及 UIE 模型的“加载运行组件、下载/转换、自检”子步骤。完整构建明细分别保存在 `.runtime/docker-build-backend.log` 和 `.runtime/docker-build-frontend.log`；窗口长时间没有变化时，可把对应文件与 `install-support-latest.log` 一并提供给维护人员。UIE 缓存进度显示已经写入磁盘的实际 MB，不用虚构百分比。
 

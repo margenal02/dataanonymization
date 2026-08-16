@@ -341,6 +341,14 @@ write_secure_environment() {
         set_env_value UIE_MAX_TOTAL_CHARS "500000"
         set_env_value UIE_START_TIMEOUT_SECONDS "180"
         set_env_value UIE_REQUEST_TIMEOUT_SECONDS "600"
+        set_env_value PDF_OCR_ENABLED "1"
+        set_env_value PDF_OCR_LANGUAGES "chi_sim+eng"
+        set_env_value PDF_OCR_DPI "180"
+        set_env_value PDF_OCR_MAX_IMAGE_DIMENSION "3508"
+        set_env_value PDF_OCR_MIN_TEXT_CHARS "12"
+        set_env_value PDF_OCR_MAX_PAGES "300"
+        set_env_value PDF_OCR_MAX_TOTAL_CHARS "500000"
+        set_env_value PDF_OCR_PAGE_TIMEOUT_SECONDS "180"
         current_upload_limit="$(sed -n 's/^MAX_UPLOAD_SIZE_MB=//p' "$env_file" | tail -n 1 | tr -d '\r')"
         if [[ -z "$current_upload_limit" || "$current_upload_limit" == "50" ]]; then
             set_env_value MAX_UPLOAD_SIZE_MB "200"
@@ -383,6 +391,14 @@ UIE_MAX_SEQ_LEN=512
 UIE_MAX_TOTAL_CHARS=500000
 UIE_START_TIMEOUT_SECONDS=180
 UIE_REQUEST_TIMEOUT_SECONDS=600
+PDF_OCR_ENABLED=1
+PDF_OCR_LANGUAGES=chi_sim+eng
+PDF_OCR_DPI=180
+PDF_OCR_MAX_IMAGE_DIMENSION=3508
+PDF_OCR_MIN_TEXT_CHARS=12
+PDF_OCR_MAX_PAGES=300
+PDF_OCR_MAX_TOTAL_CHARS=500000
+PDF_OCR_PAGE_TIMEOUT_SECONDS=180
 EOF
     chmod 600 "$env_file"
 }

@@ -18,7 +18,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen import canvas
 
-from .file_processors import process_file
+from .file_processors import ProcessingError, process_file
 from .crypto import decrypt_mapping
 from .models import AnonymizationTask, RecognitionLabel, TrainingExample
 from .recognizer import MappingBuilder, restore_text
@@ -285,6 +285,43 @@ class FileProcessorTests(TestCase):
         self.assertNotIn("张三", "".join(page.extract_text() or "" for page in __import__('pypdf').PdfReader(anonymized).pages))
         self.assertIn("张三", "".join(page.extract_text() or "" for page in __import__('pypdf').PdfReader(restored).pages))
 
+    @override_settings(PDF_OCR_ENABLED=True)
+    @patch("anonymizer.file_processors._ocr_pdf_page")
+    def test_scanned_pdf_uses_local_ocr_and_reports_progress(self, ocr_page):
+        source = self.directory / "scanned.pdf"
+        pdf = canvas.Canvas(str(source), pagesize=A4)
+        pdf.rect(50, 700, 300, 80)
+        pdf.showPage()
+        pdf.save()
+        ocr_page.return_value = self.source_text
+        progress = []
+        builder = MappingBuilder("scan123")
+        anonymized = self.directory / "scanned-anonymized.pdf"
+
+        process_file(
+            source,
+            anonymized,
+            builder.anonymize,
+            progress_callback=progress.append,
+        )
+
+        ocr_page.assert_called_once_with(source, 1)
+        extracted = "".join(page.extract_text() or "" for page in __import__('pypdf').PdfReader(anonymized).pages)
+        self.assertNotIn("中国烟草总公司", extracted)
+        self.assertNotIn("张三", extracted)
+        self.assertTrue(any(item.get("stage") == "pdf_ocr" for item in progress))
+        self.assertEqual(progress[-1]["stage"], "pdf_write")
+
+    @override_settings(PDF_OCR_ENABLED=False)
+    def test_scanned_pdf_fails_clearly_when_local_ocr_is_disabled(self):
+        source = self.directory / "ocr-disabled.pdf"
+        pdf = canvas.Canvas(str(source), pagesize=A4)
+        pdf.rect(50, 700, 300, 80)
+        pdf.save()
+
+        with self.assertRaisesRegex(ProcessingError, "本地 OCR 已关闭"):
+            process_file(source, self.directory / "unused.pdf", lambda text: text)
+
 
 class TaskApiTests(TestCase):
     def setUp(self):
@@ -336,6 +373,26 @@ class TaskApiTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["max_upload_size_mb"], 200)
+
+    @override_settings(UIE_ENABLED=False, PDF_OCR_ENABLED=True)
+    @patch("anonymizer.file_processors._ocr_pdf_page")
+    def test_scanned_pdf_api_exposes_ocr_page_count_and_completed_progress(self, ocr_page):
+        ocr_page.return_value = "单位：中国烟草总公司\n联系人：张三"
+        buffer = io.BytesIO()
+        pdf = canvas.Canvas(buffer, pagesize=A4)
+        pdf.rect(50, 700, 300, 80)
+        pdf.save()
+        upload = SimpleUploadedFile("扫描公文.pdf", buffer.getvalue(), content_type="application/pdf")
+
+        response = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["organization", "person"]),
+        })
+
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(response.json()["ocr_page_count"], 1)
+        self.assertEqual(response.json()["processing_progress"]["percent"], 100)
+        self.assertEqual(response.json()["processing_progress"]["stage"], "completed")
 
     def test_api_returns_counts_for_realistic_unlabeled_content(self):
         source = (

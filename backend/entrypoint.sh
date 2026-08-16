@@ -20,4 +20,4 @@ until curl -fsS http://127.0.0.1:8765/status >/dev/null 2>&1; do
     sleep 1
 done
 
-exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 660 --access-logfile - --error-logfile -
+exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 3600 --access-logfile - --error-logfile -

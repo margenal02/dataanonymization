@@ -89,6 +89,14 @@ UIE_CATEGORY_THRESHOLDS = {
     "location": float(os.getenv("UIE_LOCATION_PROB", "0.60")),
     "product": float(os.getenv("UIE_PRODUCT_PROB", "0.60")),
 }
+PDF_OCR_ENABLED = os.getenv("PDF_OCR_ENABLED", "1") == "1"
+PDF_OCR_LANGUAGES = os.getenv("PDF_OCR_LANGUAGES", "chi_sim+eng")
+PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "180"))
+PDF_OCR_MAX_IMAGE_DIMENSION = int(os.getenv("PDF_OCR_MAX_IMAGE_DIMENSION", "3508"))
+PDF_OCR_MIN_TEXT_CHARS = int(os.getenv("PDF_OCR_MIN_TEXT_CHARS", "12"))
+PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "300"))
+PDF_OCR_MAX_TOTAL_CHARS = int(os.getenv("PDF_OCR_MAX_TOTAL_CHARS", "500000"))
+PDF_OCR_PAGE_TIMEOUT_SECONDS = int(os.getenv("PDF_OCR_PAGE_TIMEOUT_SECONDS", "180"))
 
 CORS_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 REST_FRAMEWORK = {

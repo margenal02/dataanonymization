@@ -31,6 +31,7 @@ const reviewLoading = ref(false)
 const reviewData = ref({ entities: [], excluded_count: 0 })
 const reviewAdditions = ref('')
 const reviewRemoveTokens = ref([])
+const processingProgress = ref(null)
 const selectedCategories = ref(['organization', 'person', 'product', 'location', 'phone', 'id_card', 'email', 'address'])
 
 const categoryOptions = [
@@ -192,6 +193,25 @@ async function submitAnonymize() {
   error.value = ''
   result.value = null
   reviewOpen.value = false
+  const sourceName = anonymizeFile.value.name
+  const startedAt = Date.now() - 5000
+  processingProgress.value = { percent: 0, detail: '正在上传文件，请稍候…' }
+  const progressTimer = window.setInterval(async () => {
+    try {
+      const latestTasks = await api.listTasks()
+      const activeTask = latestTasks.find(task => (
+        task.status === 'processing'
+        && task.original_name === sourceName
+        && new Date(task.created_at).getTime() >= startedAt
+      ))
+      if (activeTask?.processing_progress) {
+        processingProgress.value = activeTask.processing_progress
+        tasks.value = latestTasks
+      }
+    } catch {
+      // 主上传请求会返回真正的错误；轮询失败不覆盖它。
+    }
+  }, 1500)
   try {
     result.value = await api.anonymize(anonymizeFile.value, selectedCategories.value, customEntities.value, uieMode.value)
     await Promise.all([refreshData(), refreshModelRuntime(), refreshLabels()])
@@ -199,7 +219,9 @@ async function submitAnonymize() {
     error.value = e.message
     if (e.data?.id) result.value = e.data
   } finally {
+    window.clearInterval(progressTimer)
     loading.value = false
+    processingProgress.value = null
   }
 }
 
@@ -426,8 +448,13 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               <button class="btn primary-btn" :disabled="loading || !anonymizeFile" @click="submitAnonymize">
                 <span v-if="loading" class="spinner-border spinner-border-sm"></span>
                 <AppIcon v-else name="file-lock" :size="18" />
-                {{ loading ? '正在加载模型并识别…' : '开始数据匿名' }}
+                {{ loading ? (processingProgress?.stage === 'pdf_ocr' ? '正在本地 OCR…' : '正在识别并生成…') : '开始数据匿名' }}
               </button>
+            </div>
+            <div v-if="loading && processingProgress" class="task-progress">
+              <div><span>{{ processingProgress.detail }}</span><strong>{{ processingProgress.percent || 0 }}%</strong></div>
+              <div class="task-progress-track"><i :style="{ width: `${processingProgress.percent || 0}%` }"></i></div>
+              <small v-if="processingProgress.ocr_page_count">扫描 PDF：正在逐页本地 OCR，共 {{ processingProgress.ocr_page_count }} 页需要识别</small>
             </div>
           </section>
 
@@ -481,6 +508,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                 <span v-for="(count, label) in result.entity_counts" :key="label">{{ label }} {{ count }}</span>
                 <span v-if="result.uie_detected_count">UIE 补充 {{ result.uie_detected_count }}</span>
                 <span v-if="result.uie_rejected_count">已过滤低置信/冲突 {{ result.uie_rejected_count }}</span>
+                <span v-if="result.ocr_page_count">本地 OCR {{ result.ocr_page_count }} 页</span>
                 <span v-if="result.recognition_mode === 'on_demand'">临时调用</span>
                 <span v-else-if="result.recognition_mode === 'resident'">模型常驻</span>
                 <span v-if="!Object.keys(result.entity_counts || {}).length">未发现自动识别项，请确认文件不是扫描图片，或补充“指定敏感词”</span>
@@ -532,7 +560,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
             </template>
           </section>
 
-          <div class="format-note"><strong>格式说明：</strong>DOCX 仅改写命中的文本区间并保留原有文字节点和样式；XLS、TXT、OFD 尽量保持原结构。文本型 PDF 仍会重新排版，扫描 PDF 需先完成 OCR。</div>
+          <div class="format-note"><strong>格式说明：</strong>DOCX 仅改写命中的文本区间并保留原有文字节点和样式；XLS、TXT、OFD 尽量保持原结构。扫描 PDF 会自动在本机逐页 OCR，PDF 输出仍会重新排版。</div>
         </template>
 
         <template v-else-if="nav === 'history'">
@@ -549,7 +577,12 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                     <td><strong>{{ task.task_name }}</strong><small>{{ task.code }} · {{ task.display_name || task.original_name }} · {{ formatBytes(task.file_size) }}</small></td>
                     <td><span class="file-type">{{ task.file_type.toUpperCase() }}</span></td>
                     <td>{{ Object.values(task.entity_counts || {}).reduce((a, b) => a + b, 0) }} 项</td>
-                    <td><span class="status-pill" :class="statusMeta(task.status)[1]"><i></i>{{ statusMeta(task.status)[0] }}</span></td>
+                    <td>
+                      <span class="status-pill" :class="statusMeta(task.status)[1]"><i></i>{{ statusMeta(task.status)[0] }}</span>
+                      <small v-if="task.status === 'processing' && task.processing_progress?.detail" class="history-progress">
+                        {{ task.processing_progress.percent || 0 }}% · {{ task.processing_progress.detail }}
+                      </small>
+                    </td>
                     <td>{{ formatDate(task.created_at) }}</td>
                     <td class="text-end table-actions">
                       <button v-if="task.anonymized_download_url" title="下载脱敏文件" @click="openDownload(task.anonymized_download_url)"><AppIcon name="download" :size="17" /></button>
@@ -629,7 +662,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               <li>自动识别前，建议在“指定敏感词”中补充烟草专卖局、卷烟厂、供应商和人员名单。</li>
               <li>“临时调用”在每个任务结束后释放 UIE 内存；“模型常驻”适合连续处理大量文件，但空闲时仍占用约 0.9～1.5 GB 内存。</li>
               <li>新增或修改的识别标签会加密保存并立即加入本地词库，同时形成后续批量微调所需的训练样本。</li>
-              <li>PDF 扫描件请先 OCR；PDF 处理结果会重新排版，复杂公文建议优先使用 DOCX。</li>
+              <li>扫描 PDF 会自动调用容器内简体中文+英文 OCR，并显示当前页和百分比；PDF 处理结果会重新排版，复杂公文建议优先使用 DOCX。</li>
               <li>生产部署时必须修改环境文件中的 Django 密钥、映射加密密钥和数据库密码。</li>
               <li>AI 处理过程中不得删除、拆分或改写全角书名号包裹的匿名标记。</li>
             </ul>

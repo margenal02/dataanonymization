@@ -1,10 +1,15 @@
 import zipfile
 import re
+import shutil
+# Only fixed local OCR binaries are invoked with list arguments and without a shell.
+import subprocess  # nosec B404
+import tempfile
 from difflib import SequenceMatcher
 from pathlib import Path, PurePosixPath
 
 import xlrd
 from charset_normalizer import from_bytes
+from django.conf import settings
 from docx import Document
 from docx.oxml.ns import qn
 from lxml import etree
@@ -209,7 +214,76 @@ def process_xls(source, destination, transform):
         raise ProcessingError(f"XLS 文件解析失败：{exc}") from exc
 
 
-def _extract_pdf_text(source):
+def _notify_progress(progress_callback, **payload):
+    if progress_callback:
+        progress_callback(payload)
+
+
+def _ocr_pdf_page(source, page_number):
+    pdftoppm = shutil.which("pdftoppm")
+    tesseract = shutil.which("tesseract")
+    if not pdftoppm or not tesseract:
+        raise ProcessingError("扫描 PDF 需要本地 OCR 组件，请重新运行一键安装脚本更新后端镜像。")
+
+    dpi = max(72, min(300, int(getattr(settings, "PDF_OCR_DPI", 180))))
+    max_dimension = max(1200, min(5000, int(getattr(settings, "PDF_OCR_MAX_IMAGE_DIMENSION", 3508))))
+    timeout_seconds = max(30, min(600, int(getattr(settings, "PDF_OCR_PAGE_TIMEOUT_SECONDS", 180))))
+    languages = str(getattr(settings, "PDF_OCR_LANGUAGES", "chi_sim+eng"))
+    if not re.fullmatch(r"[A-Za-z0-9_+.-]{3,80}", languages):
+        raise ProcessingError("PDF_OCR_LANGUAGES 配置无效，只允许 OCR 语言代码及加号。")
+    with tempfile.TemporaryDirectory(prefix="data-ocr-") as directory:
+        image_prefix = Path(directory) / "page"
+        image_path = image_prefix.with_suffix(".png")
+        render_command = [
+            pdftoppm,
+            "-f", str(page_number),
+            "-l", str(page_number),
+            "-r", str(dpi),
+            "-scale-to", str(max_dimension),
+            "-png",
+            "-singlefile",
+            str(source),
+            str(image_prefix),
+        ]
+        try:
+            # The executable is resolved by fixed name and no shell is involved.
+            rendered = subprocess.run(  # nosec B603
+                render_command,
+                capture_output=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProcessingError(f"PDF 第 {page_number} 页渲染超过 {timeout_seconds} 秒，已停止 OCR。") from exc
+        if rendered.returncode != 0 or not image_path.exists():
+            detail = rendered.stderr.decode("utf-8", errors="replace").strip()[-300:]
+            raise ProcessingError(f"PDF 第 {page_number} 页渲染失败：{detail or '未生成页面图像'}")
+
+        ocr_command = [
+            tesseract,
+            str(image_path),
+            "stdout",
+            "-l", languages,
+            "--oem", "1",
+            "--psm", "3",
+        ]
+        try:
+            # The executable is resolved by fixed name and no shell is involved.
+            recognized = subprocess.run(  # nosec B603
+                ocr_command,
+                capture_output=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProcessingError(f"PDF 第 {page_number} 页 OCR 超过 {timeout_seconds} 秒，已停止处理。") from exc
+        if recognized.returncode != 0:
+            detail = recognized.stderr.decode("utf-8", errors="replace").strip()[-300:]
+            raise ProcessingError(f"PDF 第 {page_number} 页 OCR 失败：{detail or '识别程序返回错误'}")
+        return recognized.stdout.decode("utf-8", errors="replace").replace("\x0c", "").strip()
+
+
+def extract_pdf_pages(source, progress_callback=None):
     try:
         reader = PdfReader(source)
     except Exception as exc:
@@ -224,9 +298,57 @@ def _extract_pdf_text(source):
             raise
         except Exception as exc:
             raise ProcessingError("暂不支持带密码的 PDF 文件。") from exc
+    _notify_progress(
+        progress_callback,
+        percent=5,
+        stage="pdf_extract",
+        detail=f"正在检查 PDF 文本层，共 {len(reader.pages)} 页",
+        pdf_page_count=len(reader.pages),
+    )
     pages = [page.extract_text() or "" for page in reader.pages]
+    minimum_chars = int(getattr(settings, "PDF_OCR_MIN_TEXT_CHARS", 12))
+    ocr_indexes = [
+        index for index, page_text in enumerate(pages)
+        if len(re.sub(r"\s+", "", page_text)) < minimum_chars
+    ]
+    if ocr_indexes:
+        if not bool(getattr(settings, "PDF_OCR_ENABLED", True)):
+            page_list = "、".join(str(index + 1) for index in ocr_indexes[:8])
+            raise ProcessingError(f"PDF 第 {page_list} 页没有可提取文本，且本地 OCR 已关闭。")
+        max_pages = int(getattr(settings, "PDF_OCR_MAX_PAGES", 300))
+        if len(ocr_indexes) > max_pages:
+            raise ProcessingError(
+                f"PDF 需要 OCR 的页面为 {len(ocr_indexes)} 页，超过上限 {max_pages} 页，请拆分文件后处理。"
+            )
+        total_ocr_pages = len(ocr_indexes)
+        for completed, page_index in enumerate(ocr_indexes, start=1):
+            _notify_progress(
+                progress_callback,
+                percent=8 + int(47 * (completed - 1) / max(total_ocr_pages, 1)),
+                stage="pdf_ocr",
+                detail=f"本地 OCR 正在识别第 {page_index + 1}/{len(pages)} 页（OCR {completed}/{total_ocr_pages}）",
+                current_page=page_index + 1,
+                pdf_page_count=len(pages),
+                ocr_page_count=total_ocr_pages,
+            )
+            pages[page_index] = _ocr_pdf_page(source, page_index + 1)
+        _notify_progress(
+            progress_callback,
+            percent=55,
+            stage="pdf_ocr",
+            detail=f"本地 OCR 完成，共识别 {total_ocr_pages} 页",
+            pdf_page_count=len(pages),
+            ocr_page_count=total_ocr_pages,
+        )
+
+    max_characters = int(getattr(settings, "PDF_OCR_MAX_TOTAL_CHARS", 500000))
+    total_characters = sum(len(page) for page in pages)
+    if total_characters > max_characters:
+        raise ProcessingError(
+            f"PDF 提取及 OCR 文字共 {total_characters} 字符，超过上限 {max_characters}，请拆分文件后处理。"
+        )
     if not any(page.strip() for page in pages):
-        raise ProcessingError("PDF 未检测到可提取文本，扫描件请先进行 OCR。")
+        raise ProcessingError("PDF 本地 OCR 未识别出文字，请提高扫描清晰度或拆分后重试。")
     return pages
 
 
@@ -247,8 +369,8 @@ def _draw_wrapped_line(pdf, text, x, y, max_width, font_name, font_size, leading
     return y
 
 
-def process_pdf(source, destination, transform):
-    pages = _extract_pdf_text(source)
+def process_pdf(source, destination, transform, pages=None, progress_callback=None):
+    pages = pages if pages is not None else extract_pdf_pages(source, progress_callback)
     font_name = "STSong-Light"
     try:
         pdfmetrics.registerFont(UnicodeCIDFont(font_name))
@@ -261,6 +383,14 @@ def process_pdf(source, destination, transform):
     leading = 17
     pdf.setTitle(Path(destination).stem)
     for page_index, page_text in enumerate(pages):
+        _notify_progress(
+            progress_callback,
+            percent=72 + int(23 * (page_index + 1) / max(len(pages), 1)),
+            stage="pdf_write",
+            detail=f"正在生成安全 PDF，第 {page_index + 1}/{len(pages)} 页",
+            current_page=page_index + 1,
+            pdf_page_count=len(pages),
+        )
         if page_index:
             pdf.showPage()
         pdf.setFont(font_name, font_size)
@@ -338,11 +468,20 @@ PROCESSORS = {
 }
 
 
-def process_file(source, destination, transform):
+def process_file(source, destination, transform, *, pdf_pages=None, progress_callback=None):
     extension = Path(source).suffix.lower()
     if extension not in PROCESSORS:
         raise ProcessingError(f"不支持的文件格式：{extension}")
     Path(destination).parent.mkdir(parents=True, exist_ok=True)
-    PROCESSORS[extension](source, destination, transform)
+    if extension == ".pdf":
+        process_pdf(
+            source,
+            destination,
+            transform,
+            pages=pdf_pages,
+            progress_callback=progress_callback,
+        )
+    else:
+        PROCESSORS[extension](source, destination, transform)
     if not Path(destination).exists() or Path(destination).stat().st_size == 0:
         raise ProcessingError("处理结果为空，请检查源文件。")

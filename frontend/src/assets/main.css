@@ -108,6 +108,12 @@ textarea.form-control { resize: vertical; min-height: 95px; }
 .action-row { display: flex; align-items: center; justify-content: space-between; padding-top: 22px; margin-top: 21px; border-top: 1px solid #edf0ee; }
 .privacy-tip { display: flex; align-items: center; gap: 7px; color: #6e7b77; font-size: 10px; }
 .privacy-tip svg { color: var(--forest); }
+.task-progress { margin-top: 12px; padding: 12px 14px; color: #52625d; background: #f5f9f7; border: 1px solid #dce9e4; border-radius: 8px; }
+.task-progress > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 15px; font-size: 10px; }
+.task-progress strong { color: var(--forest); font-size: 11px; }
+.task-progress-track { height: 7px; margin-top: 8px; overflow: hidden; background: #dfe9e5; border-radius: 6px; }
+.task-progress-track i { display: block; height: 100%; min-width: 2px; background: linear-gradient(90deg, #2c7562, #62a88e); border-radius: inherit; transition: width .35s ease; }
+.task-progress small { display: block; margin-top: 7px; color: #7d8b87; font-size: 9px; }
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-size: 12px; border-radius: 7px; padding: 10px 17px; font-weight: 600; }
 .primary-btn { background: var(--forest); color: #fff; border: 1px solid var(--forest); }
 .primary-btn:hover { background: var(--forest-dark); color: #fff; }
@@ -172,6 +178,7 @@ textarea.form-control { resize: vertical; min-height: 95px; }
 .status-restored { color: #966421; background: #fbf1df; }
 .status-processing { color: #526d93; background: #edf2f8; }
 .status-failed { color: #a9483e; background: #faecea; }
+.history-progress { max-width: 240px; margin-top: 6px !important; color: #526d93 !important; line-height: 1.5; }
 .table-actions button { width: 30px; height: 30px; display: inline-grid; place-items: center; border: 1px solid #dfe5e1; color: var(--forest); background: #fff; border-radius: 6px; margin-left: 5px; }
 .table-actions button:hover { background: var(--forest-soft); }
 .table-actions button.amber { color: var(--amber); }
