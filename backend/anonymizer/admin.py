@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import AnonymizationTask, RecognitionLabel, TrainingExample
+from .models import AnonymizationTask, RecognitionLabel, TrainingDocument, TrainingExample
 
 
 @admin.register(AnonymizationTask)
@@ -22,3 +22,10 @@ class TrainingExampleAdmin(admin.ModelAdmin):
     list_display = ("id", "label", "action", "created_at")
     list_filter = ("action", "created_at")
     readonly_fields = ("id", "label", "action", "payload_ciphertext", "created_at")
+
+
+@admin.register(TrainingDocument)
+class TrainingDocumentAdmin(admin.ModelAdmin):
+    list_display = ("original_name", "file_type", "status", "created_at", "updated_at")
+    list_filter = ("status", "file_type", "created_at")
+    readonly_fields = ("id", "preview_ciphertext", "annotations_ciphertext", "created_at", "updated_at")

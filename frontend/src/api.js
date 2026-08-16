@@ -59,10 +59,26 @@ export const api = {
     return request(`/tasks/${taskId}/restore/`, { method: 'POST', body: form })
   },
   getTaskReview: taskId => request(`/tasks/${taskId}/review/`),
-  applyTaskReview: (taskId, additions, selectedEntities) => request(`/tasks/${taskId}/review/`, {
+  applyTaskReview: (taskId, additions, selectedEntities, aliasGroups = []) => request(`/tasks/${taskId}/review/`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ additions, selected_entities: selectedEntities })
+    body: JSON.stringify({ additions, selected_entities: selectedEntities, alias_groups: aliasGroups })
+  }),
+  listTrainingDocuments: () => request('/training/documents/'),
+  getTrainingDocument: documentId => request(`/training/documents/${documentId}/`),
+  uploadTrainingDocument(file) {
+    const form = new FormData()
+    form.append('file', file)
+    return request('/training/documents/', { method: 'POST', body: form })
+  },
+  saveTrainingAnnotations: (documentId, additions, selectedEntities, aliasGroups = []) => request(`/training/documents/${documentId}/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ additions, selected_entities: selectedEntities, alias_groups: aliasGroups })
+  }),
+  deleteTrainingDocument: documentId => request(`/training/documents/${documentId}/`, {
+    method: 'DELETE',
+    headers: { 'X-Training-Delete-Confirm': documentId }
   }),
   deleteTask: taskId => request(`/tasks/${taskId}/`, {
     method: 'DELETE',

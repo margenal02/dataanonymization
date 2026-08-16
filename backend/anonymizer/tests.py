@@ -21,7 +21,7 @@ from reportlab.pdfgen import canvas
 
 from .file_processors import ProcessingError, process_file
 from .crypto import decrypt_mapping
-from .models import AnonymizationTask, RecognitionLabel, TrainingExample
+from .models import AnonymizationTask, RecognitionLabel, TrainingDocument, TrainingExample
 from .paddlenlp_compat import ensure_aistudio_download_compatibility
 from .ppstructure_worker import _build_pipeline as build_ppstructure_pipeline
 from .ppstructure_worker import _extract_text as extract_ppstructure_text
@@ -105,6 +105,17 @@ class MappingBuilderTests(TestCase):
         self.assertIsNone(builder.register_detected("工作人员", "person"))
         self.assertIsNone(builder.register_detected("文山雨露", "person"))
         self.assertEqual(builder.counts(), {"人名": 1})
+
+    def test_reviewed_aliases_share_one_token_and_restore_to_canonical_name(self):
+        builder = MappingBuilder("alias123", ["organization"])
+        builder.register("陆良复烤厂", "organization")
+        builder.register("陆良厂", "organization")
+        token = builder.merge_aliases("陆良复烤厂", ["陆良复烤厂", "陆良厂"])
+
+        anonymized = builder.anonymize("陆良复烤厂安排陆良厂复核。")
+        self.assertEqual(anonymized.count(token), 2)
+        self.assertEqual(builder.counts(), {"单位": 1})
+        self.assertEqual(restore_text(anonymized, builder.export()), "陆良复烤厂安排陆良复烤厂复核。")
 
     def test_detects_tobacco_alias_product_and_location_without_false_person(self):
         source = "山东中烟在文山产区生产品牌：文山雨露。"
@@ -527,6 +538,76 @@ class TaskApiTests(TestCase):
         self.assertIn("中国烟草总公司", anonymized)
         self.assertNotIn("张三", anonymized)
         self.assertNotIn("星辰一号", anonymized)
+
+    @override_settings(UIE_ENABLED=False)
+    def test_full_preview_marks_all_occurrences_and_suggests_reviewed_alias_merge(self):
+        source = "委托单位：陆良复烤厂。后续由陆良厂负责，陆良厂提交报告。"
+        upload = SimpleUploadedFile("陆良复烤厂报告.txt", source.encode("utf-8"), content_type="text/plain")
+        response = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["organization"]),
+            "review_required": "true",
+        })
+        self.assertEqual(response.status_code, 201, response.content)
+        task_id = response.json()["id"]
+        review = self.client.get(f"/api/tasks/{task_id}/review/").json()
+
+        self.assertIn("陆良厂", [item["text"] for item in review["entities"]])
+        group = next(item for item in review["alias_groups"] if "陆良厂" in item["members"])
+        preview_spans = [span for section in review["preview"] for span in section["spans"]]
+        self.assertEqual(sum(span["text"] == "陆良厂" for span in preview_spans), 2)
+
+        selected = [
+            {"token": item["token"], "text": item["text"], "category": item["category"]}
+            for item in review["entities"]
+        ]
+        confirmed = self.client.post(
+            f"/api/tasks/{task_id}/review/",
+            {
+                "selected_entities": selected,
+                "alias_groups": [dict(group, accepted=True, canonical="陆良复烤厂")],
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.content)
+        download = self.client.get(confirmed.json()["task"]["anonymized_download_url"])
+        anonymized = b"".join(download.streaming_content).decode("utf-8")
+        self.assertEqual(anonymized.count("【单001】"), 3)
+
+    @override_settings(UIE_ENABLED=False)
+    def test_training_document_machine_prelabel_human_save_and_jsonl_export(self):
+        source = "单位：中国烟草总公司。联系人：张三。"
+        upload = SimpleUploadedFile("训练样本.txt", source.encode("utf-8"), content_type="text/plain")
+        response = self.client.post("/api/training/documents/", {"file": upload})
+        self.assertEqual(response.status_code, 201, response.content)
+        document = response.json()
+        self.assertEqual(document["status"], "ready")
+        self.assertTrue(document["preview"])
+        selected = [
+            {"text": item["text"], "category": item["category"]}
+            for item in document["entities"]
+        ]
+        saved = self.client.post(
+            f"/api/training/documents/{document['id']}/",
+            {"selected_entities": selected, "additions": "单位|陆良厂"},
+            content_type="application/json",
+        )
+        self.assertEqual(saved.status_code, 200, saved.content)
+        self.assertEqual(saved.json()["status"], "labeled")
+        self.assertTrue(RecognitionLabel.objects.filter(is_active=True).exists())
+        self.assertTrue(TrainingExample.objects.filter(action="annotated").exists())
+        exported = self.client.get("/api/training/export/")
+        self.assertEqual(exported.status_code, 200)
+        self.assertIn("result_list", exported.content.decode("utf-8"))
+        self.assertTrue(TrainingDocument.objects.filter(id=document["id"]).exists())
+        training_folder = Path(self.media_directory) / "training" / document["id"]
+        self.assertTrue(training_folder.exists())
+        deleted = self.client.delete(
+            f"/api/training/documents/{document['id']}/",
+            HTTP_X_TRAINING_DELETE_CONFIRM=document["id"],
+        )
+        self.assertEqual(deleted.status_code, 204)
+        self.assertFalse(training_folder.exists())
 
     def test_training_labels_are_encrypted_versioned_and_used_by_later_tasks(self):
         response = self.client.post("/api/labels/", {"text": "李作英", "category": "person"}, content_type="application/json")

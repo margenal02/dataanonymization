@@ -5,7 +5,7 @@ from pathlib import Path
 
 from django.conf import settings
 from django.core.files import File
-from django.http import FileResponse
+from django.http import FileResponse, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
@@ -21,8 +21,14 @@ from .file_processors import (
     process_file,
     validate_upload_content,
 )
-from .models import AnonymizationTask, RecognitionLabel, TrainingExample
-from .recognizer import CATEGORY_LABELS, DEFAULT_CATEGORIES, MappingBuilder, restore_text
+from .models import AnonymizationTask, RecognitionLabel, TrainingDocument, TrainingExample
+from .recognizer import (
+    CATEGORY_LABELS,
+    DEFAULT_CATEGORIES,
+    MappingBuilder,
+    restore_text,
+    suggest_organization_alias_groups,
+)
 from .serializers import TaskSerializer
 from .training_data import (
     active_custom_entities,
@@ -30,6 +36,7 @@ from .training_data import (
     deactivate_label,
     label_to_dict,
     record_rejected_entities,
+    record_document_annotations,
     save_task_custom_entities,
     update_label,
 )
@@ -122,21 +129,19 @@ def _sha256(upload):
 
 def _collect_text_chunks(source, task_id, progress_callback=None):
     chunks = []
-    seen = set()
     total_chars = 0
     extension = Path(source).suffix.lower()
 
     def collect(text):
         nonlocal total_chars
         value = str(text or "").strip()
-        if not value or value in seen:
+        if not value:
             return text
         total_chars += len(value)
         if total_chars > settings.UIE_MAX_TOTAL_CHARS:
             raise ProcessingError(
                 f"文件可识别文字超过 UIE 上限 {settings.UIE_MAX_TOTAL_CHARS} 字符，请拆分文件后处理。"
             )
-        seen.add(value)
         chunks.append(value)
         return text
 
@@ -233,7 +238,71 @@ def _build_review_contexts(mapping, text_chunks, file_type, filename_stem, model
     return contexts
 
 
-def _process_task(task, categories, uie_mode, combined_custom, excluded_entities=None, await_review=False):
+def _build_review_preview(mapping, text_chunks, file_type, filename_stem):
+    """Build an encrypted full-text preview with non-overlapping entity spans."""
+    original_to_token = mapping.get("original_to_token") or {
+        original: token for token, original in mapping.get("token_to_original", {}).items()
+        if token.startswith("【")
+    }
+    token_categories = mapping.get("token_categories", {})
+    values = sorted(
+        ((original, token) for original, token in original_to_token.items() if original and token.startswith("【")),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    sections = []
+    source_sections = [
+        {
+            "location": f"第 {index + 1} 页" if file_type == "pdf" else f"文本片段 {index + 1}",
+            "text": chunk,
+        }
+        for index, chunk in enumerate(text_chunks)
+    ]
+    if filename_stem:
+        source_sections.insert(0, {"location": "文件名", "text": filename_stem})
+    for section_index, section in enumerate(source_sections):
+        text = section["text"]
+        candidates = []
+        for original, token in values:
+            start_at = 0
+            while True:
+                position = text.find(original, start_at)
+                if position < 0:
+                    break
+                candidates.append({
+                    "start": position,
+                    "end": position + len(original),
+                    "text": original,
+                    "token": token,
+                    "category": token_categories.get(token, "custom"),
+                })
+                start_at = position + max(1, len(original))
+        occupied = set()
+        spans = []
+        for candidate in sorted(candidates, key=lambda item: (-(item["end"] - item["start"]), item["start"])):
+            positions = set(range(candidate["start"], candidate["end"]))
+            if positions & occupied:
+                continue
+            occupied.update(positions)
+            spans.append(candidate)
+        sections.append({
+            "index": section_index,
+            "location": section["location"],
+            "text": text,
+            "spans": sorted(spans, key=lambda item: item["start"]),
+        })
+    return sections
+
+
+def _process_task(
+    task,
+    categories,
+    uie_mode,
+    combined_custom,
+    excluded_entities=None,
+    await_review=False,
+    accepted_alias_groups=None,
+):
     options = dict(task.options or {})
     task.status = AnonymizationTask.Status.PROCESSING
 
@@ -281,7 +350,7 @@ def _process_task(task, categories, uie_mode, combined_custom, excluded_entities
     if settings.UIE_ENABLED and set(categories) & {"person", "organization", "address", "location", "product"}:
         report_progress({"percent": 60, "stage": "uie", "detail": "正在使用 UIE-base 复核敏感信息"})
         model_entities, rejected_count = _select_model_entities(
-            builder, predict_entities(recognition_chunks, categories, uie_mode)
+            builder, predict_entities(list(dict.fromkeys(recognition_chunks)), categories, uie_mode)
         )
         for entity in model_entities:
             if builder.register_detected(entity.get("text"), entity.get("category")):
@@ -291,6 +360,27 @@ def _process_task(task, categories, uie_mode, combined_custom, excluded_entities
                 }
         options["uie_rejected_count"] = rejected_count
     options["uie_detected_count"] = model_entity_count
+
+    alias_suggestions = suggest_organization_alias_groups(builder, searchable_text)
+    applied_alias_groups = []
+    for group in accepted_alias_groups or []:
+        if not isinstance(group, dict):
+            continue
+        canonical = str(group.get("canonical", "")).strip()
+        members = [str(item).strip() for item in group.get("members", []) if str(item).strip()]
+        if canonical and canonical in members:
+            token = builder.merge_aliases(canonical, members, group.get("category", "organization"))
+            if token:
+                applied_alias_groups.append({
+                    "id": str(group.get("id", "")),
+                    "category": group.get("category", "organization"),
+                    "canonical": canonical,
+                    "members": list(dict.fromkeys(members)),
+                    "reason": str(group.get("reason", "人工确认同一实体")),
+                    "confidence": float(group.get("confidence", 1.0) or 1.0),
+                    "accepted": True,
+                    "token": token,
+                })
 
     anonymized_stem = builder.anonymize_filename_stem(Path(task.original_name).stem)
     if await_review:
@@ -326,6 +416,8 @@ def _process_task(task, categories, uie_mode, combined_custom, excluded_entities
         model_metadata,
         custom_keys,
     )
+    mapping["review_preview"] = _build_review_preview(mapping, text_chunks, task.file_type, filename_stem)
+    mapping["alias_suggestions"] = applied_alias_groups or alias_suggestions
     task.mapping_ciphertext = encrypt_mapping(mapping)
     task.entity_counts = builder.counts()
     task.task_name = _task_name(anonymized_stem)
@@ -393,6 +485,201 @@ def label_detail(request, label_id):
     except ValueError as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
     return Response(label_to_dict(label))
+
+
+def _training_document_summary(document):
+    annotation_count = 0
+    if document.annotations_ciphertext:
+        try:
+            annotation_count = len(decrypt_mapping(document.annotations_ciphertext).get("entities", []))
+        except ValueError:
+            annotation_count = 0
+    return {
+        "id": str(document.id),
+        "original_name": document.original_name,
+        "file_type": document.file_type,
+        "file_size": document.file_size,
+        "status": document.status,
+        "status_label": document.get_status_display(),
+        "annotation_count": annotation_count,
+        "error_message": document.error_message,
+        "created_at": document.created_at,
+        "updated_at": document.updated_at,
+    }
+
+
+def _training_document_payload(document):
+    payload = _training_document_summary(document)
+    if document.preview_ciphertext:
+        preview_mapping = decrypt_mapping(document.preview_ciphertext)
+        payload.update({
+            "preview": preview_mapping.get("review_preview", []),
+            "entities": _review_entities(preview_mapping),
+            "alias_groups": preview_mapping.get("alias_suggestions", []),
+        })
+    else:
+        payload.update({"preview": [], "entities": [], "alias_groups": []})
+    if document.annotations_ciphertext:
+        payload["annotations"] = decrypt_mapping(document.annotations_ciphertext)
+    return payload
+
+
+def _prepare_training_document(document):
+    chunks, _ = _collect_text_chunks(document.source_file.path, document.id)
+    filename_stem = Path(document.original_name).stem
+    recognition_chunks = list(chunks)
+    if filename_stem:
+        recognition_chunks.append(filename_stem)
+    searchable_text = "\n".join(recognition_chunks)
+    learned = active_custom_entities()
+    builder = MappingBuilder(str(document.id), DEFAULT_CATEGORIES, learned)
+    for chunk in recognition_chunks:
+        builder.discover(chunk)
+    model_metadata = {}
+    if settings.UIE_ENABLED:
+        model_entities, _ = _select_model_entities(
+            builder,
+            predict_entities(list(dict.fromkeys(recognition_chunks)), DEFAULT_CATEGORIES, "on_demand"),
+        )
+        for entity in model_entities:
+            if builder.register_detected(entity.get("text"), entity.get("category")):
+                model_metadata[(entity.get("text"), entity.get("category"))] = {
+                    "probability": round(float(entity.get("probability", 0.0)), 4),
+                }
+    alias_suggestions = suggest_organization_alias_groups(builder, searchable_text)
+    mapping = builder.export()
+    custom_keys = {(item["text"], item["category"]) for item in learned}
+    mapping["review_contexts"] = _build_review_contexts(
+        mapping, chunks, document.file_type, filename_stem, model_metadata, custom_keys,
+    )
+    mapping["review_preview"] = _build_review_preview(mapping, chunks, document.file_type, filename_stem)
+    mapping["alias_suggestions"] = alias_suggestions
+    document.preview_ciphertext = encrypt_mapping(mapping)
+    document.status = TrainingDocument.Status.READY
+    document.error_message = ""
+    document.save(update_fields=["preview_ciphertext", "status", "error_message", "updated_at"])
+
+
+@api_view(["GET", "POST"])
+@parser_classes([MultiPartParser, FormParser])
+def training_document_collection(request):
+    if request.method == "GET":
+        return Response({
+            "documents": [_training_document_summary(item) for item in TrainingDocument.objects.all()[:100]],
+            "labeled_count": TrainingDocument.objects.filter(status=TrainingDocument.Status.LABELED).count(),
+        })
+    upload = request.FILES.get("file")
+    error = _validate_upload(upload)
+    if error:
+        return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
+    original_name = _safe_name(upload.name)
+    document = TrainingDocument.objects.create(
+        original_name=original_name,
+        file_type=Path(original_name).suffix.lower().lstrip("."),
+        file_size=upload.size,
+        sha256=_sha256(upload),
+        source_file=upload,
+    )
+    try:
+        _prepare_training_document(document)
+    except Exception as exc:
+        document.status = TrainingDocument.Status.FAILED
+        document.error_message = str(exc) if isinstance(exc, (ProcessingError, UIEProcessingError, ValueError)) else "文档预标失败，请查看后端日志。"
+        document.save(update_fields=["status", "error_message", "updated_at"])
+        return Response(_training_document_summary(document), status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+    return Response(_training_document_payload(document), status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "POST", "DELETE"])
+def training_document_detail(request, document_id):
+    document = get_object_or_404(TrainingDocument, id=document_id)
+    if request.method == "DELETE":
+        if request.headers.get("X-Training-Delete-Confirm") != str(document.id):
+            return Response({"detail": "缺少有效的删除确认信息。"}, status=status.HTTP_400_BAD_REQUEST)
+        document.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    if request.method == "GET":
+        try:
+            return Response(_training_document_payload(document))
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+
+    if not document.preview_ciphertext:
+        return Response({"detail": "该文档尚未完成机器预标。"}, status=status.HTTP_409_CONFLICT)
+    mapping = decrypt_mapping(document.preview_ciphertext)
+    known = {(item["text"], item["category"]) for item in _review_entities(mapping)}
+    known_texts = {item[0] for item in known}
+    selected = []
+    for item in request.data.get("selected_entities", []):
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text", "")).strip()
+        category = str(item.get("category", "custom"))
+        if text in known_texts and category in {*DEFAULT_CATEGORIES, "custom"}:
+            selected.append({"text": text, "category": category})
+    additions = _custom_entities(request.data.get("additions", ""))
+    final_entities = list({
+        (item["category"], item["text"]): item for item in [*selected, *additions]
+    }.values())
+    if not final_entities:
+        return Response({"detail": "请至少保留或补充一个有效标注。"}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        for item in final_entities:
+            create_or_reactivate_label(item["text"], item["category"], source="annotation")
+        record_document_annotations(final_entities, document.id, mapping.get("review_preview", []))
+        rejected = [
+            {"text": text, "category": category}
+            for text, category in known
+            if (text, category) not in {(item["text"], item["category"]) for item in selected}
+        ]
+        if rejected:
+            record_rejected_entities(rejected, document.id)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    document.annotations_ciphertext = encrypt_mapping({
+        "entities": final_entities,
+        "alias_groups": request.data.get("alias_groups", []),
+        "saved_at": timezone.now().isoformat(),
+    })
+    document.status = TrainingDocument.Status.LABELED
+    document.save(update_fields=["annotations_ciphertext", "status", "updated_at"])
+    return Response(_training_document_payload(document))
+
+
+@api_view(["GET"])
+def training_dataset_export(request):
+    lines = []
+    prompt_labels = {key: value for key, value in CATEGORY_LABELS.items()}
+    for document in TrainingDocument.objects.filter(status=TrainingDocument.Status.LABELED):
+        if not document.preview_ciphertext or not document.annotations_ciphertext:
+            continue
+        preview = decrypt_mapping(document.preview_ciphertext).get("review_preview", [])
+        entities = decrypt_mapping(document.annotations_ciphertext).get("entities", [])
+        for section in preview:
+            content = str(section.get("text", ""))
+            by_category = {}
+            for entity in entities:
+                text = str(entity.get("text", ""))
+                category = str(entity.get("category", "custom"))
+                start_at = 0
+                while text:
+                    start = content.find(text, start_at)
+                    if start < 0:
+                        break
+                    by_category.setdefault(category, []).append({
+                        "text": text, "start": start, "end": start + len(text),
+                    })
+                    start_at = start + len(text)
+            for category, results in by_category.items():
+                lines.append(json.dumps({
+                    "content": content,
+                    "prompt": prompt_labels.get(category, CATEGORY_LABELS["custom"]),
+                    "result_list": results,
+                }, ensure_ascii=False))
+    body = "\n".join(lines) + ("\n" if lines else "")
+    response = HttpResponse(body, content_type="application/jsonl; charset=utf-8")
+    response["Content-Disposition"] = 'attachment; filename="uie-training-dataset.jsonl"'
+    return response
 
 
 @api_view(["GET", "POST"])
@@ -467,21 +754,67 @@ def task_detail(request, task_id):
 def _review_entities(mapping):
     categories = mapping.get("token_categories", {})
     context_map = mapping.get("review_contexts", {})
+    original_to_token = mapping.get("original_to_token") or {
+        text: token for token, text in mapping.get("token_to_original", {}).items()
+        if token.startswith("【")
+    }
+    aliases = mapping.get("alias_to_canonical", {})
+    suggestion_members = {
+        member
+        for group in mapping.get("alias_suggestions", [])
+        if isinstance(group, dict) and not group.get("accepted")
+        for member in group.get("members", [])[1:]
+    }
     entities = []
-    for token, text in mapping.get("token_to_original", {}).items():
+    for text, token in original_to_token.items():
         if not token.startswith("【"):
             continue
         category = categories.get(token, "custom")
+        context = context_map.get(token, {})
+        occurrences = []
+        for section in mapping.get("review_preview", []):
+            for span in section.get("spans", []):
+                if span.get("text") != text:
+                    continue
+                start = int(span.get("start", 0))
+                end = int(span.get("end", start))
+                section_text = str(section.get("text", ""))
+                occurrences.append({
+                    "prefix": re.sub(r"\s+", " ", section_text[max(0, start - 70):start]).strip(),
+                    "match": text,
+                    "suffix": re.sub(r"\s+", " ", section_text[end:end + 70]).strip(),
+                    "location": section.get("location", "原文"),
+                })
+                if len(occurrences) >= 3:
+                    break
+            if len(occurrences) >= 3:
+                break
         entities.append({
+            "key": f"{token}::{text}",
             "token": token,
             "text": text,
             "category": category,
             "category_label": CATEGORY_LABELS.get(category, CATEGORY_LABELS["custom"]),
-            "source": context_map.get(token, {}).get("source", "rule"),
-            "probability": context_map.get(token, {}).get("probability"),
-            "occurrences": context_map.get(token, {}).get("occurrences", []),
+            "source": "alias" if text in suggestion_members else context.get("source", "rule"),
+            "probability": context.get("probability"),
+            "occurrences": occurrences or context.get("occurrences", []),
+            "canonical": aliases.get(text, text),
+            "is_alias": text in aliases,
         })
-    return sorted(entities, key=lambda item: (item["category_label"], item["token"]))
+    return sorted(entities, key=lambda item: (item["category_label"], item["token"], item["text"]))
+
+
+def _review_payload(task, mapping, request, excluded_count=None):
+    return {
+        "task": TaskSerializer(task, context={"request": request}).data,
+        "entities": _review_entities(mapping),
+        "preview": mapping.get("review_preview", []),
+        "alias_groups": mapping.get("alias_suggestions", []),
+        "excluded_count": (
+            len(mapping.get("review_exclusions", []))
+            if excluded_count is None else excluded_count
+        ),
+    }
 
 
 @api_view(["GET", "POST"])
@@ -495,21 +828,24 @@ def task_review(request, task_id):
         return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
 
     if request.method == "GET":
-        return Response({
-            "task": TaskSerializer(task, context={"request": request}).data,
-            "entities": _review_entities(mapping),
-            "excluded_count": len(mapping.get("review_exclusions", [])),
-        })
+        return Response(_review_payload(task, mapping, request))
 
     additions = _custom_entities(request.data.get("additions", ""))
     remove_tokens = request.data.get("remove_tokens", [])
     if not isinstance(remove_tokens, list):
         return Response({"detail": "误识别标记必须是列表。"}, status=status.HTTP_400_BAD_REQUEST)
     token_to_original = mapping.get("token_to_original", {})
+    original_to_token = mapping.get("original_to_token") or {
+        text: token for token, text in token_to_original.items() if token.startswith("【")
+    }
     token_categories = mapping.get("token_categories", {})
-    entity_tokens = [token for token in token_to_original if token.startswith("【")]
+    entity_rows = [
+        (text, token, token_categories.get(token, "custom"))
+        for text, token in original_to_token.items() if token.startswith("【")
+    ]
+    entity_tokens = [row[1] for row in entity_rows]
     selected_payload = request.data.get("selected_entities")
-    selected_by_token = {}
+    selected_by_key = {}
     if selected_payload is not None:
         if not isinstance(selected_payload, list):
             return Response({"detail": "已选识别项必须是列表。"}, status=status.HTTP_400_BAD_REQUEST)
@@ -519,25 +855,30 @@ def task_review(request, task_id):
             token = str(item.get("token", ""))
             category = str(item.get("category", token_categories.get(token, "custom")))
             if token in entity_tokens and category in {*DEFAULT_CATEGORIES, "custom"}:
-                selected_by_token[token] = category
+                text = str(item.get("text", "")).strip()
+                if text:
+                    selected_by_key[(token, text)] = category
+                else:
+                    for row_text, row_token, _ in entity_rows:
+                        if row_token == token:
+                            selected_by_key[(token, row_text)] = category
     else:
         removed_set = set(remove_tokens)
-        selected_by_token = {
-            token: token_categories.get(token, "custom")
-            for token in entity_tokens
+        selected_by_key = {
+            (token, text): category
+            for text, token, category in entity_rows
             if token not in removed_set
         }
 
     removals = []
     category_corrections = []
-    for token in entity_tokens:
-        old_category = token_categories.get(token, "custom")
-        selected_category = selected_by_token.get(token)
+    for text, token, old_category in entity_rows:
+        selected_category = selected_by_key.get((token, text))
         if selected_category is None or selected_category != old_category:
-            removals.append({"text": token_to_original[token], "category": old_category})
+            removals.append({"text": text, "category": old_category})
         if selected_category is not None and selected_category != old_category:
             category_corrections.append({
-                "text": token_to_original[token],
+                "text": text,
                 "category": selected_category,
             })
     additions = list({
@@ -545,8 +886,40 @@ def task_review(request, task_id):
         for item in [*additions, *category_corrections]
     }.values())
 
+    requested_alias_groups = request.data.get("alias_groups", [])
+    accepted_alias_groups = []
+    known_groups = {
+        str(group.get("id")): group
+        for group in mapping.get("alias_suggestions", []) if isinstance(group, dict)
+    }
+    if isinstance(requested_alias_groups, list):
+        selected_texts = {text for (_, text) in selected_by_key}
+        for requested in requested_alias_groups:
+            if not isinstance(requested, dict) or not requested.get("accepted"):
+                continue
+            known = known_groups.get(str(requested.get("id")))
+            if not known:
+                continue
+            members = [str(item) for item in known.get("members", [])]
+            canonical = str(requested.get("canonical") or known.get("canonical", ""))
+            if canonical in members and all(member in selected_texts for member in members):
+                accepted = dict(known, canonical=canonical, accepted=True)
+                accepted_alias_groups.append(accepted)
+                additions.extend({"text": member, "category": known.get("category", "organization")} for member in members)
+    additions = list({
+        (item["category"], item["text"]): item for item in additions
+    }.values())
+
     try:
-        save_task_custom_entities(additions)
+        confirmed_semantic_entities = [
+            {"text": text, "category": category}
+            for (token, text), category in selected_by_key.items()
+            if category in {"organization", "person", "product", "location", "address"}
+        ]
+        save_task_custom_entities(list({
+            (item["category"], item["text"]): item
+            for item in [*additions, *confirmed_semantic_entities]
+        }.values()))
         previous_exclusions = [
             item for item in mapping.get("review_exclusions", []) if isinstance(item, dict)
         ]
@@ -566,7 +939,15 @@ def task_review(request, task_id):
             if item in DEFAULT_CATEGORIES
         ]
         uie_mode = (task.options or {}).get("uie_mode", "on_demand")
-        _process_task(task, categories, uie_mode, combined_custom, excluded_entities, await_review=False)
+        _process_task(
+            task,
+            categories,
+            uie_mode,
+            combined_custom,
+            excluded_entities,
+            await_review=False,
+            accepted_alias_groups=accepted_alias_groups,
+        )
         if removals:
             record_rejected_entities(removals, task.id)
         for field_name in ("restore_input_file", "restored_file"):
@@ -579,11 +960,12 @@ def task_review(request, task_id):
     except Exception:
         return Response({"detail": "校正后重新处理失败，请查看后端日志。"}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
-    return Response({
-        "task": TaskSerializer(task, context={"request": request}).data,
-        "entities": _review_entities(decrypt_mapping(task.mapping_ciphertext)),
-        "excluded_count": len(excluded_entities),
-    })
+    return Response(_review_payload(
+        task,
+        decrypt_mapping(task.mapping_ciphertext),
+        request,
+        excluded_count=len(excluded_entities),
+    ))
 
 
 @api_view(["POST"])

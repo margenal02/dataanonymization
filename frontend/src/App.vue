@@ -28,10 +28,20 @@ const editingLabel = ref({ text: '', category: 'person' })
 const labelLoading = ref(false)
 const reviewOpen = ref(false)
 const reviewLoading = ref(false)
-const reviewData = ref({ entities: [], excluded_count: 0 })
+const reviewData = ref({ entities: [], preview: [], alias_groups: [], excluded_count: 0 })
 const reviewAdditions = ref('')
 const reviewSelectedTokens = ref([])
 const reviewCategories = ref({})
+const reviewAliasChoices = ref({})
+const trainingDocuments = ref([])
+const trainingDocumentFile = ref(null)
+const activeTrainingDocument = ref(null)
+const trainingDocumentLoading = ref(false)
+const trainingSelectedKeys = ref([])
+const trainingCategories = ref({})
+const trainingAdditions = ref('')
+const trainingSelection = ref('')
+const trainingSelectionCategory = ref('organization')
 const processingProgress = ref(null)
 const selectedCategories = ref(['organization', 'person', 'product', 'location', 'phone', 'id_card', 'email', 'address'])
 
@@ -133,6 +143,15 @@ async function refreshLabels() {
     const data = await api.listLabels()
     trainingLabels.value = data.labels || []
     trainingExampleCount.value = data.training_example_count || 0
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+async function refreshTrainingDocuments() {
+  try {
+    const data = await api.listTrainingDocuments()
+    trainingDocuments.value = data.documents || []
   } catch (e) {
     error.value = e.message
   }
@@ -273,12 +292,19 @@ async function openReview(task = result.value) {
   reviewAdditions.value = ''
   reviewSelectedTokens.value = []
   reviewCategories.value = {}
+  reviewAliasChoices.value = {}
   error.value = ''
   try {
     reviewData.value = await api.getTaskReview(task.id)
-    reviewSelectedTokens.value = reviewData.value.entities.map(entity => entity.token)
+    reviewSelectedTokens.value = reviewData.value.entities.map(entity => entity.key)
     reviewCategories.value = Object.fromEntries(
-      reviewData.value.entities.map(entity => [entity.token, entity.category])
+      reviewData.value.entities.map(entity => [entity.key, entity.category])
+    )
+    reviewAliasChoices.value = Object.fromEntries(
+      (reviewData.value.alias_groups || []).map(group => [group.id, {
+        accepted: Boolean(group.accepted),
+        canonical: group.canonical
+      }])
     )
   } catch (e) {
     error.value = e.message
@@ -297,17 +323,29 @@ async function applyReview() {
       result.value.id,
       reviewAdditions.value,
       reviewData.value.entities
-        .filter(entity => reviewSelectedTokens.value.includes(entity.token))
+        .filter(entity => reviewSelectedTokens.value.includes(entity.key))
         .map(entity => ({
           token: entity.token,
-          category: reviewCategories.value[entity.token] || entity.category
-        }))
+          text: entity.text,
+          category: reviewCategories.value[entity.key] || entity.category
+        })),
+      (reviewData.value.alias_groups || []).map(group => ({
+        ...group,
+        accepted: Boolean(reviewAliasChoices.value[group.id]?.accepted),
+        canonical: reviewAliasChoices.value[group.id]?.canonical || group.canonical
+      }))
     )
     result.value = reviewData.value.task
     reviewAdditions.value = ''
-    reviewSelectedTokens.value = reviewData.value.entities.map(entity => entity.token)
+    reviewSelectedTokens.value = reviewData.value.entities.map(entity => entity.key)
     reviewCategories.value = Object.fromEntries(
-      reviewData.value.entities.map(entity => [entity.token, entity.category])
+      reviewData.value.entities.map(entity => [entity.key, entity.category])
+    )
+    reviewAliasChoices.value = Object.fromEntries(
+      (reviewData.value.alias_groups || []).map(group => [group.id, {
+        accepted: Boolean(group.accepted),
+        canonical: group.canonical
+      }])
     )
     await Promise.all([refreshData(), refreshLabels()])
   } catch (e) {
@@ -318,7 +356,7 @@ async function applyReview() {
 }
 
 function selectAllReviewCandidates() {
-  reviewSelectedTokens.value = reviewData.value.entities.map(entity => entity.token)
+  reviewSelectedTokens.value = reviewData.value.entities.map(entity => entity.key)
 }
 
 function clearReviewCandidates() {
@@ -330,7 +368,131 @@ function reviewSourceLabel(entity) {
     return entity.probability ? `模型 ${(entity.probability * 100).toFixed(0)}%` : '模型候选'
   }
   if (entity.source === 'label') return '本地标签'
+  if (entity.source === 'alias') return '简称候选'
   return '规则识别'
+}
+
+function previewSegments(section, entities, selectedKeys) {
+  const entityMap = Object.fromEntries((entities || []).map(entity => [entity.key, entity]))
+  const segments = []
+  let cursor = 0
+  for (const span of [...(section.spans || [])].sort((a, b) => a.start - b.start)) {
+    if (span.start > cursor) segments.push({ text: section.text.slice(cursor, span.start), plain: true })
+    const key = `${span.token}::${span.text}`
+    const entity = entityMap[key]
+    segments.push({
+      text: section.text.slice(span.start, span.end),
+      key,
+      token: span.token,
+      category: entity?.category || span.category,
+      selected: selectedKeys.includes(key),
+      title: `${entity?.category_label || span.category} · ${span.token}`
+    })
+    cursor = span.end
+  }
+  if (cursor < section.text.length) segments.push({ text: section.text.slice(cursor), plain: true })
+  return segments
+}
+
+function fileFromTrainingEvent(event) {
+  trainingDocumentFile.value = event.target.files?.[0] || event.dataTransfer?.files?.[0] || null
+}
+
+function initializeTrainingSelection(document) {
+  activeTrainingDocument.value = document
+  const savedEntities = document.annotations?.entities || []
+  const savedKeys = new Set(savedEntities.map(entity => `${entity.text}::${entity.category}`))
+  trainingSelectedKeys.value = (document.entities || [])
+    .filter(entity => !savedEntities.length || savedKeys.has(`${entity.text}::${entity.category}`))
+    .map(entity => entity.key)
+  trainingCategories.value = Object.fromEntries(
+    (document.entities || []).map(entity => [entity.key, entity.category])
+  )
+  const machineTexts = new Set((document.entities || []).map(entity => entity.text))
+  const labels = Object.fromEntries(labelCategoryOptions.map(item => [item.key, item.label.split(' / ')[0]]))
+  trainingAdditions.value = savedEntities
+    .filter(entity => !machineTexts.has(entity.text))
+    .map(entity => `${labels[entity.category] || '敏感项'}|${entity.text}`)
+    .join('\n')
+  trainingSelection.value = ''
+}
+
+async function uploadTrainingDocument() {
+  if (!trainingDocumentFile.value) return
+  trainingDocumentLoading.value = true
+  error.value = ''
+  try {
+    const document = await api.uploadTrainingDocument(trainingDocumentFile.value)
+    initializeTrainingSelection(document)
+    trainingDocumentFile.value = null
+    await refreshTrainingDocuments()
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    trainingDocumentLoading.value = false
+  }
+}
+
+async function openTrainingDocument(documentId) {
+  trainingDocumentLoading.value = true
+  error.value = ''
+  try {
+    initializeTrainingSelection(await api.getTrainingDocument(documentId))
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    trainingDocumentLoading.value = false
+  }
+}
+
+function captureTrainingSelection() {
+  const selected = window.getSelection()?.toString().replace(/\s+/g, ' ').trim() || ''
+  if (selected.length >= 2 && selected.length <= 200) trainingSelection.value = selected
+}
+
+function addTrainingSelection() {
+  if (!trainingSelection.value) return
+  const label = labelCategoryOptions.find(item => item.key === trainingSelectionCategory.value)?.label || '敏感项'
+  const prefix = label.split(' / ')[0].replace('人员姓名', '人名').replace('联系电话', '电话').replace('证件号码', '证件').replace('电子邮箱', '邮箱').replace('地址信息', '地址').replace('其他敏感项', '敏感项')
+  trainingAdditions.value = `${trainingAdditions.value}${trainingAdditions.value ? '\n' : ''}${prefix}|${trainingSelection.value}`
+  trainingSelection.value = ''
+  window.getSelection()?.removeAllRanges()
+}
+
+async function saveTrainingAnnotations() {
+  if (!activeTrainingDocument.value?.id) return
+  trainingDocumentLoading.value = true
+  error.value = ''
+  try {
+    const document = await api.saveTrainingAnnotations(
+      activeTrainingDocument.value.id,
+      trainingAdditions.value,
+      (activeTrainingDocument.value.entities || [])
+        .filter(entity => trainingSelectedKeys.value.includes(entity.key))
+        .map(entity => ({ text: entity.text, category: trainingCategories.value[entity.key] || entity.category })),
+      activeTrainingDocument.value.alias_groups || []
+    )
+    initializeTrainingSelection(document)
+    await Promise.all([refreshTrainingDocuments(), refreshLabels(), refreshData()])
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    trainingDocumentLoading.value = false
+  }
+}
+
+async function removeTrainingDocument(document) {
+  if (!window.confirm(`确认删除训练文档“${document.original_name}”及其原始文件吗？\n已形成的加密训练样本和本地标签将保留。`)) return
+  trainingDocumentLoading.value = true
+  try {
+    await api.deleteTrainingDocument(document.id)
+    if (activeTrainingDocument.value?.id === document.id) activeTrainingDocument.value = null
+    await refreshTrainingDocuments()
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    trainingDocumentLoading.value = false
+  }
 }
 
 function openDownload(url) {
@@ -345,7 +507,7 @@ function selectMode(nextMode) {
   error.value = ''
 }
 
-onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels()]))
+onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels(), refreshTrainingDocuments()]))
 </script>
 
 <template>
@@ -365,8 +527,8 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
           <AppIcon name="history" /> 处理记录
           <span v-if="tasks.length" class="nav-count">{{ tasks.length }}</span>
         </button>
-        <button :class="{ active: nav === 'labels' }" @click="nav = 'labels'; refreshLabels()">
-          <AppIcon name="info" /> 训练标签
+        <button :class="{ active: nav === 'labels' }" @click="nav = 'labels'; refreshLabels(); refreshTrainingDocuments()">
+          <AppIcon name="info" /> 训练标注
           <span v-if="trainingLabels.length" class="nav-count">{{ trainingLabels.length }}</span>
         </button>
         <button :class="{ active: nav === 'guide' }" @click="nav = 'guide'">
@@ -384,8 +546,8 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
     <main class="main-panel">
       <header class="topbar">
         <div>
-          <h1>{{ nav === 'workspace' ? '数据处理台' : nav === 'history' ? '处理记录' : nav === 'labels' ? '本地训练标签' : '使用说明' }}</h1>
-          <p>{{ nav === 'workspace' ? '文件级敏感信息匿名化与安全恢复' : nav === 'history' ? '查看并下载历史处理结果' : nav === 'labels' ? '维护本地词库并沉淀模型训练样本' : '了解安全、可逆的数据处理流程' }}</p>
+          <h1>{{ nav === 'workspace' ? '数据处理台' : nav === 'history' ? '处理记录' : nav === 'labels' ? '训练标注工作台' : '使用说明' }}</h1>
+          <p>{{ nav === 'workspace' ? '文件级敏感信息匿名化与安全恢复' : nav === 'history' ? '查看并下载历史处理结果' : nav === 'labels' ? '机器预标、人工校正并沉淀本地训练集' : '了解安全、可逆的数据处理流程' }}</p>
         </div>
         <div class="industry-badge"><AppIcon name="building" :size="17" /> 烟草行业专用</div>
       </header>
@@ -564,6 +726,32 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
             <div v-if="reviewLoading" class="review-loading"><span class="spinner-border spinner-border-sm"></span> 正在读取或重新处理文件…</div>
             <template v-else>
               <div class="review-warning">{{ result?.status === 'review' ? '尚未开放脱敏文件下载。只有确认过的候选项和人工补录项会进入脱敏结果。' : '重新校正会更新匿名映射；已有反匿名上传稿和正式文件将作废。' }}</div>
+              <div class="document-preview review-document-preview">
+                <div class="preview-toolbar">
+                  <div><strong>上传文件全文预览</strong><small>所有相同字段都会统一着色；灰色删除线表示已取消脱敏</small></div>
+                  <span>{{ reviewData.preview?.length || 0 }} 个文本区块</span>
+                </div>
+                <div class="preview-pages">
+                  <section v-for="section in reviewData.preview" :key="section.index" class="preview-section">
+                    <header>{{ section.location }}</header>
+                    <p><template v-for="(segment, segmentIndex) in previewSegments(section, reviewData.entities, reviewSelectedTokens)" :key="segmentIndex"><span v-if="segment.plain">{{ segment.text }}</span><mark v-else :class="[`entity-${segment.category}`, { rejected: !segment.selected }]" :title="segment.title">{{ segment.text }}</mark></template></p>
+                  </section>
+                  <p v-if="!reviewData.preview?.length" class="review-empty">未提取到可预览文字；扫描 PDF 请确认 OCR 已成功完成。</p>
+                </div>
+              </div>
+              <section v-if="reviewData.alias_groups?.length" class="alias-review">
+                <div class="preview-toolbar"><div><strong>可能指代同一单位</strong><small>请人工判断；合并后共用一个匿名代码，反匿名统一恢复为所选标准名称</small></div></div>
+                <article v-for="group in reviewData.alias_groups" :key="group.id">
+                  <label><input v-model="reviewAliasChoices[group.id].accepted" type="checkbox" /> 确认属于同一实体</label>
+                  <div class="alias-members"><span v-for="member in group.members" :key="member">{{ member }}</span></div>
+                  <label>反匿名标准名称
+                    <select v-model="reviewAliasChoices[group.id].canonical" class="form-select" :disabled="!reviewAliasChoices[group.id].accepted">
+                      <option v-for="member in group.members" :key="member" :value="member">{{ member }}</option>
+                    </select>
+                  </label>
+                  <small>{{ group.reason }} · 建议置信度 {{ Math.round((group.confidence || 0) * 100) }}%</small>
+                </article>
+              </section>
               <div class="review-grid">
                 <div>
                   <div class="review-list-heading">
@@ -571,13 +759,13 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                     <span><button @click="selectAllReviewCandidates">全选</button><button @click="clearReviewCandidates">清空</button></span>
                   </div>
                   <div class="review-entities">
-                    <article v-for="entity in reviewData.entities" :key="entity.token" :class="{ selected: reviewSelectedTokens.includes(entity.token), rejected: !reviewSelectedTokens.includes(entity.token) }">
+                    <article v-for="entity in reviewData.entities" :key="entity.key" :class="{ selected: reviewSelectedTokens.includes(entity.key), rejected: !reviewSelectedTokens.includes(entity.key) }">
                       <div class="review-entity-main">
-                        <input v-model="reviewSelectedTokens" type="checkbox" :value="entity.token" :aria-label="`选择 ${entity.text}`" />
+                        <input v-model="reviewSelectedTokens" type="checkbox" :value="entity.key" :aria-label="`选择 ${entity.text}`" />
                         <span class="review-token">{{ entity.token }}</span>
                         <strong>{{ entity.text }}</strong>
                         <span class="review-source">{{ reviewSourceLabel(entity) }}</span>
-                        <select v-model="reviewCategories[entity.token]" class="form-select review-category" :disabled="!reviewSelectedTokens.includes(entity.token)">
+                        <select v-model="reviewCategories[entity.key]" class="form-select review-category" :disabled="!reviewSelectedTokens.includes(entity.key)">
                           <option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option>
                         </select>
                       </div>
@@ -594,7 +782,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                 <div>
                   <label class="form-label app-label">补充漏识别内容 <small>每行一个</small></label>
                   <textarea v-model="reviewAdditions" class="form-control review-textarea" placeholder="单位|山东中烟&#10;产品|文山雨露&#10;产区|文山&#10;人名|张三"></textarea>
-                  <p class="form-hint">补录内容会立即加入加密本地词库；勾掉的误识别会保存为加密否决样本，供后续微调评测。</p>
+                  <p class="form-hint">人工确认的单位、人名、产品、产区和地址以及补录内容会立即加入加密本地词库；勾掉的误识别会保存为加密否决样本，供后续微调评测。</p>
                 </div>
               </div>
               <div class="review-footer">
@@ -651,10 +839,57 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
           <section class="training-explain">
             <span><AppIcon name="info" :size="25" /></span>
             <div>
-              <h2>标签立即用于识别，修改历史沉淀为训练数据</h2>
-              <p>新增或修改标签后，系统会加密保存原值并立即加入本地精确词库；同时保留一条加密训练样本，供后续集中微调 UIE-base。保存训练数据不等于每次立即重新训练模型，避免频繁训练造成卡顿和模型退化。</p>
+              <h2>文档预标 + 人工校正 + 本地训练数据</h2>
+              <p>上传样本文档后由规则与 UIE-base 机器预标，人工在全文中确认、改类型或补标。保存后词条立即进入本地精确识别；带上下文和字符位置的样本用于后续 UIE-base 权重微调。</p>
             </div>
             <div class="training-count"><strong>{{ trainingLabels.length }}</strong><small>有效标签</small><strong>{{ trainingExampleCount }}</strong><small>训练样本</small></div>
+          </section>
+
+          <section class="annotation-card">
+            <div class="annotation-upload">
+              <div><h2>上传训练文档</h2><p>支持与脱敏任务相同的格式；原文、预标和人工结果均只在本机保存，敏感内容加密入库</p></div>
+              <label class="annotation-file"><input type="file" accept=".xls,.docx,.pdf,.ofd,.txt" @change="fileFromTrainingEvent" /><span>{{ trainingDocumentFile?.name || '选择样本文档' }}</span></label>
+              <button class="btn primary-btn" :disabled="trainingDocumentLoading || !trainingDocumentFile" @click="uploadTrainingDocument"><span v-if="trainingDocumentLoading" class="spinner-border spinner-border-sm"></span> 机器预标</button>
+              <a class="btn light-btn" href="/api/training/export/">导出 UIE JSONL 训练集</a>
+            </div>
+            <div v-if="trainingDocuments.length" class="training-documents">
+              <article v-for="document in trainingDocuments" :key="document.id" :class="{ active: activeTrainingDocument?.id === document.id }">
+                <button class="training-doc-main" @click="openTrainingDocument(document.id)"><strong>{{ document.original_name }}</strong><small>{{ document.status_label }} · {{ document.annotation_count }} 条标注 · {{ formatDate(document.updated_at) }}</small></button>
+                <button class="training-doc-delete" title="删除训练文档" @click="removeTrainingDocument(document)">×</button>
+              </article>
+            </div>
+
+            <div v-if="activeTrainingDocument" class="annotation-workbench">
+              <div class="annotation-heading"><div><h3>{{ activeTrainingDocument.original_name }}</h3><p>彩色文本是机器候选；取消勾选可否决，类别可修改，也可在原文中划词补标</p></div><span>{{ trainingSelectedKeys.length }} / {{ activeTrainingDocument.entities?.length || 0 }} 个机器候选</span></div>
+              <div class="annotation-layout">
+                <div class="document-preview training-preview">
+                  <div class="preview-pages" @mouseup="captureTrainingSelection">
+                    <section v-for="section in activeTrainingDocument.preview" :key="section.index" class="preview-section">
+                      <header>{{ section.location }}</header>
+                      <p><template v-for="(segment, segmentIndex) in previewSegments(section, activeTrainingDocument.entities, trainingSelectedKeys)" :key="segmentIndex"><span v-if="segment.plain">{{ segment.text }}</span><mark v-else :class="[`entity-${segment.category}`, { rejected: !segment.selected }]">{{ segment.text }}</mark></template></p>
+                    </section>
+                  </div>
+                </div>
+                <aside class="annotation-panel">
+                  <div v-if="trainingSelection" class="selection-add">
+                    <small>已选择原文</small><strong>{{ trainingSelection }}</strong>
+                    <select v-model="trainingSelectionCategory" class="form-select"><option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option></select>
+                    <button class="btn light-btn" @click="addTrainingSelection">加入人工标注</button>
+                  </div>
+                  <div class="annotation-candidates">
+                    <label v-for="entity in activeTrainingDocument.entities" :key="entity.key" :class="{ rejected: !trainingSelectedKeys.includes(entity.key) }">
+                      <input v-model="trainingSelectedKeys" type="checkbox" :value="entity.key" />
+                      <strong>{{ entity.text }}</strong>
+                      <select v-model="trainingCategories[entity.key]" class="form-select"><option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option></select>
+                    </label>
+                  </div>
+                  <label class="form-label app-label">人工补标 <small>每行一个，也可在左侧划词添加</small></label>
+                  <textarea v-model="trainingAdditions" class="form-control" placeholder="单位|陆良厂&#10;人名|张三"></textarea>
+                  <button class="btn primary-btn annotation-save" :disabled="trainingDocumentLoading || (!trainingSelectedKeys.length && !trainingAdditions.trim())" @click="saveTrainingAnnotations">保存标注并立即学习</button>
+                  <p class="form-hint">“立即学习”指本地精确词库立即生效；UIE-base 权重不会因一份文档自动重训。达到足够样本后用导出的 JSONL 集中微调，可避免小样本灾难性遗忘。</p>
+                </aside>
+              </div>
+            </div>
           </section>
 
           <section class="label-card">

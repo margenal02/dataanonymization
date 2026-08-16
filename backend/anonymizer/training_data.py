@@ -157,3 +157,36 @@ def record_rejected_entities(entities, task_id):
                 "task_id": str(task_id),
             }),
         )
+
+
+def record_document_annotations(entities, document_id, sections):
+    """Persist encrypted, context-bearing samples for later UIE fine-tuning."""
+    for item in entities:
+        text = normalize_label_text(item.get("text"))
+        category = validate_category(item.get("category", "custom"))
+        contexts = []
+        for section in sections:
+            content = str(section.get("text", ""))
+            start_at = 0
+            while len(contexts) < 8:
+                start = content.find(text, start_at)
+                if start < 0:
+                    break
+                contexts.append({
+                    "content": content,
+                    "start": start,
+                    "end": start + len(text),
+                    "location": section.get("location", "原文"),
+                })
+                start_at = start + max(1, len(text))
+            if len(contexts) >= 8:
+                break
+        TrainingExample.objects.create(
+            action="annotated",
+            payload_ciphertext=encrypt_mapping({
+                "before": None,
+                "after": {"text": text, "category": category, "contexts": contexts},
+                "source": "training_document",
+                "document_id": str(document_id),
+            }),
+        )

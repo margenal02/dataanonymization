@@ -232,6 +232,21 @@ _ORG_LEADING_NOISE = re.compile(
     r"实施单位|所属单位|名称|全称)+\s*(?:[：:]|为|是)?\s*"
 )
 
+# Only derive abbreviations which preserve an organization's distinctive prefix
+# and replace a well-known legal/industry suffix.  These values are candidates
+# for human review, never silently trusted as entities or merged automatically.
+_ORG_ABBREVIATION_SUFFIXES = (
+    ("烟叶复烤厂", "厂"),
+    ("复烤厂", "厂"),
+    ("卷烟厂", "厂"),
+    ("烟草专卖局", "烟草局"),
+    ("有限责任公司", "公司"),
+    ("股份有限公司", "公司"),
+    ("集团有限公司", "集团"),
+    ("集团公司", "集团"),
+    ("有限公司", "公司"),
+)
+
 
 def _is_cjk_or_ascii_word(character):
     return bool(character and ("\u4e00" <= character <= "\u9fff" or character.isalnum()))
@@ -348,6 +363,7 @@ class MappingBuilder:
         self.original_to_token = {}
         self.token_to_original = {}
         self.token_categories = {}
+        self.alias_to_canonical = {}
         self.counters = Counter()
         for item in custom_entities or []:
             text = item.get("text", "").strip()
@@ -405,6 +421,42 @@ class MappingBuilder:
         """Register a model-detected span after conservative type validation."""
         value = self.validate_detected(original, category)
         return self.register(value, category) if value else None
+
+    def merge_aliases(self, canonical, aliases, category="organization"):
+        """Make reviewed aliases share one reversible token.
+
+        A shared token cannot preserve which surface form occurred at each
+        position, so restoration deliberately uses ``canonical``.  The review
+        API exposes this consequence before accepting a merge.
+        """
+        canonical = _normalize_detected_value(canonical)
+        if not canonical or category not in CATEGORY_LABELS:
+            return None
+        canonical_token = self.original_to_token.get(canonical) or self.register(canonical, category)
+        if not canonical_token:
+            return None
+        removed_tokens = set()
+        for alias in aliases or []:
+            alias = _normalize_detected_value(alias)
+            if not alias or alias == canonical:
+                continue
+            old_token = self.original_to_token.get(alias)
+            if not old_token:
+                old_token = self.register(alias, category)
+            if not old_token:
+                continue
+            if old_token != canonical_token:
+                removed_tokens.add(old_token)
+            self.original_to_token[alias] = canonical_token
+            self.alias_to_canonical[alias] = canonical
+        for token in removed_tokens:
+            old_category = self.token_categories.pop(token, None)
+            self.token_to_original.pop(token, None)
+            if old_category and self.counters[old_category] > 0:
+                self.counters[old_category] -= 1
+        self.token_to_original[canonical_token] = canonical
+        self.token_categories[canonical_token] = category
+        return canonical_token
 
     def _pattern_candidates(self, text):
         candidates = []
@@ -520,15 +572,17 @@ class MappingBuilder:
             filename_token = f"ANON_{content_token[1:-1]}"
             result = result.replace(original, filename_token)
             if filename_token in result:
-                self.token_to_original[filename_token] = original
+                self.token_to_original[filename_token] = self.token_to_original.get(content_token, original)
                 self.token_categories[filename_token] = self.token_categories[content_token]
         return result
 
     def export(self):
         return {
-            "version": 2,
+            "version": 3,
             "token_to_original": self.token_to_original,
             "token_categories": self.token_categories,
+            "original_to_token": self.original_to_token,
+            "alias_to_canonical": self.alias_to_canonical,
         }
 
     def counts(self):
@@ -540,3 +594,45 @@ def restore_text(text, mapping):
     for token, original in sorted(mapping.get("token_to_original", {}).items(), key=lambda item: len(item[0]), reverse=True):
         result = result.replace(token, original)
     return result
+
+
+def suggest_organization_alias_groups(builder, text):
+    """Register and return conservative full-name/abbreviation suggestions.
+
+    Suggestions are limited to derived abbreviations that actually occur in
+    the same document.  Human review decides whether the abbreviation is an
+    entity and whether it shares the full name's token.
+    """
+    if "organization" not in builder.enabled or not text:
+        return []
+    organizations = []
+    for original, token in list(builder.original_to_token.items()):
+        if builder.token_categories.get(token) == "organization":
+            organizations.append(original)
+    groups = []
+    seen_pairs = set()
+    for full_name in sorted(organizations, key=len, reverse=True):
+        for suffix, short_suffix in _ORG_ABBREVIATION_SUFFIXES:
+            if not full_name.endswith(suffix):
+                continue
+            prefix = full_name[:-len(suffix)].strip()
+            alias = f"{prefix}{short_suffix}"
+            if len(prefix) < 2 or alias == full_name or alias not in text:
+                continue
+            pair = (full_name, alias)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            token = builder.register(alias, "organization")
+            if not token:
+                continue
+            groups.append({
+                "id": f"organization-{len(groups) + 1}",
+                "category": "organization",
+                "canonical": full_name,
+                "members": [full_name, alias],
+                "reason": f"“{alias}”与“{full_name}”具有相同主体词和单位后缀",
+                "confidence": 0.92,
+                "accepted": False,
+            })
+    return groups

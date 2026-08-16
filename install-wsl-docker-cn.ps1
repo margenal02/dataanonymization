@@ -423,11 +423,17 @@ prepare_system() {
         echo "当前自动流程仅支持 Ubuntu WSL，检测到：${PRETTY_NAME:-unknown}" >&2
         exit 1
     fi
+    progress 5 "步骤 1/5：读取 Ubuntu 版本并检查软件源"
     configure_ubuntu_mirror
+    progress 25 "步骤 2/5：配置 Python 国内镜像"
     configure_pip_mirror
+    progress 40 "步骤 3/5：安装或校验 Docker Engine 与 Compose"
     install_docker
+    progress 85 "步骤 4/5：配置 Docker 容器镜像加速"
     configure_docker_mirror
+    progress 95 "步骤 5/5：启用 WSL systemd"
     enable_systemd
+    progress 100 "步骤 5/5：Docker Engine 与国内镜像配置完成"
 }
 
 run_compose_build() {
@@ -1119,6 +1125,10 @@ function Get-NativeProgressState([string[]]$Paths) {
                 $clean = ($clean -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', '').Trim()
                 if ([string]::IsNullOrWhiteSpace($clean) -or $clean -match '^__DA_PROGRESS__\|') { continue }
                 if ($clean -match '(?i)(PASSWORD|SECRET_KEY|ENCRYPTION_KEY)\s*=') { continue }
+                # WSL/ConHost combinations on Windows PowerShell 5.1 can recode
+                # redirected UTF-8 Chinese into mojibake. Structured progress
+                # markers above are UTF-8-safe; only append raw ASCII diagnostics.
+                if ($clean -match '[^\x20-\x7E]') { continue }
                 $latestOutput = $clean
             }
         } catch {
@@ -2797,7 +2807,7 @@ try {
 
     Write-Step '在 WSL 中配置国内镜像并安装 Docker Engine'
     $wslResult = Invoke-NativeCommand -FilePath 'wsl.exe' `
-        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'bash', $linuxInstaller, 'prepare', $linuxProject) `
+        -ArgumentList @('--distribution', $DistroName, '--user', 'root', '--', 'env', 'LANG=C.UTF-8', 'LC_ALL=C.UTF-8', 'bash', $linuxInstaller, 'prepare', $linuxProject) `
         -DisplayOutput -Activity '配置大陆镜像并安装 Docker' -ProgressStart 65 -ProgressEnd 78
     if ($wslResult.ExitCode -ne 0) { throw 'WSL 内的 Docker 安装或镜像配置失败。' }
 

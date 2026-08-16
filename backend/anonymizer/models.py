@@ -18,6 +18,10 @@ def restored_upload_path(instance, filename):
     return f"tasks/{instance.id}/restored/{filename}"
 
 
+def training_upload_path(instance, filename):
+    return f"training/{instance.id}/input/{filename}"
+
+
 class AnonymizationTask(models.Model):
     class Status(models.TextChoices):
         PROCESSING = "processing", "处理中"
@@ -94,6 +98,7 @@ class TrainingExample(models.Model):
         ("deleted", "停用"),
         ("task_custom", "任务新增"),
         ("rejected", "人工否决"),
+        ("annotated", "文档标注"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -106,3 +111,29 @@ class TrainingExample(models.Model):
         ordering = ["-created_at"]
         verbose_name = "模型训练样本"
         verbose_name_plural = "模型训练样本"
+
+
+class TrainingDocument(models.Model):
+    class Status(models.TextChoices):
+        PROCESSING = "processing", "机器预标中"
+        READY = "ready", "待人工标注"
+        LABELED = "labeled", "已形成训练集"
+        FAILED = "failed", "预标失败"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    original_name = models.CharField(max_length=255)
+    file_type = models.CharField(max_length=12)
+    file_size = models.PositiveBigIntegerField(default=0)
+    sha256 = models.CharField(max_length=64, blank=True)
+    source_file = models.FileField(upload_to=training_upload_path)
+    preview_ciphertext = models.TextField(blank=True)
+    annotations_ciphertext = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROCESSING)
+    error_message = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "训练标注文档"
+        verbose_name_plural = "训练标注文档"
