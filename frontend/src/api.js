@@ -50,6 +50,7 @@ export const api = {
     form.append('categories', JSON.stringify(categories))
     form.append('custom_entities', customEntities)
     form.append('uie_mode', uieMode)
+    form.append('review_required', 'true')
     return request('/tasks/', { method: 'POST', body: form })
   },
   restore(taskId, file) {
@@ -58,10 +59,10 @@ export const api = {
     return request(`/tasks/${taskId}/restore/`, { method: 'POST', body: form })
   },
   getTaskReview: taskId => request(`/tasks/${taskId}/review/`),
-  applyTaskReview: (taskId, additions, removeTokens) => request(`/tasks/${taskId}/review/`, {
+  applyTaskReview: (taskId, additions, selectedEntities) => request(`/tasks/${taskId}/review/`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ additions, remove_tokens: removeTokens })
+    body: JSON.stringify({ additions, selected_entities: selectedEntities })
   }),
   deleteTask: taskId => request(`/tasks/${taskId}/`, {
     method: 'DELETE',

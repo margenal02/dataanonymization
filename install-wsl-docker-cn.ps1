@@ -329,6 +329,7 @@ write_secure_environment() {
         set_env_value NPM_REGISTRY "$NPM_MIRROR"
         set_env_value DEBIAN_MIRROR "${APT_MIRROR}/debian"
         set_env_value UIE_ENABLED "1"
+        set_env_value REQUIRE_HUMAN_REVIEW "1"
         set_env_value UIE_MODEL "uie-micro"
         set_env_value UIE_POSITION_PROB "0.45"
         set_env_value UIE_PERSON_PROB "0.70"
@@ -370,6 +371,7 @@ MYSQL_PASSWORD=$(openssl rand -hex 32)
 DJANGO_DEBUG=0
 ALLOWED_HOSTS=${allowed_hosts}
 MAX_UPLOAD_SIZE_MB=200
+REQUIRE_HUMAN_REVIEW=1
 DATA_RETENTION_DAYS=30
 MYSQL_IMAGE=${DOCKER_HUB_PREFIX}mysql:8.4
 PYTHON_IMAGE=${DOCKER_HUB_PREFIX}python:3.12-slim

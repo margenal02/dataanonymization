@@ -21,6 +21,7 @@ def restored_upload_path(instance, filename):
 class AnonymizationTask(models.Model):
     class Status(models.TextChoices):
         PROCESSING = "processing", "处理中"
+        REVIEW = "review", "待人工确认"
         COMPLETED = "completed", "脱敏完成"
         RESTORED = "restored", "已反匿名"
         FAILED = "failed", "处理失败"

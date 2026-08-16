@@ -326,7 +326,11 @@ class FileProcessorTests(TestCase):
 class TaskApiTests(TestCase):
     def setUp(self):
         self.media_directory = tempfile.mkdtemp()
-        self.override = override_settings(MEDIA_ROOT=self.media_directory, MAPPING_ENCRYPTION_KEY="test-mapping-key")
+        self.override = override_settings(
+            MEDIA_ROOT=self.media_directory,
+            MAPPING_ENCRYPTION_KEY="test-mapping-key",
+            REQUIRE_HUMAN_REVIEW=False,
+        )
         self.override.enable()
 
     def tearDown(self):
@@ -474,6 +478,50 @@ class TaskApiTests(TestCase):
         self.assertIn("张三", anonymized)
         self.assertNotIn("星辰一号", anonymized)
         self.assertEqual(TrainingExample.objects.filter(action="rejected").count(), 1)
+
+    def test_required_review_highlights_context_and_blocks_download_until_confirmation(self):
+        source = "单位：中国烟草总公司。联系人：张三。内部产品代号星辰一号。"
+        upload = SimpleUploadedFile("人工确认.txt", source.encode("utf-8"), content_type="text/plain")
+        response = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["organization", "person", "product"]),
+            "review_required": "true",
+        })
+
+        self.assertEqual(response.status_code, 201, response.content)
+        task = response.json()
+        self.assertEqual(task["status"], "review")
+        self.assertTrue(task["review_required"])
+        self.assertFalse(task["review_confirmed"])
+        self.assertIsNone(task["anonymized_download_url"])
+        self.assertFalse(task["stored_files"]["anonymized"])
+        blocked = self.client.get(f"/api/tasks/{task['id']}/download/anonymized/")
+        self.assertEqual(blocked.status_code, 409)
+
+        review = self.client.get(f"/api/tasks/{task['id']}/review/")
+        self.assertEqual(review.status_code, 200, review.content)
+        entities = review.json()["entities"]
+        person = next(item for item in entities if item["text"] == "张三")
+        self.assertEqual(person["occurrences"][0]["match"], "张三")
+        self.assertIn("联系人", person["occurrences"][0]["prefix"])
+
+        confirmed = self.client.post(
+            f"/api/tasks/{task['id']}/review/",
+            {
+                "additions": "产品|星辰一号",
+                "selected_entities": [{"token": person["token"], "category": "person"}],
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.content)
+        completed = confirmed.json()["task"]
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(completed["review_confirmed"])
+        download = self.client.get(completed["anonymized_download_url"])
+        anonymized = b"".join(download.streaming_content).decode("utf-8")
+        self.assertIn("中国烟草总公司", anonymized)
+        self.assertNotIn("张三", anonymized)
+        self.assertNotIn("星辰一号", anonymized)
 
     def test_training_labels_are_encrypted_versioned_and_used_by_later_tasks(self):
         response = self.client.post("/api/labels/", {"text": "李作英", "category": "person"}, content_type="application/json")

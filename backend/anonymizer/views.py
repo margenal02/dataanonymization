@@ -69,6 +69,12 @@ def _parse_json(value, default):
         return default
 
 
+def _as_bool(value, default=False):
+    if value is None or value == "":
+        return bool(default)
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _custom_entities(value):
     parsed = _parse_json(value, None)
     if isinstance(parsed, list):
@@ -183,10 +189,51 @@ def _select_model_entities(builder, entities):
     return ordered, rejected_count
 
 
-def _process_task(task, categories, uie_mode, combined_custom, excluded_entities=None):
-    builder = MappingBuilder(
-        str(task.id), categories, combined_custom, excluded_entities=excluded_entities,
-    )
+def _build_review_contexts(mapping, text_chunks, file_type, filename_stem, model_metadata, custom_keys):
+    contexts = {}
+    token_categories = mapping.get("token_categories", {})
+    for token, original in mapping.get("token_to_original", {}).items():
+        if not token.startswith("【"):
+            continue
+        category = token_categories.get(token, "custom")
+        key = (original, category)
+        occurrences = []
+        for index, chunk in enumerate(text_chunks):
+            start_at = 0
+            while len(occurrences) < 3:
+                position = chunk.find(original, start_at)
+                if position < 0:
+                    break
+                prefix = re.sub(r"\s+", " ", chunk[max(0, position - 70):position]).strip()
+                suffix = re.sub(r"\s+", " ", chunk[position + len(original):position + len(original) + 70]).strip()
+                occurrences.append({
+                    "prefix": prefix,
+                    "match": original,
+                    "suffix": suffix,
+                    "location": f"第 {index + 1} 页" if file_type == "pdf" else f"文本片段 {index + 1}",
+                })
+                start_at = position + max(1, len(original))
+            if len(occurrences) >= 3:
+                break
+        if not occurrences and original in filename_stem:
+            position = filename_stem.find(original)
+            occurrences.append({
+                "prefix": filename_stem[:position],
+                "match": original,
+                "suffix": filename_stem[position + len(original):],
+                "location": "文件名",
+            })
+        model_info = model_metadata.get(key, {})
+        source = "model" if model_info else "label" if key in custom_keys else "rule"
+        contexts[token] = {
+            "source": source,
+            "probability": model_info.get("probability"),
+            "occurrences": occurrences,
+        }
+    return contexts
+
+
+def _process_task(task, categories, uie_mode, combined_custom, excluded_entities=None, await_review=False):
     options = dict(task.options or {})
     task.status = AnonymizationTask.Status.PROCESSING
 
@@ -206,60 +253,92 @@ def _process_task(task, categories, uie_mode, combined_custom, excluded_entities
 
     report_progress({"percent": 2, "stage": "prepare", "detail": "文件已保存，正在检查内容结构"})
     model_entity_count = 0
-    pdf_pages = None
+    model_metadata = {}
+    text_chunks, pdf_pages = _collect_text_chunks(
+        task.input_file.path,
+        task.id,
+        progress_callback=report_progress,
+    )
+    filename_stem = Path(task.original_name).stem
+    recognition_chunks = list(text_chunks)
+    if filename_stem and filename_stem not in recognition_chunks:
+        recognition_chunks.append(filename_stem)
+    searchable_text = "\n".join(recognition_chunks)
+    matching_custom = [
+        item for item in combined_custom
+        if str(item.get("text", "")).strip() and str(item.get("text", "")).strip() in searchable_text
+    ]
+    custom_keys = {
+        (str(item.get("text", "")).strip(), item.get("category", "custom"))
+        for item in matching_custom
+    }
+    builder = MappingBuilder(
+        str(task.id), categories, matching_custom, excluded_entities=excluded_entities,
+    )
+    for text_chunk in recognition_chunks:
+        builder.discover(text_chunk)
+
     if settings.UIE_ENABLED and set(categories) & {"person", "organization", "address", "location", "product"}:
-        text_chunks, pdf_pages = _collect_text_chunks(
-            task.input_file.path,
-            task.id,
-            progress_callback=report_progress,
-        )
-        filename_stem = Path(task.original_name).stem
-        if filename_stem and filename_stem not in text_chunks:
-            text_chunks.append(filename_stem)
-        for text_chunk in text_chunks:
-            builder.discover(text_chunk)
         report_progress({"percent": 60, "stage": "uie", "detail": "正在使用 UIE-micro 复核敏感信息"})
         model_entities, rejected_count = _select_model_entities(
-            builder, predict_entities(text_chunks, categories, uie_mode)
+            builder, predict_entities(recognition_chunks, categories, uie_mode)
         )
         for entity in model_entities:
             if builder.register_detected(entity.get("text"), entity.get("category")):
                 model_entity_count += 1
+                model_metadata[(entity.get("text"), entity.get("category"))] = {
+                    "probability": round(float(entity.get("probability", 0.0)), 4),
+                }
         options["uie_rejected_count"] = rejected_count
     options["uie_detected_count"] = model_entity_count
 
     anonymized_stem = builder.anonymize_filename_stem(Path(task.original_name).stem)
-    output_name = _output_name(task.original_name, "已脱敏", anonymized_stem)
-    output_path = Path(settings.MEDIA_ROOT) / "processing" / str(task.id) / output_name
-    report_progress({"percent": 70, "stage": "write", "detail": "识别完成，正在生成脱敏文件"})
-    try:
-        process_file(
-            task.input_file.path,
-            output_path,
-            builder.anonymize,
-            pdf_pages=pdf_pages,
-            progress_callback=report_progress,
-        )
+    if await_review:
+        report_progress({"percent": 75, "stage": "review", "detail": "识别完成，正在整理人工确认候选"})
         if task.anonymized_file:
             task.anonymized_file.delete(save=False)
-        with output_path.open("rb") as handle:
-            task.anonymized_file.save(output_name, File(handle), save=False)
-    finally:
-        output_path.unlink(missing_ok=True)
+    else:
+        output_name = _output_name(task.original_name, "已脱敏", anonymized_stem)
+        output_path = Path(settings.MEDIA_ROOT) / "processing" / str(task.id) / output_name
+        report_progress({"percent": 70, "stage": "write", "detail": "人工选择已确认，正在生成脱敏文件"})
+        try:
+            process_file(
+                task.input_file.path,
+                output_path,
+                builder.anonymize,
+                pdf_pages=pdf_pages,
+                progress_callback=report_progress,
+            )
+            if task.anonymized_file:
+                task.anonymized_file.delete(save=False)
+            with output_path.open("rb") as handle:
+                task.anonymized_file.save(output_name, File(handle), save=False)
+        finally:
+            output_path.unlink(missing_ok=True)
 
     mapping = builder.export()
     mapping["review_exclusions"] = list(excluded_entities or [])
+    mapping["review_contexts"] = _build_review_contexts(
+        mapping,
+        text_chunks,
+        task.file_type,
+        filename_stem,
+        model_metadata,
+        custom_keys,
+    )
     task.mapping_ciphertext = encrypt_mapping(mapping)
     task.entity_counts = builder.counts()
     task.task_name = _task_name(anonymized_stem)
     task.options = options
+    task.options["review_required"] = bool(options.get("review_required", await_review))
+    task.options["review_confirmed"] = not await_review
     task.options["processing_progress"] = {
         "percent": 100,
-        "stage": "completed",
-        "detail": "脱敏文件生成完成",
+        "stage": "review" if await_review else "completed",
+        "detail": "候选识别完成，请人工确认" if await_review else "脱敏文件生成完成",
     }
     task.error_message = ""
-    task.status = AnonymizationTask.Status.COMPLETED
+    task.status = AnonymizationTask.Status.REVIEW if await_review else AnonymizationTask.Status.COMPLETED
     task.save()
     return task
 
@@ -341,6 +420,10 @@ def task_collection(request):
     learned = active_custom_entities()
     combined_custom = list({(item["category"], item["text"]): item for item in [*learned, *custom]}.values())
     original_name = _safe_name(upload.name)
+    review_required = _as_bool(
+        request.data.get("review_required"),
+        getattr(settings, "REQUIRE_HUMAN_REVIEW", True),
+    )
     task = AnonymizationTask.objects.create(
         task_name=_task_name(original_name),
         original_name=original_name,
@@ -354,11 +437,13 @@ def task_collection(request):
             "learned_label_count": len(learned),
             "uie_mode": uie_mode,
             "uie_model": settings.UIE_MODEL if settings.UIE_ENABLED else "disabled",
+            "review_required": review_required,
+            "review_confirmed": False,
         },
     )
 
     try:
-        _process_task(task, categories, uie_mode, combined_custom)
+        _process_task(task, categories, uie_mode, combined_custom, await_review=review_required)
     except Exception as exc:
         task.status = AnonymizationTask.Status.FAILED
         task.error_message = str(exc) if isinstance(exc, (ProcessingError, UIEProcessingError, ValueError)) else "文件处理失败，请检查文件是否损坏。"
@@ -381,6 +466,7 @@ def task_detail(request, task_id):
 
 def _review_entities(mapping):
     categories = mapping.get("token_categories", {})
+    context_map = mapping.get("review_contexts", {})
     entities = []
     for token, text in mapping.get("token_to_original", {}).items():
         if not token.startswith("【"):
@@ -391,6 +477,9 @@ def _review_entities(mapping):
             "text": text,
             "category": category,
             "category_label": CATEGORY_LABELS.get(category, CATEGORY_LABELS["custom"]),
+            "source": context_map.get(token, {}).get("source", "rule"),
+            "probability": context_map.get(token, {}).get("probability"),
+            "occurrences": context_map.get(token, {}).get("occurrences", []),
         })
     return sorted(entities, key=lambda item: (item["category_label"], item["token"]))
 
@@ -418,13 +507,43 @@ def task_review(request, task_id):
         return Response({"detail": "误识别标记必须是列表。"}, status=status.HTTP_400_BAD_REQUEST)
     token_to_original = mapping.get("token_to_original", {})
     token_categories = mapping.get("token_categories", {})
+    entity_tokens = [token for token in token_to_original if token.startswith("【")]
+    selected_payload = request.data.get("selected_entities")
+    selected_by_token = {}
+    if selected_payload is not None:
+        if not isinstance(selected_payload, list):
+            return Response({"detail": "已选识别项必须是列表。"}, status=status.HTTP_400_BAD_REQUEST)
+        for item in selected_payload:
+            if not isinstance(item, dict):
+                continue
+            token = str(item.get("token", ""))
+            category = str(item.get("category", token_categories.get(token, "custom")))
+            if token in entity_tokens and category in {*DEFAULT_CATEGORIES, "custom"}:
+                selected_by_token[token] = category
+    else:
+        removed_set = set(remove_tokens)
+        selected_by_token = {
+            token: token_categories.get(token, "custom")
+            for token in entity_tokens
+            if token not in removed_set
+        }
+
     removals = []
-    for token in dict.fromkeys(remove_tokens):
-        if token.startswith("【") and token in token_to_original:
-            removals.append({
+    category_corrections = []
+    for token in entity_tokens:
+        old_category = token_categories.get(token, "custom")
+        selected_category = selected_by_token.get(token)
+        if selected_category is None or selected_category != old_category:
+            removals.append({"text": token_to_original[token], "category": old_category})
+        if selected_category is not None and selected_category != old_category:
+            category_corrections.append({
                 "text": token_to_original[token],
-                "category": token_categories.get(token, "custom"),
+                "category": selected_category,
             })
+    additions = list({
+        (item["category"], item["text"]): item
+        for item in [*additions, *category_corrections]
+    }.values())
 
     try:
         save_task_custom_entities(additions)
@@ -447,7 +566,7 @@ def task_review(request, task_id):
             if item in DEFAULT_CATEGORIES
         ]
         uie_mode = (task.options or {}).get("uie_mode", "on_demand")
-        _process_task(task, categories, uie_mode, combined_custom, excluded_entities)
+        _process_task(task, categories, uie_mode, combined_custom, excluded_entities, await_review=False)
         if removals:
             record_rejected_entities(removals, task.id)
         for field_name in ("restore_input_file", "restored_file"):
@@ -508,6 +627,8 @@ def restore_task(request, task_id):
 def download_task(request, task_id, kind):
     task = get_object_or_404(AnonymizationTask, id=task_id)
     if kind == "anonymized":
+        if task.status == AnonymizationTask.Status.REVIEW:
+            return Response({"detail": "请先完成人工确认，再下载脱敏文件。"}, status=status.HTTP_409_CONFLICT)
         field = task.anonymized_file
         filename = Path(field.name).name if field else ""
     elif kind == "restored":

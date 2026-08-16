@@ -13,6 +13,9 @@ class TaskSerializer(serializers.ModelSerializer):
     uie_rejected_count = serializers.SerializerMethodField()
     processing_progress = serializers.SerializerMethodField()
     ocr_page_count = serializers.SerializerMethodField()
+    review_required = serializers.SerializerMethodField()
+    review_confirmed = serializers.SerializerMethodField()
+    review_candidate_count = serializers.SerializerMethodField()
 
     class Meta:
         model = AnonymizationTask
@@ -22,10 +25,13 @@ class TaskSerializer(serializers.ModelSerializer):
             "anonymized_download_url", "restored_download_url", "stored_files",
             "recognition_mode", "uie_detected_count", "uie_rejected_count",
             "processing_progress", "ocr_page_count",
+            "review_required", "review_confirmed", "review_candidate_count",
         ]
 
     def _url(self, task, kind):
         field = task.anonymized_file if kind == "anonymized" else task.restored_file
+        if kind == "anonymized" and task.status == task.Status.REVIEW:
+            return None
         if not field:
             return None
         return f"/api/tasks/{task.id}/download/{kind}/"
@@ -54,6 +60,15 @@ class TaskSerializer(serializers.ModelSerializer):
 
     def get_ocr_page_count(self, task):
         return int((task.options or {}).get("ocr_page_count", 0))
+
+    def get_review_required(self, task):
+        return bool((task.options or {}).get("review_required", False))
+
+    def get_review_confirmed(self, task):
+        return bool((task.options or {}).get("review_confirmed", not self.get_review_required(task)))
+
+    def get_review_candidate_count(self, task):
+        return sum(task.entity_counts.values()) if isinstance(task.entity_counts, dict) else 0
 
     def get_stored_files(self, task):
         return {

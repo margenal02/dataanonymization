@@ -151,12 +151,23 @@ textarea.form-control { resize: vertical; min-height: 95px; }
 .review-loading { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 130px; color: var(--forest); font-size: 11px; }
 .review-warning { margin: 15px 0; padding: 9px 11px; color: #7b642f; background: #fcf7eb; border: 1px solid #eee0bd; border-radius: 7px; font-size: 9px; }
 .review-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 20px; }
-.review-entities { max-height: 285px; overflow: auto; display: grid; gap: 6px; padding-right: 4px; }
-.review-entities label { display: grid; grid-template-columns: auto auto 1fr auto; align-items: center; gap: 8px; padding: 8px 9px; border: 1px solid #e1e7e4; border-radius: 6px; cursor: pointer; }
-.review-entities label.rejected { color: #9a544c; background: #fff5f3; border-color: #efd4d0; text-decoration: line-through; }
+.review-list-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.review-list-heading span { display: flex; gap: 5px; }
+.review-list-heading button { padding: 2px 7px; color: var(--forest); background: #fff; border: 1px solid #cddbd5; border-radius: 4px; font-size: 8px; }
+.review-entities { max-height: 430px; overflow: auto; display: grid; gap: 8px; padding-right: 4px; }
+.review-entities article { padding: 9px; border: 1px solid #e1e7e4; border-radius: 7px; transition: .15s ease; }
+.review-entities article.selected { background: #f5faf7; border-color: #9ec7b7; }
+.review-entities article.rejected { color: #8b9692; background: #fafafa; opacity: .7; }
+.review-entity-main { display: grid; grid-template-columns: auto auto minmax(90px, 1fr) auto 118px; align-items: center; gap: 8px; }
 .review-entities input { accent-color: #a9483e; }
 .review-entities strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 10px; white-space: nowrap; }
 .review-entities small { color: var(--muted); font-size: 8px; }
+.review-source { padding: 2px 5px; color: #526d93; background: #edf2f8; border-radius: 9px; font-size: 8px; white-space: nowrap; }
+.review-category { min-height: 28px !important; padding: 3px 22px 3px 7px !important; font-size: 8px !important; }
+.review-contexts { display: grid; gap: 4px; margin-top: 8px; padding: 7px 8px; color: #42504b; background: #fff; border-left: 2px solid #9ec7b7; border-radius: 3px; }
+.review-contexts p { margin: 0; font-size: 9px; line-height: 1.55; }
+.review-contexts small { display: inline-block; margin-right: 7px; color: #7a8782; }
+.review-contexts mark { padding: 1px 2px; color: #6f321d; background: #ffe2a8; border-radius: 2px; font-weight: 700; }
 .review-token { color: var(--forest); background: var(--forest-soft); padding: 2px 5px; border-radius: 3px; font-family: Consolas, monospace; font-size: 9px; }
 .review-empty { margin: 0; padding: 28px; color: var(--muted); background: #fafbfa; border-radius: 6px; text-align: center; font-size: 9px; }
 .review-textarea { min-height: 190px !important; }
@@ -177,6 +188,7 @@ textarea.form-control { resize: vertical; min-height: 95px; }
 .status-completed { color: #28745f; background: #eaf5f0; }
 .status-restored { color: #966421; background: #fbf1df; }
 .status-processing { color: #526d93; background: #edf2f8; }
+.status-review { color: #8a5d16; background: #fff3d8; }
 .status-failed { color: #a9483e; background: #faecea; }
 .history-progress { max-width: 240px; margin-top: 6px !important; color: #526d93 !important; line-height: 1.5; }
 .table-actions button { width: 30px; height: 30px; display: inline-grid; place-items: center; border: 1px solid #dfe5e1; color: var(--forest); background: #fff; border-radius: 6px; margin-left: 5px; }
@@ -255,6 +267,8 @@ textarea.form-control { resize: vertical; min-height: 95px; }
   .result-actions { flex-wrap: wrap; }
   .result-actions .btn { flex: 1; }
   .review-footer { align-items: stretch; flex-direction: column; }
+  .review-entity-main { grid-template-columns: auto auto 1fr; }
+  .review-source, .review-category { grid-column: 2 / -1; }
   .guide-grid { grid-template-columns: 1fr; }
   .training-explain { align-items: flex-start; flex-wrap: wrap; }
   .training-count { width: 100%; margin-left: 58px; }

@@ -30,7 +30,8 @@ const reviewOpen = ref(false)
 const reviewLoading = ref(false)
 const reviewData = ref({ entities: [], excluded_count: 0 })
 const reviewAdditions = ref('')
-const reviewRemoveTokens = ref([])
+const reviewSelectedTokens = ref([])
+const reviewCategories = ref({})
 const processingProgress = ref(null)
 const selectedCategories = ref(['organization', 'person', 'product', 'location', 'phone', 'id_card', 'email', 'address'])
 
@@ -65,6 +66,7 @@ function formatDate(value) {
 function statusMeta(status) {
   return {
     processing: ['处理中', 'status-processing'],
+    review: ['待人工确认', 'status-review'],
     completed: ['脱敏完成', 'status-completed'],
     restored: ['已生成正式版', 'status-restored'],
     failed: ['处理失败', 'status-failed']
@@ -215,6 +217,7 @@ async function submitAnonymize() {
   try {
     result.value = await api.anonymize(anonymizeFile.value, selectedCategories.value, customEntities.value, uieMode.value)
     await Promise.all([refreshData(), refreshModelRuntime(), refreshLabels()])
+    if (result.value?.status === 'review') await openReview(result.value)
   } catch (e) {
     error.value = e.message
     if (e.data?.id) result.value = e.data
@@ -268,10 +271,15 @@ async function openReview(task = result.value) {
   reviewOpen.value = true
   reviewLoading.value = true
   reviewAdditions.value = ''
-  reviewRemoveTokens.value = []
+  reviewSelectedTokens.value = []
+  reviewCategories.value = {}
   error.value = ''
   try {
     reviewData.value = await api.getTaskReview(task.id)
+    reviewSelectedTokens.value = reviewData.value.entities.map(entity => entity.token)
+    reviewCategories.value = Object.fromEntries(
+      reviewData.value.entities.map(entity => [entity.token, entity.category])
+    )
   } catch (e) {
     error.value = e.message
     reviewOpen.value = false
@@ -288,17 +296,41 @@ async function applyReview() {
     reviewData.value = await api.applyTaskReview(
       result.value.id,
       reviewAdditions.value,
-      reviewRemoveTokens.value
+      reviewData.value.entities
+        .filter(entity => reviewSelectedTokens.value.includes(entity.token))
+        .map(entity => ({
+          token: entity.token,
+          category: reviewCategories.value[entity.token] || entity.category
+        }))
     )
     result.value = reviewData.value.task
     reviewAdditions.value = ''
-    reviewRemoveTokens.value = []
+    reviewSelectedTokens.value = reviewData.value.entities.map(entity => entity.token)
+    reviewCategories.value = Object.fromEntries(
+      reviewData.value.entities.map(entity => [entity.token, entity.category])
+    )
     await Promise.all([refreshData(), refreshLabels()])
   } catch (e) {
     error.value = e.message
   } finally {
     reviewLoading.value = false
   }
+}
+
+function selectAllReviewCandidates() {
+  reviewSelectedTokens.value = reviewData.value.entities.map(entity => entity.token)
+}
+
+function clearReviewCandidates() {
+  reviewSelectedTokens.value = []
+}
+
+function reviewSourceLabel(entity) {
+  if (entity.source === 'model') {
+    return entity.probability ? `模型 ${(entity.probability * 100).toFixed(0)}%` : '模型候选'
+  }
+  if (entity.source === 'label') return '本地标签'
+  return '规则识别'
 }
 
 function openDownload(url) {
@@ -500,9 +532,9 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
           </section>
 
           <section v-if="result && !result.error_message" class="result-card">
-            <span class="result-check"><AppIcon name="check" :size="25" /></span>
+            <span class="result-check"><AppIcon :name="result.status === 'review' ? 'info' : 'check'" :size="25" /></span>
             <div class="result-main">
-              <h3>{{ result.status === 'restored' ? '正式文件已生成' : '文件脱敏完成' }}</h3>
+              <h3>{{ result.status === 'review' ? '候选识别完成，请人工确认' : result.status === 'restored' ? '正式文件已生成' : '文件脱敏完成' }}</h3>
               <p>{{ result.code }} · {{ result.task_name }}</p>
               <div v-if="result.status !== 'restored'" class="entity-tags">
                 <span v-for="(count, label) in result.entity_counts" :key="label">{{ label }} {{ count }}</span>
@@ -515,10 +547,10 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
               </div>
             </div>
             <div class="result-actions">
-              <button v-if="result.anonymized_download_url" class="btn light-btn" @click="openReview(result)">
-                <AppIcon name="info" :size="18" /> 校正识别
+              <button v-if="result.status === 'review' || result.anonymized_download_url" class="btn light-btn" @click="openReview(result)">
+                <AppIcon name="info" :size="18" /> {{ result.status === 'review' ? '人工确认' : '重新校正' }}
               </button>
-              <button class="btn download-btn" @click="openDownload(result.status === 'restored' ? result.restored_download_url : result.anonymized_download_url)">
+              <button v-if="result.restored_download_url || result.anonymized_download_url" class="btn download-btn" @click="openDownload(result.status === 'restored' ? result.restored_download_url : result.anonymized_download_url)">
                 <AppIcon name="download" :size="18" /> 下载文件
               </button>
             </div>
@@ -526,22 +558,36 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
 
           <section v-if="reviewOpen" class="review-card">
             <div class="review-heading">
-              <div><h3>识别结果人工校正</h3><p>勾选误识别项，并按“类别|完整内容”逐行补充漏识别词；保存后使用原始文件重新生成脱敏稿。</p></div>
+              <div><h3>{{ result?.status === 'review' ? '人工确认敏感信息' : '重新校正识别结果' }}</h3><p>高亮查看候选项所在原文；保留需要脱敏的数据、取消误识别、修改类型，并补录漏识别内容。</p></div>
               <button class="review-close" @click="reviewOpen = false">关闭</button>
             </div>
             <div v-if="reviewLoading" class="review-loading"><span class="spinner-border spinner-border-sm"></span> 正在读取或重新处理文件…</div>
             <template v-else>
-              <div class="review-warning">校正会更新该任务的匿名映射；已有反匿名上传稿和正式文件将作废，需要重新执行反匿名。</div>
+              <div class="review-warning">{{ result?.status === 'review' ? '尚未开放脱敏文件下载。只有确认过的候选项和人工补录项会进入脱敏结果。' : '重新校正会更新匿名映射；已有反匿名上传稿和正式文件将作废。' }}</div>
               <div class="review-grid">
                 <div>
-                  <label class="form-label app-label">已识别内容 <small>勾选需要移除的误识别</small></label>
+                  <div class="review-list-heading">
+                    <label class="form-label app-label">识别候选 <small>勾选表示确认需要脱敏</small></label>
+                    <span><button @click="selectAllReviewCandidates">全选</button><button @click="clearReviewCandidates">清空</button></span>
+                  </div>
                   <div class="review-entities">
-                    <label v-for="entity in reviewData.entities" :key="entity.token" :class="{ rejected: reviewRemoveTokens.includes(entity.token) }">
-                      <input v-model="reviewRemoveTokens" type="checkbox" :value="entity.token" />
-                      <span class="review-token">{{ entity.token }}</span>
-                      <strong>{{ entity.text }}</strong>
-                      <small>{{ entity.category_label }}</small>
-                    </label>
+                    <article v-for="entity in reviewData.entities" :key="entity.token" :class="{ selected: reviewSelectedTokens.includes(entity.token), rejected: !reviewSelectedTokens.includes(entity.token) }">
+                      <div class="review-entity-main">
+                        <input v-model="reviewSelectedTokens" type="checkbox" :value="entity.token" :aria-label="`选择 ${entity.text}`" />
+                        <span class="review-token">{{ entity.token }}</span>
+                        <strong>{{ entity.text }}</strong>
+                        <span class="review-source">{{ reviewSourceLabel(entity) }}</span>
+                        <select v-model="reviewCategories[entity.token]" class="form-select review-category" :disabled="!reviewSelectedTokens.includes(entity.token)">
+                          <option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option>
+                        </select>
+                      </div>
+                      <div v-if="entity.occurrences?.length" class="review-contexts">
+                        <p v-for="(occurrence, occurrenceIndex) in entity.occurrences" :key="occurrenceIndex">
+                          <small>{{ occurrence.location }}</small>
+                          <span>{{ occurrence.prefix }}</span><mark>{{ occurrence.match }}</mark><span>{{ occurrence.suffix }}</span>
+                        </p>
+                      </div>
+                    </article>
                     <p v-if="!reviewData.entities?.length" class="review-empty">当前没有识别项，请在右侧补充漏识别内容。</p>
                   </div>
                 </div>
@@ -552,9 +598,9 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                 </div>
               </div>
               <div class="review-footer">
-                <span>历史已排除 {{ reviewData.excluded_count || 0 }} 项</span>
-                <button class="btn primary-btn" :disabled="reviewLoading || (!reviewAdditions.trim() && !reviewRemoveTokens.length)" @click="applyReview">
-                  <AppIcon name="check" :size="18" /> 保存校正并重新脱敏
+                <span>已选择 {{ reviewSelectedTokens.length }} / {{ reviewData.entities?.length || 0 }} 项 · 历史已排除 {{ reviewData.excluded_count || 0 }} 项</span>
+                <button class="btn primary-btn" :disabled="reviewLoading || (!reviewAdditions.trim() && !reviewSelectedTokens.length)" @click="applyReview">
+                  <AppIcon name="check" :size="18" /> {{ result?.status === 'review' ? '确认选择并生成脱敏文件' : '保存校正并重新脱敏' }}
                 </button>
               </div>
             </template>
@@ -586,7 +632,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                     <td>{{ formatDate(task.created_at) }}</td>
                     <td class="text-end table-actions">
                       <button v-if="task.anonymized_download_url" title="下载脱敏文件" @click="openDownload(task.anonymized_download_url)"><AppIcon name="download" :size="17" /></button>
-                      <button v-if="task.anonymized_download_url" title="校正识别结果" @click="openReview(task)"><AppIcon name="info" :size="17" /></button>
+                      <button v-if="task.status === 'review' || task.anonymized_download_url" :title="task.status === 'review' ? '人工确认识别结果' : '校正识别结果'" @click="openReview(task)"><AppIcon name="info" :size="17" /></button>
                       <button v-if="task.restored_download_url" class="amber" title="下载正式文件" @click="openDownload(task.restored_download_url)"><AppIcon name="restore" :size="17" /></button>
                       <button class="danger" title="删除记录及所有文件" :disabled="deletingTaskId === task.id" @click="deleteTask(task)">
                         <span v-if="deletingTaskId === task.id" class="spinner-border spinner-border-sm"></span>
