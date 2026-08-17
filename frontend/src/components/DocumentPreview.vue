@@ -1,5 +1,5 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 
 const props = defineProps({
   sections: { type: Array, default: () => [] },
@@ -11,7 +11,21 @@ const props = defineProps({
   showToolbar: { type: Boolean, default: true }
 })
 
-defineEmits(['text-selected'])
+const emit = defineEmits(['text-selected'])
+const root = ref(null)
+
+function captureSelection() {
+  const selection = window.getSelection()
+  const text = selection?.toString().replace(/\s+/g, ' ').trim() || ''
+  if (!text || !selection?.rangeCount || !root.value) return
+  const range = selection.getRangeAt(0)
+  if (!root.value.contains(range.commonAncestorContainer)) return
+  const section = range.commonAncestorContainer.parentElement?.closest?.('.preview-section')
+  emit('text-selected', {
+    text,
+    location: section?.querySelector('header')?.textContent?.trim() || '全文预览'
+  })
+}
 
 const entityMap = computed(() => Object.fromEntries(
   props.entities.map(entity => [entity.key, entity])
@@ -40,7 +54,7 @@ function segments(section) {
 </script>
 
 <template>
-  <div class="document-preview" @mouseup="$emit('text-selected')">
+  <div ref="root" class="document-preview" @mouseup="captureSelection">
     <div v-if="showToolbar" class="preview-toolbar">
       <div><strong>{{ title }}</strong><small>{{ subtitle }}</small></div>
       <span>{{ sections.length }} 个文本区块</span>

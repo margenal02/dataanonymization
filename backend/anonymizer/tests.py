@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import shutil
 import tempfile
 import zipfile
@@ -21,7 +22,7 @@ from reportlab.pdfgen import canvas
 
 from .file_processors import ProcessingError, process_file
 from .crypto import decrypt_mapping, encrypt_mapping
-from .models import AnonymizationTask, RecognitionLabel, TrainingDocument, TrainingExample
+from .models import AnonymizationTask, ModelArtifact, RecognitionLabel, TrainingDocument, TrainingExample
 from .paddlenlp_compat import ensure_aistudio_download_compatibility
 from .ppstructure_worker import _build_pipeline as build_ppstructure_pipeline
 from .ppstructure_worker import _extract_text as extract_ppstructure_text
@@ -29,7 +30,7 @@ from .ppstructure_worker import _recognize as recognize_with_ppstructure
 from .recognizer import MappingBuilder, restore_text, suggest_organization_alias_groups
 from .training_data import decrypt_label
 from .uie_runtime import UIEProcessingError, _manager_url
-from .uie_worker import _predict
+from .uie_worker import _model_configuration, _predict
 from .views import _select_model_entities
 
 
@@ -993,6 +994,77 @@ class TaskApiTests(TestCase):
         set_mode.assert_called_once_with("resident")
         self.assertTrue(response.json()["resident_loaded"])
 
+    def _valid_model_package(self, extra_files=None):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("checkpoint/model_state.pdparams", b"safe-paddle-weights")
+            archive.writestr("checkpoint/model_config.json", json.dumps({"init_class": "UIE"}))
+            archive.writestr("checkpoint/vocab.txt", "[PAD]\n[UNK]\n")
+            for name, content in (extra_files or {}).items():
+                archive.writestr(name, content)
+        return SimpleUploadedFile("industry-uie.zip", buffer.getvalue(), content_type="application/zip")
+
+    @patch("anonymizer.views.set_runtime_mode")
+    def test_model_package_import_activate_export_and_delete(self, set_runtime_mode_mock):
+        imported = self.client.post("/api/model/artifacts/", {
+            "file": self._valid_model_package(),
+            "name": "行业实体识别",
+            "version": "1.2.0",
+        })
+        self.assertEqual(imported.status_code, 201, imported.content)
+        artifact_id = imported.json()["id"]
+        artifact = ModelArtifact.objects.get(id=artifact_id)
+        self.assertFalse(artifact.is_active)
+        self.assertEqual(imported.json()["file_count"], 3)
+
+        activated = self.client.post(f"/api/model/artifacts/{artifact_id}/activate/")
+        self.assertEqual(activated.status_code, 200, activated.content)
+        artifact.refresh_from_db()
+        self.assertTrue(artifact.is_active)
+        pointer = Path(self.media_directory) / "model-artifacts" / "active.json"
+        self.assertEqual(json.loads(pointer.read_text(encoding="utf-8"))["artifact_id"], artifact_id)
+
+        exported = self.client.get(f"/api/model/artifacts/{artifact_id}/export/")
+        self.assertEqual(exported.status_code, 200)
+        exported_bytes = b"".join(exported.streaming_content)
+        with zipfile.ZipFile(io.BytesIO(exported_bytes)) as archive:
+            self.assertIn("model_state.pdparams", archive.namelist())
+            manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(manifest["format"], "data-security-uie-model")
+            self.assertNotIn("mapping", json.dumps(manifest).lower())
+
+        weight_path = Path(self.media_directory) / "model-artifacts" / artifact.storage_folder / "model_state.pdparams"
+        weight_path.write_bytes(b"tampered")
+        tampered = self.client.get(f"/api/model/artifacts/{artifact_id}/export/")
+        self.assertEqual(tampered.status_code, 409)
+        self.assertIn("完整性校验失败", tampered.json()["detail"])
+        weight_path.write_bytes(b"safe-paddle-weights")
+
+        refused = self.client.delete(
+            f"/api/model/artifacts/{artifact_id}/",
+            HTTP_X_MODEL_DELETE_CONFIRM=artifact_id,
+        )
+        self.assertEqual(refused.status_code, 409)
+        base = self.client.post("/api/model/artifacts/base/activate/")
+        self.assertEqual(base.status_code, 200, base.content)
+        deleted = self.client.delete(
+            f"/api/model/artifacts/{artifact_id}/",
+            HTTP_X_MODEL_DELETE_CONFIRM=artifact_id,
+        )
+        self.assertEqual(deleted.status_code, 204)
+        self.assertFalse(ModelArtifact.objects.filter(id=artifact_id).exists())
+
+    def test_model_package_rejects_traversal_and_executable_files(self):
+        traversal = self._valid_model_package({"../escape.txt": "bad"})
+        response = self.client.post("/api/model/artifacts/", {"file": traversal})
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("不安全路径", response.json()["detail"])
+
+        executable = self._valid_model_package({"checkpoint/run.py": "print('unsafe')"})
+        response = self.client.post("/api/model/artifacts/", {"file": executable})
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("可执行文件", response.json()["detail"])
+
     def test_anonymizes_download_filename_and_restores_formal_filename(self):
         source = "组长：潘富昆。\n成员：赵英桥、李作英。"
         upload = SimpleUploadedFile(
@@ -1177,3 +1249,21 @@ class UIEWorkerTests(TestCase):
             "end": 6,
             "probability": 0.98,
         }])
+
+    def test_worker_uses_only_model_path_below_controlled_pointer_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "artifact"
+            checkpoint.mkdir()
+            pointer = root / "active.json"
+            pointer.write_text(json.dumps({
+                "name": "行业模型",
+                "version": "2.0",
+                "base_model": "uie-base",
+                "task_path": str(checkpoint),
+            }), encoding="utf-8")
+            with patch.dict(os.environ, {"UIE_MODEL_POINTER": str(pointer), "UIE_MODEL": "uie-base"}):
+                options, identity = _model_configuration()
+            self.assertEqual(options["task_path"], str(checkpoint.resolve()))
+            self.assertEqual(options["model"], "uie-base")
+            self.assertEqual(identity, "行业模型 2.0")

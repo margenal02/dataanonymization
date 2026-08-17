@@ -37,6 +37,9 @@ const reviewCategories = ref({})
 const reviewAliasChoices = ref({})
 const reviewQuery = ref('')
 const reviewCategoryFilter = ref('all')
+const reviewSelection = ref('')
+const reviewSelectionLocation = ref('')
+const reviewSelectionCategory = ref('organization')
 const trainingDocuments = ref([])
 const trainingDocumentFile = ref(null)
 const activeTrainingDocument = ref(null)
@@ -46,6 +49,12 @@ const trainingCategories = ref({})
 const trainingAdditions = ref('')
 const trainingSelection = ref('')
 const trainingSelectionCategory = ref('organization')
+const modelArtifacts = ref([])
+const modelBase = ref({ name: 'uie-base', version: '内置', is_active: true })
+const modelPackageMaxMb = ref(1024)
+const modelPackageFile = ref(null)
+const modelPackageForm = ref({ name: '', version: '' })
+const modelPackageLoading = ref(false)
 const processingProgress = ref(null)
 const selectedCategories = ref(['organization', 'person', 'product', 'location', 'phone', 'id_card', 'email', 'address'])
 
@@ -68,6 +77,7 @@ const pageMeta = computed(() => ({
   workspace: ['数据处理台', '安全处理、人工复核、可逆恢复'],
   history: ['处理记录', '文件状态与结果管理'],
   analytics: ['质量洞察', '识别质量与处理效率'],
+  models: ['模型中心', '权重版本、导入导出与运行状态'],
   labels: ['训练标注', '机器预标与人工校正'],
   guide: ['使用说明', '三步完成安全数据处理']
 })[nav.value] || ['数据处理台', '文件级敏感信息匿名化与安全恢复'])
@@ -165,6 +175,76 @@ async function refreshLabels() {
     trainingExampleCount.value = data.training_example_count || 0
   } catch (e) {
     error.value = e.message
+  }
+}
+
+async function refreshModelArtifacts() {
+  try {
+    const data = await api.listModelArtifacts()
+    modelArtifacts.value = data.artifacts || []
+    modelBase.value = data.base_model || modelBase.value
+    modelPackageMaxMb.value = Number(data.max_package_size_mb) || 1024
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+function fileFromModelPackageEvent(event) {
+  const file = event.target.files?.[0] || event.dataTransfer?.files?.[0] || null
+  if (file && file.size > modelPackageMaxMb.value * 1024 * 1024) {
+    modelPackageFile.value = null
+    if (event.target && 'value' in event.target) event.target.value = ''
+    error.value = `模型包不能超过 ${modelPackageMaxMb.value} MB，当前文件为 ${formatBytes(file.size)}。`
+    return
+  }
+  modelPackageFile.value = file
+  if (file && !modelPackageForm.value.name) modelPackageForm.value.name = file.name.replace(/\.zip$/i, '')
+  error.value = ''
+}
+
+async function importModelPackage() {
+  if (!modelPackageFile.value) return
+  modelPackageLoading.value = true
+  error.value = ''
+  try {
+    await api.importModelArtifact(modelPackageFile.value, modelPackageForm.value.name, modelPackageForm.value.version)
+    modelPackageFile.value = null
+    modelPackageForm.value = { name: '', version: '' }
+    await refreshModelArtifacts()
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    modelPackageLoading.value = false
+  }
+}
+
+async function activateModelPackage(artifact = null) {
+  modelPackageLoading.value = true
+  error.value = ''
+  try {
+    if (artifact) await api.activateModelArtifact(artifact.id)
+    else await api.activateBaseModel()
+    uieMode.value = 'on_demand'
+    localStorage.setItem('uieMode', 'on_demand')
+    await Promise.all([refreshModelArtifacts(), refreshModelRuntime()])
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    modelPackageLoading.value = false
+  }
+}
+
+async function removeModelPackage(artifact) {
+  if (!window.confirm(`确认删除模型“${artifact.name} ${artifact.version}”吗？\n权重文件会从本机同步删除。`)) return
+  modelPackageLoading.value = true
+  error.value = ''
+  try {
+    await api.deleteModelArtifact(artifact.id)
+    await refreshModelArtifacts()
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    modelPackageLoading.value = false
   }
 }
 
@@ -315,6 +395,8 @@ async function openReview(task = result.value) {
   reviewAliasChoices.value = {}
   reviewQuery.value = ''
   reviewCategoryFilter.value = 'all'
+  reviewSelection.value = ''
+  reviewSelectionLocation.value = ''
   error.value = ''
   try {
     reviewData.value = await api.getTaskReview(task.id)
@@ -394,6 +476,37 @@ function reviewSourceLabel(entity) {
   return '规则识别'
 }
 
+function categoryInputPrefix(category) {
+  const label = labelCategoryOptions.find(item => item.key === category)?.label || '敏感项'
+  return label.split(' / ')[0]
+    .replace('人员姓名', '人名')
+    .replace('联系电话', '电话')
+    .replace('证件号码', '证件')
+    .replace('电子邮箱', '邮箱')
+    .replace('地址信息', '地址')
+    .replace('其他敏感项', '敏感项')
+}
+
+function captureReviewSelection(payload) {
+  const selected = String(payload?.text || '').trim()
+  if (selected.length >= 2 && selected.length <= 200) {
+    reviewSelection.value = selected
+    reviewSelectionLocation.value = payload?.location || '全文预览'
+  }
+}
+
+function addReviewSelection() {
+  if (!reviewSelection.value) return
+  const line = `${categoryInputPrefix(reviewSelectionCategory.value)}|${reviewSelection.value}`
+  const existing = reviewAdditions.value.split(/\r?\n/).map(item => item.trim()).filter(Boolean)
+  if (!existing.some(item => item.toLocaleLowerCase('zh-CN') === line.toLocaleLowerCase('zh-CN'))) {
+    reviewAdditions.value = [...existing, line].join('\n')
+  }
+  reviewSelection.value = ''
+  reviewSelectionLocation.value = ''
+  window.getSelection()?.removeAllRanges()
+}
+
 function fileFromTrainingEvent(event) {
   const file = event.target.files?.[0] || event.dataTransfer?.files?.[0] || null
   if (file && file.size > maxUploadSizeMb.value * 1024 * 1024) {
@@ -453,15 +566,14 @@ async function openTrainingDocument(documentId) {
   }
 }
 
-function captureTrainingSelection() {
-  const selected = window.getSelection()?.toString().replace(/\s+/g, ' ').trim() || ''
+function captureTrainingSelection(payload) {
+  const selected = String(payload?.text || '').trim()
   if (selected.length >= 2 && selected.length <= 200) trainingSelection.value = selected
 }
 
 function addTrainingSelection() {
   if (!trainingSelection.value) return
-  const label = labelCategoryOptions.find(item => item.key === trainingSelectionCategory.value)?.label || '敏感项'
-  const prefix = label.split(' / ')[0].replace('人员姓名', '人名').replace('联系电话', '电话').replace('证件号码', '证件').replace('电子邮箱', '邮箱').replace('地址信息', '地址').replace('其他敏感项', '敏感项')
+  const prefix = categoryInputPrefix(trainingSelectionCategory.value)
   trainingAdditions.value = `${trainingAdditions.value}${trainingAdditions.value ? '\n' : ''}${prefix}|${trainingSelection.value}`
   trainingSelection.value = ''
   window.getSelection()?.removeAllRanges()
@@ -515,7 +627,7 @@ function selectMode(nextMode) {
   error.value = ''
 }
 
-onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels(), refreshTrainingDocuments()]))
+onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshModelArtifacts(), refreshLabels(), refreshTrainingDocuments()]))
 </script>
 
 <template>
@@ -538,8 +650,12 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
         <button title="质量洞察" :class="{ active: nav === 'analytics' }" @click="nav = 'analytics'; refreshData()">
           <span class="nav-icon"><AppIcon name="chart" /></span><span class="nav-text">洞察</span>
         </button>
+        <button title="模型中心" :class="{ active: nav === 'models' }" @click="nav = 'models'; refreshModelArtifacts(); refreshModelRuntime()">
+          <span class="nav-icon"><AppIcon name="package" /></span><span class="nav-text">模型</span>
+          <span v-if="modelArtifacts.length" class="nav-count">{{ modelArtifacts.length }}</span>
+        </button>
         <button title="训练标注" :class="{ active: nav === 'labels' }" @click="nav = 'labels'; refreshLabels(); refreshTrainingDocuments()">
-          <span class="nav-icon"><AppIcon name="info" /></span><span class="nav-text">训练</span>
+          <span class="nav-icon"><AppIcon name="scan" /></span><span class="nav-text">训练</span>
           <span v-if="trainingLabels.length" class="nav-count">{{ trainingLabels.length }}</span>
         </button>
         <button title="使用说明" :class="{ active: nav === 'guide' }" @click="nav = 'guide'">
@@ -746,15 +862,81 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
             <div v-if="reviewLoading" class="review-loading"><span class="spinner-border spinner-border-sm"></span> 正在读取或重新处理文件…</div>
             <template v-else>
               <div class="review-warning">{{ result?.status === 'review' ? '尚未开放脱敏文件下载。只有确认过的候选项和人工补录项会进入脱敏结果。' : '重新校正会生成新版脱敏文件，同时保留旧匿名编号的恢复能力；已有反匿名上传稿和正式输出会清除，请重新生成。' }}</div>
-              <DocumentPreview
-                class="review-document-preview"
-                :sections="reviewData.preview"
-                :entities="reviewData.entities"
-                :selected-keys="reviewSelectedTokens"
-                title="上传文件全文预览"
-                subtitle="所有相同字段都会统一着色；灰色删除线表示已取消脱敏"
-                empty-text="未提取到可预览文字；扫描 PDF 请确认 OCR 已成功完成。"
-              />
+              <div class="review-workbench">
+                <section class="review-preview-pane">
+                  <div class="pane-heading">
+                    <span><AppIcon name="scan" :size="21" /></span>
+                    <div><strong>全文原文预览</strong><small>从左侧任意位置划选漏识别字段，再到右侧点击箭头加入</small></div>
+                    <b>{{ reviewData.preview?.length || 0 }} 个分段</b>
+                  </div>
+                  <DocumentPreview
+                    class="review-document-preview"
+                    :sections="reviewData.preview"
+                    :entities="reviewData.entities"
+                    :selected-keys="reviewSelectedTokens"
+                    title="上传文件全文预览"
+                    subtitle="彩色高亮为机器候选；灰色删除线表示已取消脱敏"
+                    empty-text="未提取到可预览文字；扫描 PDF 请确认 OCR 已成功完成。"
+                    @text-selected="captureReviewSelection"
+                  />
+                </section>
+                <aside class="review-control-pane">
+                  <section class="selection-transfer" :class="{ ready: reviewSelection }">
+                    <div class="selection-transfer-icon"><AppIcon name="arrow-right" :size="27" /></div>
+                    <div class="selection-copy">
+                      <small>{{ reviewSelection ? `选自 ${reviewSelectionLocation}` : '在左侧文档中按住鼠标划选文字' }}</small>
+                      <strong>{{ reviewSelection || '划词后可补充机器漏识别项' }}</strong>
+                    </div>
+                    <select v-model="reviewSelectionCategory" class="form-select" :disabled="!reviewSelection">
+                      <option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option>
+                    </select>
+                    <button class="selection-arrow" :disabled="!reviewSelection" title="把所选文字加入识别项" @click="addReviewSelection">
+                      <AppIcon name="arrow-right" :size="24" /><span>加入识别</span>
+                    </button>
+                  </section>
+
+                  <section class="candidate-pane">
+                    <div class="review-list-heading">
+                      <label class="form-label app-label">识别候选 <small>勾选表示确认需要脱敏</small></label>
+                      <span><button @click="selectAllReviewCandidates">全选</button><button @click="clearReviewCandidates">清空</button></span>
+                    </div>
+                    <div class="review-filters">
+                      <label class="search-field"><AppIcon name="search" :size="17" /><input v-model="reviewQuery" class="form-control" placeholder="搜索字段或匿名代码" /></label>
+                      <select v-model="reviewCategoryFilter" class="form-select">
+                        <option value="all">全部类型</option>
+                        <option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option>
+                      </select>
+                      <span>{{ filteredReviewEntities.length }} 项</span>
+                    </div>
+                    <div class="review-entities">
+                      <article v-for="entity in filteredReviewEntities" :key="entity.key" :class="{ selected: reviewSelectedTokens.includes(entity.key), rejected: !reviewSelectedTokens.includes(entity.key) }">
+                        <div class="review-entity-main">
+                          <input v-model="reviewSelectedTokens" type="checkbox" :value="entity.key" :aria-label="`选择 ${entity.text}`" />
+                          <span class="review-token">{{ entity.token }}</span>
+                          <strong>{{ entity.text }}</strong>
+                          <span class="review-source">{{ reviewSourceLabel(entity) }} · {{ entity.occurrence_count || 0 }} 处</span>
+                          <select v-model="reviewCategories[entity.key]" class="form-select review-category" :disabled="!reviewSelectedTokens.includes(entity.key)">
+                            <option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option>
+                          </select>
+                        </div>
+                        <div v-if="entity.occurrences?.length" class="review-contexts">
+                          <p v-for="(occurrence, occurrenceIndex) in entity.occurrences" :key="occurrenceIndex">
+                            <small>{{ occurrence.location }}</small>
+                            <span>{{ occurrence.prefix }}</span><mark>{{ occurrence.match }}</mark><span>{{ occurrence.suffix }}</span>
+                          </p>
+                        </div>
+                      </article>
+                      <p v-if="!filteredReviewEntities.length" class="review-empty">没有符合当前筛选条件的候选项。可从左侧原文划词补录。</p>
+                    </div>
+                  </section>
+
+                  <section class="manual-additions">
+                    <label class="form-label app-label">人工补充清单 <small>{{ reviewAdditions.split(/\r?\n/).filter(Boolean).length }} 项</small></label>
+                    <textarea v-model="reviewAdditions" class="form-control review-textarea" placeholder="可在左侧划词加入，也可手动输入：&#10;单位|山东中烟&#10;产品|文山雨露&#10;人名|张三"></textarea>
+                    <p class="form-hint">确认字段会加密保存为本机标签；误识别会保存为否决样本。模型包导出不会包含这些原文数据。</p>
+                  </section>
+                </aside>
+              </div>
               <section v-if="reviewData.alias_groups?.length" class="alias-review">
                 <div class="preview-toolbar"><div><strong>可能指代同一单位</strong><small>请人工判断；合并后共用一个匿名代码，反匿名统一恢复为所选标准名称</small></div></div>
                 <article v-for="group in reviewData.alias_groups" :key="group.id">
@@ -768,47 +950,6 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
                   <small>{{ group.reason }} · 建议置信度 {{ Math.round((group.confidence || 0) * 100) }}%</small>
                 </article>
               </section>
-              <div class="review-grid">
-                <div>
-                  <div class="review-list-heading">
-                    <label class="form-label app-label">识别候选 <small>勾选表示确认需要脱敏</small></label>
-                    <span><button @click="selectAllReviewCandidates">全选</button><button @click="clearReviewCandidates">清空</button></span>
-                  </div>
-                  <div class="review-filters">
-                    <label class="search-field"><AppIcon name="search" :size="17" /><input v-model="reviewQuery" class="form-control" placeholder="搜索字段或匿名代码" /></label>
-                    <select v-model="reviewCategoryFilter" class="form-select">
-                      <option value="all">全部类型</option>
-                      <option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option>
-                    </select>
-                    <span>{{ filteredReviewEntities.length }} 项</span>
-                  </div>
-                  <div class="review-entities">
-                    <article v-for="entity in filteredReviewEntities" :key="entity.key" :class="{ selected: reviewSelectedTokens.includes(entity.key), rejected: !reviewSelectedTokens.includes(entity.key) }">
-                      <div class="review-entity-main">
-                        <input v-model="reviewSelectedTokens" type="checkbox" :value="entity.key" :aria-label="`选择 ${entity.text}`" />
-                        <span class="review-token">{{ entity.token }}</span>
-                        <strong>{{ entity.text }}</strong>
-                        <span class="review-source">{{ reviewSourceLabel(entity) }} · {{ entity.occurrence_count || 0 }} 处</span>
-                        <select v-model="reviewCategories[entity.key]" class="form-select review-category" :disabled="!reviewSelectedTokens.includes(entity.key)">
-                          <option v-for="category in labelCategoryOptions" :key="category.key" :value="category.key">{{ category.label }}</option>
-                        </select>
-                      </div>
-                      <div v-if="entity.occurrences?.length" class="review-contexts">
-                        <p v-for="(occurrence, occurrenceIndex) in entity.occurrences" :key="occurrenceIndex">
-                          <small>{{ occurrence.location }}</small>
-                          <span>{{ occurrence.prefix }}</span><mark>{{ occurrence.match }}</mark><span>{{ occurrence.suffix }}</span>
-                        </p>
-                      </div>
-                    </article>
-                    <p v-if="!filteredReviewEntities.length" class="review-empty">没有符合当前筛选条件的候选项，请调整搜索或在右侧补录。</p>
-                  </div>
-                </div>
-                <div>
-                  <label class="form-label app-label">补充漏识别内容 <small>每行一个</small></label>
-                  <textarea v-model="reviewAdditions" class="form-control review-textarea" placeholder="单位|山东中烟&#10;产品|文山雨露&#10;产区|文山&#10;人名|张三"></textarea>
-                  <p class="form-hint">每个勾选确认的字段（包括电话、证件、邮箱和自定义项）都会立即成为本机加密标签；勾掉的误识别会保存为加密否决样本，供后续微调评测。</p>
-                </div>
-              </div>
               <div class="review-footer">
                 <span>已选择 {{ reviewSelectedTokens.length }} / {{ reviewData.entities?.length || 0 }} 项 · 历史已排除 {{ reviewData.excluded_count || 0 }} 项</span>
                 <button class="btn primary-btn" :disabled="reviewLoading || (!reviewAdditions.trim() && !reviewSelectedTokens.length)" @click="applyReview">
@@ -861,6 +1002,86 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshLabels
 
         <template v-else-if="nav === 'analytics'">
           <AnalyticsPanel :stats="stats" :loading="loadingHistory" @refresh="refreshData" />
+        </template>
+
+        <template v-else-if="nav === 'models'">
+          <section class="model-hero">
+            <span class="model-hero-icon"><AppIcon name="package" :size="31" /></span>
+            <div>
+              <small class="heading-kicker">LOCAL MODEL REGISTRY</small>
+              <h2>本地模型中心</h2>
+              <p>管理 UIE 权重版本、受控导入与可移植导出。权重始终保存在本机 Docker 数据卷中。</p>
+            </div>
+            <div class="active-model-summary">
+              <small>当前识别模型</small>
+              <strong>{{ modelArtifacts.find(item => item.is_active)?.name || modelBase.name }}</strong>
+              <span :class="{ online: modelRuntime.available }"><i></i>{{ modelRuntime.available ? (modelRuntime.resident_loaded ? '已加载到内存' : '服务就绪') : '服务不可用' }}</span>
+            </div>
+          </section>
+
+          <div class="model-center-grid">
+            <section class="model-import-card">
+              <div class="section-title-row">
+                <span><AppIcon name="upload" :size="23" /></span>
+                <div><h2>导入训练权重</h2><p>接受经本平台或 PaddleNLP 微调后打包的 ZIP 检查点</p></div>
+              </div>
+              <label class="model-drop" :class="{ selected: modelPackageFile }">
+                <input type="file" accept=".zip,application/zip" @change="fileFromModelPackageEvent" />
+                <AppIcon :name="modelPackageFile ? 'check' : 'package'" :size="31" />
+                <strong>{{ modelPackageFile?.name || '选择 UIE 模型包' }}</strong>
+                <small>{{ modelPackageFile ? `${formatBytes(modelPackageFile.size)} · 等待安全校验` : `ZIP 格式 · 最大 ${modelPackageMaxMb} MB` }}</small>
+              </label>
+              <div class="model-meta-fields">
+                <label><span>显示名称</span><input v-model="modelPackageForm.name" class="form-control" maxlength="120" placeholder="例如：行业实体识别模型" /></label>
+                <label><span>版本</span><input v-model="modelPackageForm.version" class="form-control" maxlength="64" placeholder="例如：1.2.0" /></label>
+              </div>
+              <button class="btn primary-btn model-import-action" :disabled="modelPackageLoading || !modelPackageFile" @click="importModelPackage">
+                <span v-if="modelPackageLoading" class="spinner-border spinner-border-sm"></span><AppIcon v-else name="upload" :size="18" />
+                校验并导入模型
+              </button>
+            </section>
+
+            <aside class="model-safety-card">
+              <div class="section-title-row">
+                <span><AppIcon name="shield-check" :size="23" /></span>
+                <div><h2>安全边界</h2><p>模型能共享，业务数据不随模型导出</p></div>
+              </div>
+              <ul>
+                <li><AppIcon name="check" :size="17" /><span><strong>结构校验</strong><small>必须包含权重、配置和分词器词表</small></span></li>
+                <li><AppIcon name="check" :size="17" /><span><strong>归档防护</strong><small>拦截路径穿越、符号链接和异常压缩比</small></span></li>
+                <li><AppIcon name="check" :size="17" /><span><strong>隐私隔离</strong><small>不导出原文、标签库、匿名映射和部署密钥</small></span></li>
+                <li><AppIcon name="check" :size="17" /><span><strong>完整性清单</strong><small>逐文件生成 SHA-256，可核对模型版本</small></span></li>
+              </ul>
+            </aside>
+          </div>
+
+          <section class="model-registry-card">
+            <div class="registry-heading">
+              <div><h2>模型版本</h2><p>激活会先释放常驻模型，新权重在下一次识别时加载；业务规则与本机标签仍会叠加生效。</p></div>
+              <span>{{ modelArtifacts.length + 1 }} 个版本</span>
+            </div>
+            <div class="model-registry-list">
+              <article :class="{ active: modelBase.is_active }">
+                <span class="registry-icon"><AppIcon name="model" :size="25" /></span>
+                <div class="registry-main"><strong>{{ modelBase.name }}</strong><small>内置基础模型 · 随系统镜像提供</small></div>
+                <span class="registry-status">{{ modelBase.is_active ? '当前使用' : '可切换' }}</span>
+                <div class="registry-actions"><button v-if="!modelBase.is_active" class="btn light-btn" :disabled="modelPackageLoading" @click="activateModelPackage()">设为当前</button></div>
+              </article>
+              <article v-for="artifact in modelArtifacts" :key="artifact.id" :class="{ active: artifact.is_active }">
+                <span class="registry-icon custom"><AppIcon name="package" :size="25" /></span>
+                <div class="registry-main">
+                  <strong>{{ artifact.name }} <em>v{{ artifact.version }}</em></strong>
+                  <small>{{ artifact.base_model }} · {{ formatBytes(artifact.package_size) }} · {{ artifact.file_count }} 个文件 · {{ artifact.package_sha256.slice(0, 12) }}</small>
+                </div>
+                <span class="registry-status">{{ artifact.is_active ? '当前使用' : formatDate(artifact.created_at) }}</span>
+                <div class="registry-actions">
+                  <button v-if="!artifact.is_active" class="btn light-btn" :disabled="modelPackageLoading" @click="activateModelPackage(artifact)">设为当前</button>
+                  <a class="btn icon-btn" :href="api.modelArtifactExportUrl(artifact.id)" title="导出可移植模型包"><AppIcon name="download" :size="18" /></a>
+                  <button class="btn icon-btn danger" title="删除本机模型包" :disabled="modelPackageLoading || artifact.is_active" @click="removeModelPackage(artifact)"><AppIcon name="trash" :size="18" /></button>
+                </div>
+              </article>
+            </div>
+          </section>
         </template>
 
         <template v-else-if="nav === 'labels'">

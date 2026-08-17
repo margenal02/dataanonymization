@@ -330,6 +330,7 @@ write_secure_environment() {
         set_env_value DEBIAN_MIRROR "${APT_MIRROR}/debian"
         set_env_value UIE_ENABLED "1"
         set_env_value REQUIRE_HUMAN_REVIEW "1"
+        grep -q '^MODEL_PACKAGE_MAX_SIZE_MB=' "$env_file" || set_env_value MODEL_PACKAGE_MAX_SIZE_MB "1024"
         set_env_value UIE_MODEL "uie-base"
         set_env_value UIE_POSITION_PROB "0.45"
         set_env_value UIE_PERSON_PROB "0.70"
@@ -385,6 +386,7 @@ DJANGO_HSTS_INCLUDE_SUBDOMAINS=0
 DJANGO_HSTS_PRELOAD=0
 ALLOWED_HOSTS=${allowed_hosts}
 MAX_UPLOAD_SIZE_MB=200
+MODEL_PACKAGE_MAX_SIZE_MB=1024
 REQUIRE_HUMAN_REVIEW=1
 DATA_RETENTION_DAYS=30
 MYSQL_IMAGE=${DOCKER_HUB_PREFIX}mysql:8.4

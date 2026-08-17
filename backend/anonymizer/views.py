@@ -27,7 +27,14 @@ from .file_processors import (
     process_file,
     validate_upload_content,
 )
-from .models import AnonymizationTask, RecognitionLabel, TrainingDocument, TrainingExample
+from .models import AnonymizationTask, ModelArtifact, RecognitionLabel, TrainingDocument, TrainingExample
+from .model_packages import (
+    ModelPackageError,
+    activate_artifact,
+    artifact_to_dict,
+    build_export_file,
+    import_model_package,
+)
 from .recognizer import (
     CATEGORY_LABELS,
     DEFAULT_CATEGORIES,
@@ -490,7 +497,9 @@ def health(request):
 @api_view(["GET", "POST"])
 def model_runtime(request):
     if request.method == "GET":
-        return Response(runtime_status())
+        result = runtime_status()
+        result["active_artifact_id"] = str(ModelArtifact.objects.filter(is_active=True).values_list("id", flat=True).first() or "")
+        return Response(result)
     mode = request.data.get("mode", "on_demand")
     try:
         set_runtime_mode(mode)
@@ -499,6 +508,91 @@ def model_runtime(request):
     result = runtime_status()
     result["selected_mode"] = mode
     return Response(result)
+
+
+@api_view(["GET", "POST"])
+@parser_classes([MultiPartParser, FormParser])
+@throttle_classes([LocalUploadThrottle])
+def model_artifact_collection(request):
+    if request.method == "GET":
+        artifacts = [artifact_to_dict(item) for item in ModelArtifact.objects.all()]
+        active = next((item for item in artifacts if item["is_active"]), None)
+        return Response({
+            "base_model": {
+                "name": settings.UIE_MODEL,
+                "version": "内置",
+                "is_active": active is None,
+            },
+            "artifacts": artifacts,
+            "active_artifact_id": active["id"] if active else "",
+            "max_package_size_mb": settings.MODEL_PACKAGE_MAX_SIZE_MB,
+            "package_format": "data-security-uie-model/v1",
+        })
+    try:
+        artifact = import_model_package(
+            request.FILES.get("file"),
+            request.data.get("name", ""),
+            request.data.get("version", ""),
+        )
+    except ModelPackageError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(artifact_to_dict(artifact), status=status.HTTP_201_CREATED)
+
+
+@api_view(["DELETE"])
+def model_artifact_detail(request, artifact_id):
+    artifact = get_object_or_404(ModelArtifact, id=artifact_id)
+    if artifact.is_active:
+        return Response({"detail": "正在使用的模型不能删除，请先切换到内置模型。"}, status=status.HTTP_409_CONFLICT)
+    if request.headers.get("X-Model-Delete-Confirm") != str(artifact.id):
+        return Response({"detail": "删除模型包需要确认。"}, status=status.HTTP_400_BAD_REQUEST)
+    artifact.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(["POST"])
+def model_artifact_activate(request, artifact_id):
+    artifact = get_object_or_404(ModelArtifact, id=artifact_id)
+    try:
+        set_runtime_mode("on_demand")
+    except UIEProcessingError:
+        # The pointer remains useful after a manager/container restart.
+        pass
+    try:
+        activate_artifact(artifact)
+    except ModelPackageError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+    result = artifact_to_dict(artifact)
+    result["detail"] = "模型已激活，将在下一次识别时加载。"
+    return Response(result)
+
+
+@api_view(["POST"])
+def model_base_activate(request):
+    try:
+        set_runtime_mode("on_demand")
+    except UIEProcessingError:
+        pass
+    activate_artifact(None)
+    return Response({
+        "name": settings.UIE_MODEL,
+        "is_active": True,
+        "detail": "已切换到内置模型，将在下一次识别时加载。",
+    })
+
+
+@api_view(["GET"])
+def model_artifact_export(request, artifact_id):
+    artifact = get_object_or_404(ModelArtifact, id=artifact_id)
+    try:
+        export_file = build_export_file(artifact)
+    except ModelPackageError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+    safe_name = _safe_name(f"{artifact.name}-{artifact.version}.zip")
+    response = FileResponse(export_file, as_attachment=True, filename=safe_name, content_type="application/zip")
+    response["X-Content-Type-Options"] = "nosniff"
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 @api_view(["GET", "POST"])

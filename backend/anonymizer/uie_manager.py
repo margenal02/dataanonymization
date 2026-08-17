@@ -18,6 +18,18 @@ START_TIMEOUT = int(os.getenv("UIE_START_TIMEOUT_SECONDS", "600"))
 REQUEST_TIMEOUT = int(os.getenv("UIE_REQUEST_TIMEOUT_SECONDS", "1800"))
 
 
+def _configured_model_name():
+    pointer = os.getenv("UIE_MODEL_POINTER", "")
+    if not pointer:
+        return MODEL_NAME
+    try:
+        with open(pointer, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return f"{payload.get('name') or '本地模型'} {payload.get('version') or ''}".strip()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return MODEL_NAME
+
+
 class ModelWorker:
     def __init__(self):
         worker_environment = os.environ.copy()
@@ -38,6 +50,7 @@ class ModelWorker:
         if ready.get("event") != "ready":
             self.close()
             raise RuntimeError(ready.get("detail", "UIE-base 模型未能完成初始化。"))
+        self.model_name = ready.get("model", MODEL_NAME)
 
     def _read_stdout(self):
         try:
@@ -121,7 +134,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         worker = RESIDENT_WORKER
         loaded = bool(worker is not None and worker.process.poll() is None)
-        self._json(200, {"available": True, "model": MODEL_NAME, "resident_loaded": loaded})
+        self._json(200, {
+            "available": True,
+            "model": worker.model_name if loaded else _configured_model_name(),
+            "resident_loaded": loaded,
+        })
 
     def do_POST(self):
         try:
@@ -140,17 +157,17 @@ class Handler(BaseHTTPRequestHandler):
                             entities = worker.predict(payload)
                         finally:
                             worker.close()
-                self._json(200, {"entities": entities, "mode": mode, "model": MODEL_NAME})
+                self._json(200, {"entities": entities, "mode": mode, "model": _configured_model_name()})
                 return
             if self.path == "/warmup":
                 with MODEL_LOCK:
-                    _ensure_resident()
-                self._json(200, {"resident_loaded": True, "model": MODEL_NAME})
+                    worker = _ensure_resident()
+                self._json(200, {"resident_loaded": True, "model": worker.model_name})
                 return
             if self.path == "/unload":
                 with MODEL_LOCK:
                     _unload_resident()
-                self._json(200, {"resident_loaded": False, "model": MODEL_NAME})
+                self._json(200, {"resident_loaded": False, "model": _configured_model_name()})
                 return
             self._json(404, {"detail": "not found"})
         except (ValueError, json.JSONDecodeError) as exc:

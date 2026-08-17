@@ -46,6 +46,21 @@ export const api = {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ mode })
   }),
+  listModelArtifacts: () => request('/model/artifacts/'),
+  importModelArtifact(file, name, version) {
+    const form = new FormData()
+    form.append('file', file)
+    if (name) form.append('name', name)
+    if (version) form.append('version', version)
+    return request('/model/artifacts/', { method: 'POST', body: form })
+  },
+  activateModelArtifact: artifactId => request(`/model/artifacts/${artifactId}/activate/`, { method: 'POST' }),
+  activateBaseModel: () => request('/model/artifacts/base/activate/', { method: 'POST' }),
+  deleteModelArtifact: artifactId => request(`/model/artifacts/${artifactId}/`, {
+    method: 'DELETE',
+    headers: { 'X-Model-Delete-Confirm': artifactId }
+  }),
+  modelArtifactExportUrl: artifactId => `${API_ROOT}/model/artifacts/${artifactId}/export/`,
   listLabels: () => request('/labels/'),
   createLabel: label => request('/labels/', {
     method: 'POST',

@@ -22,6 +22,30 @@ def training_upload_path(instance, filename):
     return f"training/{instance.id}/input/{filename}"
 
 
+class ModelArtifact(models.Model):
+    """A validated, portable UIE checkpoint stored in local model storage."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=120)
+    version = models.CharField(max_length=64, default="1.0.0")
+    base_model = models.CharField(max_length=80, default="uie-base")
+    storage_folder = models.CharField(max_length=255, unique=True)
+    package_sha256 = models.CharField(max_length=64)
+    package_size = models.PositiveBigIntegerField(default=0)
+    file_manifest = models.JSONField(default=dict, blank=True)
+    is_active = models.BooleanField(default=False, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "本地 UIE 模型包"
+        verbose_name_plural = "本地 UIE 模型包"
+
+    def __str__(self):
+        return f"{self.name} {self.version}"
+
+
 class AnonymizationTask(models.Model):
     class Status(models.TextChoices):
         PROCESSING = "processing", "处理中"

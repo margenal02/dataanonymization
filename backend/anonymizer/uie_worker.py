@@ -19,21 +19,43 @@ def _schema(categories):
     return list(dict.fromkeys(result))
 
 
+def _model_configuration():
+    base_model = os.getenv("UIE_MODEL", "uie-base")
+    pointer_value = os.getenv("UIE_MODEL_POINTER", "")
+    if not pointer_value:
+        return {"model": base_model}, base_model
+    pointer = os.path.realpath(pointer_value)
+    try:
+        with open(pointer, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        task_path = os.path.realpath(str(payload.get("task_path", "")))
+        allowed_root = os.path.realpath(os.path.dirname(pointer))
+        if not task_path.startswith(allowed_root + os.sep) or not os.path.isdir(task_path):
+            raise ValueError("自定义模型路径不在受控模型目录中。")
+        base_model = str(payload.get("base_model") or base_model)
+        identity = f"{payload.get('name') or '本地模型'} {payload.get('version') or ''}".strip()
+        return {"model": base_model, "task_path": task_path}, identity
+    except FileNotFoundError:
+        return {"model": base_model}, base_model
+
+
 def _load_engine():
     ensure_aistudio_download_compatibility()
     from paddlenlp import Taskflow
     from paddlenlp.utils.log import logger
 
     logger.set_level("ERROR")
-    return Taskflow(
+    model_options, identity = _model_configuration()
+    engine = Taskflow(
         "information_extraction",
         schema=["人名"],
-        model=os.getenv("UIE_MODEL", "uie-base"),
         device_id=-1,
         batch_size=max(1, int(os.getenv("UIE_BATCH_SIZE", "1"))),
         position_prob=float(os.getenv("UIE_POSITION_PROB", "0.45")),
         max_seq_len=max(128, int(os.getenv("UIE_MAX_SEQ_LEN", "512"))),
+        **model_options,
     )
+    return engine, identity
 
 
 def _predict(engine, payload):
@@ -73,11 +95,11 @@ def serve():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     try:
-        engine = _load_engine()
+        engine, identity = _load_engine()
     except Exception as exc:
         _emit({"event": "error", "detail": f"UIE-base 模型加载失败：{exc}"})
         return 1
-    _emit({"event": "ready", "model": os.getenv("UIE_MODEL", "uie-base")})
+    _emit({"event": "ready", "model": identity})
     for line in sys.stdin:
         try:
             payload = json.loads(line)
