@@ -53,6 +53,7 @@ class AnonymizationTask(models.Model):
         COMPLETED = "completed", "脱敏完成"
         RESTORED = "restored", "已反匿名"
         FAILED = "failed", "处理失败"
+        CANCELLED = "cancelled", "已中断"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     task_name = models.CharField(max_length=120, db_index=True)
@@ -68,6 +69,7 @@ class AnonymizationTask(models.Model):
     mapping_ciphertext = models.TextField(blank=True)
     entity_counts = models.JSONField(default=dict, blank=True)
     options = models.JSONField(default=dict, blank=True)
+    cancel_requested = models.BooleanField(default=False)
     error_message = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

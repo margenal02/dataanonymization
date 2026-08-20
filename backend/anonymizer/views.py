@@ -21,6 +21,7 @@ from rest_framework.response import Response
 from .crypto import decrypt_mapping, encrypt_mapping
 from .entity_schema import UIE_TRAINING_PROMPT_BY_CATEGORY
 from .file_processors import (
+    ProcessingCancelled,
     ProcessingError,
     SUPPORTED_EXTENSIONS,
     extract_pdf_pages,
@@ -146,13 +147,21 @@ def _sha256(upload):
     return digest.hexdigest()
 
 
-def _collect_text_chunks(source, task_id, progress_callback=None):
+def _collect_text_chunks(
+    source,
+    task_id,
+    progress_callback=None,
+    ocr_mode=None,
+    cancel_callback=None,
+):
     chunks = []
     total_chars = 0
     extension = Path(source).suffix.lower()
 
     def collect(text):
         nonlocal total_chars
+        if cancel_callback and cancel_callback():
+            raise ProcessingCancelled("任务已由用户中断。")
         value = str(text or "").strip()
         if not value:
             return text
@@ -165,7 +174,12 @@ def _collect_text_chunks(source, task_id, progress_callback=None):
         return text
 
     if extension == ".pdf":
-        pdf_pages = extract_pdf_pages(source, progress_callback)
+        pdf_pages = extract_pdf_pages(
+            source,
+            progress_callback,
+            ocr_mode=ocr_mode,
+            cancel_callback=cancel_callback,
+        )
         for page_text in pdf_pages:
             collect(page_text)
         return chunks, pdf_pages
@@ -173,10 +187,73 @@ def _collect_text_chunks(source, task_id, progress_callback=None):
     discovery_path = Path(settings.MEDIA_ROOT) / "processing" / str(task_id) / f"uie-discovery{extension}"
 
     try:
-        process_file(source, discovery_path, collect)
+        process_file(source, discovery_path, collect, cancel_callback=cancel_callback)
     finally:
         discovery_path.unlink(missing_ok=True)
     return chunks, None
+
+
+def _cached_pdf_pages(mapping):
+    indexed_pages = {}
+    for section in (mapping or {}).get("review_preview", []):
+        match = re.fullmatch(r"第\s*(\d+)\s*页", str(section.get("location", "")).strip())
+        if match:
+            indexed_pages[int(match.group(1))] = str(section.get("text", ""))
+    if not indexed_pages:
+        return None
+    expected = list(range(1, max(indexed_pages) + 1))
+    if sorted(indexed_pages) != expected:
+        return None
+    return [indexed_pages[index] for index in expected]
+
+
+def _task_cancel_requested(task_id):
+    return bool(
+        AnonymizationTask.objects.filter(id=task_id).values_list("cancel_requested", flat=True).first()
+    )
+
+
+def _finish_interrupted_task(task, detail="任务已由用户中断。"):
+    task.refresh_from_db()
+    options = dict(task.options or {})
+    previous_status = options.pop("processing_previous_status", "")
+    if previous_status not in {
+        AnonymizationTask.Status.REVIEW,
+        AnonymizationTask.Status.COMPLETED,
+        AnonymizationTask.Status.RESTORED,
+    }:
+        previous_status = AnonymizationTask.Status.CANCELLED
+    previous_percent = int((options.get("processing_progress") or {}).get("percent", 0))
+    options["processing_progress"] = {
+        "percent": previous_percent,
+        "stage": "cancelled",
+        "detail": detail,
+    }
+    task.status = previous_status
+    task.options = options
+    task.cancel_requested = False
+    task.error_message = detail
+    task.save(update_fields=["status", "options", "cancel_requested", "error_message", "updated_at"])
+    return task
+
+
+def _restore_task_after_processing_error(task, detail):
+    task.refresh_from_db()
+    options = dict(task.options or {})
+    previous_status = options.pop("processing_previous_status", "")
+    if previous_status in {
+        AnonymizationTask.Status.REVIEW,
+        AnonymizationTask.Status.COMPLETED,
+        AnonymizationTask.Status.RESTORED,
+    }:
+        task.status = previous_status
+    else:
+        task.status = AnonymizationTask.Status.FAILED
+    task.options = options
+    task.cancel_requested = False
+    task.error_message = detail
+    task.save(update_fields=["status", "options", "cancel_requested", "error_message", "updated_at"])
+    return task
 
 
 def _select_model_entities(builder, entities):
@@ -306,9 +383,19 @@ def _process_task(
 ):
     processing_started = time.monotonic()
     options = dict(task.options or {})
+    previous_status = task.status
+    if previous_status != AnonymizationTask.Status.PROCESSING:
+        options["processing_previous_status"] = previous_status
+    ocr_mode = str(options.get("ocr_mode") or getattr(settings, "PDF_OCR_MODE", "fast"))
+    options["ocr_mode"] = ocr_mode
     task.status = AnonymizationTask.Status.PROCESSING
 
+    def check_cancelled():
+        return _task_cancel_requested(task.id)
+
     def report_progress(event):
+        if check_cancelled():
+            raise ProcessingCancelled("任务已由用户中断。")
         progress = {
             "percent": max(0, min(100, int(event.get("percent", 0)))),
             "stage": str(event.get("stage", "processing")),
@@ -325,11 +412,26 @@ def _process_task(
     report_progress({"percent": 2, "stage": "prepare", "detail": "文件已保存，正在检查内容结构"})
     model_entity_count = 0
     model_metadata = {}
-    text_chunks, pdf_pages = _collect_text_chunks(
-        task.input_file.path,
-        task.id,
-        progress_callback=report_progress,
-    )
+    pdf_pages = _cached_pdf_pages(previous_mapping) if task.file_type == "pdf" else None
+    if pdf_pages is not None:
+        text_chunks = list(pdf_pages)
+        report_progress({
+            "percent": 55,
+            "stage": "pdf_cache",
+            "detail": f"已复用首次识别的 {len(pdf_pages)} 页 OCR 文字，无需重复扫描",
+            "pdf_page_count": len(pdf_pages),
+            "ocr_page_count": int(options.get("ocr_page_count", 0)),
+        })
+    else:
+        text_chunks, pdf_pages = _collect_text_chunks(
+            task.input_file.path,
+            task.id,
+            progress_callback=report_progress,
+            ocr_mode=ocr_mode,
+            cancel_callback=check_cancelled,
+        )
+    if check_cancelled():
+        raise ProcessingCancelled("任务已由用户中断。")
     filename_stem = Path(task.original_name).stem
     recognition_chunks = list(text_chunks)
     if filename_stem and filename_stem not in recognition_chunks:
@@ -353,9 +455,15 @@ def _process_task(
         token_namespace=settings.ANONYMIZATION_NAMESPACE,
     )
     for text_chunk in recognition_chunks:
+        if check_cancelled():
+            raise ProcessingCancelled("任务已由用户中断。")
         builder.discover(text_chunk)
 
-    if settings.UIE_ENABLED and set(categories) & {"person", "organization", "address", "location", "product"}:
+    if (
+        not previous_mapping
+        and settings.UIE_ENABLED
+        and set(categories) & {"person", "organization", "address", "location", "product"}
+    ):
         report_progress({"percent": 60, "stage": "uie", "detail": "正在使用 UIE-base 复核敏感信息"})
         model_entities, rejected_count = _select_model_entities(
             builder, predict_entities(list(dict.fromkeys(recognition_chunks)), categories, uie_mode)
@@ -367,6 +475,8 @@ def _process_task(
                     "probability": round(float(entity.get("probability", 0.0)), 4),
                 }
         options["uie_rejected_count"] = rejected_count
+        if check_cancelled():
+            raise ProcessingCancelled("任务已由用户中断。")
     options["uie_detected_count"] = model_entity_count
 
     alias_suggestions = suggest_organization_alias_groups(builder, searchable_text)
@@ -406,6 +516,8 @@ def _process_task(
                 builder.anonymize_registered,
                 pdf_pages=pdf_pages,
                 progress_callback=report_progress,
+                ocr_mode=ocr_mode,
+                cancel_callback=check_cancelled,
             )
             if task.anonymized_file:
                 task.anonymized_file.delete(save=False)
@@ -469,6 +581,10 @@ def _process_task(
         "stage": "review" if await_review else "completed",
         "detail": "候选识别完成，请人工确认" if await_review else "脱敏文件生成完成",
     }
+    task.options.pop("processing_previous_status", None)
+    if check_cancelled():
+        raise ProcessingCancelled("任务已由用户中断。")
+    task.cancel_requested = False
     task.error_message = ""
     task.status = AnonymizationTask.Status.REVIEW if await_review else AnonymizationTask.Status.COMPLETED
     task.save()
@@ -851,11 +967,26 @@ def task_collection(request):
     if error:
         return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
 
+    active_task = AnonymizationTask.objects.filter(
+        status=AnonymizationTask.Status.PROCESSING,
+    ).order_by("-updated_at").first()
+    if active_task:
+        return Response(
+            {
+                "detail": "本机已有文件正在处理。为避免多个 OCR 任务争抢 CPU 和内存，请等待完成或先中断当前任务。",
+                "active_task": TaskSerializer(active_task, context={"request": request}).data,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
     categories = _parse_json(request.data.get("categories"), DEFAULT_CATEGORIES)
     categories = [item for item in categories if item in DEFAULT_CATEGORIES]
     uie_mode = request.data.get("uie_mode", "on_demand")
     if uie_mode not in {"on_demand", "resident"}:
         return Response({"detail": "无效的 UIE 运行模式。"}, status=status.HTTP_400_BAD_REQUEST)
+    ocr_mode = str(request.data.get("ocr_mode") or getattr(settings, "PDF_OCR_MODE", "fast")).strip().lower()
+    if ocr_mode not in {"fast", "layout"}:
+        return Response({"detail": "无效的 OCR 模式。"}, status=status.HTTP_400_BAD_REQUEST)
     custom = _custom_entities(request.data.get("custom_entities", ""))
     try:
         save_task_custom_entities(custom)
@@ -880,6 +1011,7 @@ def task_collection(request):
             "custom_entity_count": len(custom),
             "learned_label_count": len(learned),
             "uie_mode": uie_mode,
+            "ocr_mode": ocr_mode,
             "uie_model": settings.UIE_MODEL if settings.UIE_ENABLED else "disabled",
             "review_required": review_required,
             "review_confirmed": False,
@@ -888,11 +1020,19 @@ def task_collection(request):
 
     try:
         _process_task(task, categories, uie_mode, combined_custom, await_review=review_required)
+    except ProcessingCancelled as exc:
+        _finish_interrupted_task(task, str(exc))
+        return Response(
+            {
+                "detail": str(exc),
+                "task": TaskSerializer(task, context={"request": request}).data,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
     except Exception as exc:
         logger.exception("Anonymization task failed", extra={"task_id": str(task.id)})
-        task.status = AnonymizationTask.Status.FAILED
-        task.error_message = str(exc) if isinstance(exc, (ProcessingError, UIEProcessingError, ValueError)) else "文件处理失败，请检查文件是否损坏。"
-        task.save(update_fields=["status", "error_message", "updated_at"])
+        detail = str(exc) if isinstance(exc, (ProcessingError, UIEProcessingError, ValueError)) else "文件处理失败，请检查文件是否损坏。"
+        _restore_task_after_processing_error(task, detail)
         return Response(TaskSerializer(task, context={"request": request}).data, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
     return Response(TaskSerializer(task, context={"request": request}).data, status=status.HTTP_201_CREATED)
@@ -902,11 +1042,35 @@ def task_collection(request):
 def task_detail(request, task_id):
     task = get_object_or_404(AnonymizationTask, id=task_id)
     if request.method == "DELETE":
+        if task.status == AnonymizationTask.Status.PROCESSING:
+            return Response(
+                {"detail": "任务仍在处理中，请先中断任务，待状态更新后再删除。"},
+                status=status.HTTP_409_CONFLICT,
+            )
         if request.headers.get("X-Task-Delete-Confirm") != str(task.id):
             return Response({"detail": "缺少有效的删除确认信息。"}, status=status.HTTP_400_BAD_REQUEST)
         task.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
     return Response(TaskSerializer(task, context={"request": request}).data)
+
+
+@api_view(["POST"])
+def cancel_task(request, task_id):
+    task = get_object_or_404(AnonymizationTask, id=task_id)
+    if task.status != AnonymizationTask.Status.PROCESSING:
+        return Response(
+            {"detail": "该任务当前不在处理中，无需中断。"},
+            status=status.HTTP_409_CONFLICT,
+        )
+    AnonymizationTask.objects.filter(
+        id=task.id,
+        status=AnonymizationTask.Status.PROCESSING,
+    ).update(cancel_requested=True)
+    task.refresh_from_db()
+    return Response(
+        TaskSerializer(task, context={"request": request}).data,
+        status=status.HTTP_202_ACCEPTED,
+    )
 
 
 def _review_entities(mapping):
@@ -982,6 +1146,11 @@ def _review_payload(task, mapping, request, excluded_count=None):
 @api_view(["GET", "POST"])
 def task_review(request, task_id):
     task = get_object_or_404(AnonymizationTask, id=task_id)
+    if request.method == "POST" and task.status == AnonymizationTask.Status.PROCESSING:
+        return Response(
+            {"detail": "该任务正在生成文件，请勿重复提交；如需停止，请点击中断脱敏。"},
+            status=status.HTTP_409_CONFLICT,
+        )
     if not task.mapping_ciphertext or not task.input_file:
         return Response({"detail": "该任务没有可校正的识别映射或原始文件。"}, status=status.HTTP_409_CONFLICT)
     try:
@@ -1117,6 +1286,21 @@ def task_review(request, task_id):
             "reviewed_at": timezone.now().isoformat(),
         })
         task_options["review_metrics"] = review_metrics
+        previous_status = task.status
+        task_options["processing_previous_status"] = previous_status
+        claimed = AnonymizationTask.objects.filter(
+            id=task.id,
+            status=previous_status,
+        ).update(
+            status=AnonymizationTask.Status.PROCESSING,
+            cancel_requested=False,
+            options=task_options,
+        )
+        if not claimed:
+            return Response(
+                {"detail": "任务状态已经变化，请刷新后重试。"},
+                status=status.HTTP_409_CONFLICT,
+            )
         task.options = task_options
         _process_task(
             task,
@@ -1135,10 +1319,18 @@ def task_review(request, task_id):
             if field:
                 field.delete(save=False)
         task.save(update_fields=["restore_input_file", "restored_file", "updated_at"])
+    except ProcessingCancelled as exc:
+        _finish_interrupted_task(task, str(exc))
+        return Response(
+            {"detail": str(exc), "task": TaskSerializer(task, context={"request": request}).data},
+            status=status.HTTP_409_CONFLICT,
+        )
     except (ProcessingError, UIEProcessingError, ValueError) as exc:
+        _restore_task_after_processing_error(task, str(exc))
         return Response({"detail": str(exc)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
     except Exception:
         logger.exception("Review reprocessing failed", extra={"task_id": str(task.id)})
+        _restore_task_after_processing_error(task, "校正后重新处理失败，请查看后端日志。")
         return Response({"detail": "校正后重新处理失败，请查看后端日志。"}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
     return Response(_review_payload(

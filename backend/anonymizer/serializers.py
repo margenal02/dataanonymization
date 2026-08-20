@@ -13,10 +13,12 @@ class TaskSerializer(serializers.ModelSerializer):
     uie_rejected_count = serializers.SerializerMethodField()
     processing_progress = serializers.SerializerMethodField()
     ocr_page_count = serializers.SerializerMethodField()
+    ocr_mode = serializers.SerializerMethodField()
     review_required = serializers.SerializerMethodField()
     review_confirmed = serializers.SerializerMethodField()
     review_candidate_count = serializers.SerializerMethodField()
     anonymization_namespace = serializers.SerializerMethodField()
+    can_cancel = serializers.SerializerMethodField()
 
     class Meta:
         model = AnonymizationTask
@@ -25,9 +27,9 @@ class TaskSerializer(serializers.ModelSerializer):
             "entity_counts", "error_message", "created_at", "updated_at",
             "anonymized_download_url", "restored_download_url", "stored_files",
             "recognition_mode", "uie_detected_count", "uie_rejected_count",
-            "processing_progress", "ocr_page_count",
+            "processing_progress", "ocr_page_count", "ocr_mode",
             "review_required", "review_confirmed", "review_candidate_count",
-            "anonymization_namespace",
+            "anonymization_namespace", "cancel_requested", "can_cancel",
         ]
 
     def _url(self, task, kind):
@@ -63,6 +65,9 @@ class TaskSerializer(serializers.ModelSerializer):
     def get_ocr_page_count(self, task):
         return int((task.options or {}).get("ocr_page_count", 0))
 
+    def get_ocr_mode(self, task):
+        return str((task.options or {}).get("ocr_mode", "fast"))
+
     def get_review_required(self, task):
         return bool((task.options or {}).get("review_required", False))
 
@@ -77,6 +82,9 @@ class TaskSerializer(serializers.ModelSerializer):
 
     def get_anonymization_namespace(self, task):
         return str((task.options or {}).get("anonymization_namespace", ""))
+
+    def get_can_cancel(self, task):
+        return task.status == task.Status.PROCESSING and not task.cancel_requested
 
     def get_stored_files(self, task):
         return {

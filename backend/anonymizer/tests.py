@@ -20,7 +20,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen import canvas
 
-from .file_processors import ProcessingError, process_file
+from .file_processors import ProcessingCancelled, ProcessingError, process_file
 from .crypto import decrypt_mapping, encrypt_mapping
 from .models import AnonymizationTask, ModelArtifact, RecognitionLabel, TrainingDocument, TrainingExample
 from .paddlenlp_compat import ensure_aistudio_download_compatibility
@@ -664,6 +664,82 @@ class TaskApiTests(TestCase):
         self.assertEqual(response.json()["ocr_page_count"], 1)
         self.assertEqual(response.json()["processing_progress"]["percent"], 100)
         self.assertEqual(response.json()["processing_progress"]["stage"], "completed")
+        self.assertEqual(response.json()["ocr_mode"], "fast")
+
+    def test_rejects_second_heavy_task_and_allows_cancelling_active_task(self):
+        active = AnonymizationTask.objects.create(
+            task_name="正在识别",
+            original_name="扫描件.pdf",
+            file_type="pdf",
+            status=AnonymizationTask.Status.PROCESSING,
+            options={"processing_progress": {"percent": 35, "detail": "正在 OCR"}},
+        )
+        upload = SimpleUploadedFile("另一任务.txt", "联系人：张三".encode("utf-8"), content_type="text/plain")
+
+        blocked = self.client.post("/api/tasks/", {"file": upload})
+        self.assertEqual(blocked.status_code, 409, blocked.content)
+        self.assertEqual(blocked.json()["active_task"]["id"], str(active.id))
+        self.assertTrue(blocked.json()["active_task"]["can_cancel"])
+
+        cancelled = self.client.post(f"/api/tasks/{active.id}/cancel/")
+        self.assertEqual(cancelled.status_code, 202, cancelled.content)
+        self.assertTrue(cancelled.json()["cancel_requested"])
+        self.assertFalse(cancelled.json()["can_cancel"])
+
+    def test_processing_task_cannot_be_deleted_before_it_is_interrupted(self):
+        task = AnonymizationTask.objects.create(
+            task_name="运行中",
+            original_name="扫描件.pdf",
+            file_type="pdf",
+            status=AnonymizationTask.Status.PROCESSING,
+        )
+        response = self.client.delete(
+            f"/api/tasks/{task.id}/",
+            HTTP_X_TASK_DELETE_CONFIRM=str(task.id),
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue(AnonymizationTask.objects.filter(id=task.id).exists())
+
+    @override_settings(UIE_ENABLED=False, PDF_OCR_ENABLED=True)
+    @patch("anonymizer.file_processors._ocr_pdf_pages")
+    def test_pdf_review_reuses_first_ocr_text_instead_of_scanning_again(self, ocr_pages):
+        ocr_pages.return_value = {0: "单位：中国烟草总公司\n联系人：张三"}
+        buffer = io.BytesIO()
+        pdf = canvas.Canvas(buffer, pagesize=A4)
+        pdf.rect(50, 700, 300, 80)
+        pdf.save()
+        upload = SimpleUploadedFile("复核扫描件.pdf", buffer.getvalue(), content_type="application/pdf")
+        created = self.client.post("/api/tasks/", {
+            "file": upload,
+            "categories": json.dumps(["organization", "person"]),
+            "review_required": "true",
+            "ocr_mode": "fast",
+        })
+        self.assertEqual(created.status_code, 201, created.content)
+        task_id = created.json()["id"]
+        review = self.client.get(f"/api/tasks/{task_id}/review/").json()
+        selected = [
+            {"token": item["token"], "text": item["text"], "category": item["category"]}
+            for item in review["entities"]
+        ]
+
+        with patch("anonymizer.views._collect_text_chunks", side_effect=AssertionError("不应重复 OCR")):
+            confirmed = self.client.post(
+                f"/api/tasks/{task_id}/review/",
+                {"selected_entities": selected},
+                content_type="application/json",
+            )
+        self.assertEqual(confirmed.status_code, 200, confirmed.content)
+        self.assertEqual(ocr_pages.call_count, 1)
+
+    @patch("anonymizer.views._collect_text_chunks", side_effect=ProcessingCancelled("任务已由用户中断。"))
+    def test_cancelled_initial_task_is_recorded_as_cancelled(self, _collect):
+        upload = SimpleUploadedFile("中断测试.txt", "联系人：张三".encode("utf-8"), content_type="text/plain")
+        response = self.client.post("/api/tasks/", {"file": upload})
+
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(response.json()["task"]["status"], "cancelled")
+        self.assertEqual(response.json()["task"]["processing_progress"]["stage"], "cancelled")
 
     def test_api_returns_counts_for_realistic_unlabeled_content(self):
         source = (
@@ -1159,7 +1235,7 @@ class PPStructureWorkerTests(TestCase):
 
         with patch("anonymizer.ppstructure_worker._layout_pipeline_class", return_value=FakeLayoutPipeline), \
                 patch.dict("sys.modules", {"paddleocr": FakeModule()}):
-            build_ppstructure_pipeline()
+            build_ppstructure_pipeline("layout")
 
         self.assertEqual(captured["layout_detection_model_name"], "PP-DocLayout-S")
         self.assertEqual(captured["text_detection_model_name"], "PP-OCRv5_mobile_det")
@@ -1179,6 +1255,23 @@ class PPStructureWorkerTests(TestCase):
             FakeLayoutPipeline().create_model({"model_name": "PP-Chart2Table"}),
             "PP-Chart2Table",
         )
+
+    def test_fast_mode_builds_mobile_text_pipeline_without_layout_model(self):
+        captured = {}
+
+        class FakeModule:
+            @staticmethod
+            def PaddleOCR(**kwargs):
+                captured.update(kwargs)
+                return object()
+
+        with patch.dict("sys.modules", {"paddleocr": FakeModule()}):
+            build_ppstructure_pipeline("fast")
+
+        self.assertEqual(captured["text_detection_model_name"], "PP-OCRv5_mobile_det")
+        self.assertEqual(captured["text_recognition_model_name"], "PP-OCRv5_mobile_rec")
+        self.assertFalse(captured["use_doc_orientation_classify"])
+        self.assertNotIn("layout_detection_model_name", captured)
 
     def test_prediction_uses_only_paddleocr_332_supported_options(self):
         captured = {}

@@ -2,6 +2,7 @@
 set -e
 
 python manage.py migrate --noinput
+python manage.py recover_interrupted_tasks
 python manage.py collectstatic --noinput
 python -m anonymizer.uie_manager &
 UIE_MANAGER_PID=$!

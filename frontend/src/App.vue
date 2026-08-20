@@ -20,6 +20,7 @@ const selectedTaskId = ref('')
 const dragging = ref('')
 const customEntities = ref('')
 const uieMode = ref(localStorage.getItem('uieMode') || 'on_demand')
+const ocrMode = ref(localStorage.getItem('ocrMode') || 'fast')
 const modelRuntime = ref({ enabled: true, available: false, model: 'uie-base', resident_loaded: false })
 const modelModeLoading = ref(false)
 const trainingLabels = ref([])
@@ -56,6 +57,8 @@ const modelPackageFile = ref(null)
 const modelPackageForm = ref({ name: '', version: '' })
 const modelPackageLoading = ref(false)
 const processingProgress = ref(null)
+const activeProcessingTaskId = ref('')
+const cancellingTaskId = ref('')
 const selectedCategories = ref(['organization', 'person', 'product', 'location', 'phone', 'id_card', 'email', 'address'])
 
 const categoryOptions = [
@@ -109,6 +112,7 @@ function statusMeta(status) {
     review: ['待人工确认', 'status-review'],
     completed: ['脱敏完成', 'status-completed'],
     restored: ['已生成正式版', 'status-restored'],
+    cancelled: ['已中断', 'status-cancelled'],
     failed: ['处理失败', 'status-failed']
   }[status] || [status, '']
 }
@@ -176,6 +180,11 @@ async function refreshLabels() {
   } catch (e) {
     error.value = e.message
   }
+}
+
+function selectOcrMode(nextMode) {
+  ocrMode.value = nextMode
+  localStorage.setItem('ocrMode', nextMode)
 }
 
 async function refreshModelArtifacts() {
@@ -317,6 +326,7 @@ async function submitAnonymize() {
   const sourceName = anonymizeFile.value.name
   const startedAt = Date.now() - 5000
   processingProgress.value = { percent: 0, detail: '正在上传文件，请稍候…' }
+  activeProcessingTaskId.value = ''
   const progressTimer = window.setInterval(async () => {
     try {
       const latestTasks = await api.listTasks()
@@ -326,6 +336,7 @@ async function submitAnonymize() {
         && new Date(task.created_at).getTime() >= startedAt
       ))
       if (activeTask?.processing_progress) {
+        activeProcessingTaskId.value = activeTask.id
         processingProgress.value = activeTask.processing_progress
         tasks.value = latestTasks
       }
@@ -334,16 +345,44 @@ async function submitAnonymize() {
     }
   }, 1500)
   try {
-    result.value = await api.anonymize(anonymizeFile.value, selectedCategories.value, customEntities.value, uieMode.value)
+    result.value = await api.anonymize(
+      anonymizeFile.value,
+      selectedCategories.value,
+      customEntities.value,
+      uieMode.value,
+      ocrMode.value
+    )
     await Promise.all([refreshData(), refreshModelRuntime(), refreshLabels()])
     if (result.value?.status === 'review') await openReview(result.value)
   } catch (e) {
     error.value = e.message
-    if (e.data?.id) result.value = e.data
+    if (e.data?.task?.id) result.value = e.data.task
+    else if (e.data?.active_task?.id) {
+      result.value = e.data.active_task
+      activeProcessingTaskId.value = e.data.active_task.id
+    } else if (e.data?.id) result.value = e.data
   } finally {
     window.clearInterval(progressTimer)
     loading.value = false
     processingProgress.value = null
+    activeProcessingTaskId.value = ''
+  }
+}
+
+async function cancelProcessing(taskId = activeProcessingTaskId.value) {
+  if (!taskId || cancellingTaskId.value) return
+  if (!window.confirm('确认中断当前脱敏任务吗？\n原始上传文件会保留；正在运行的页面渲染或 OCR 子进程会被安全终止。')) return
+  cancellingTaskId.value = taskId
+  error.value = ''
+  if (processingProgress.value) processingProgress.value.detail = '已发送中断请求，正在停止 OCR 子进程…'
+  try {
+    const task = await api.cancelTask(taskId)
+    if (result.value?.id === taskId) result.value = task
+    await refreshData()
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    cancellingTaskId.value = ''
   }
 }
 
@@ -421,6 +460,7 @@ async function openReview(task = result.value) {
 async function applyReview() {
   if (!result.value?.id) return
   reviewLoading.value = true
+  activeProcessingTaskId.value = result.value.id
   error.value = ''
   try {
     reviewData.value = await api.applyTaskReview(
@@ -454,8 +494,10 @@ async function applyReview() {
     await Promise.all([refreshData(), refreshLabels()])
   } catch (e) {
     error.value = e.message
+    if (e.data?.task?.id) result.value = e.data.task
   } finally {
     reviewLoading.value = false
+    activeProcessingTaskId.value = ''
   }
 }
 
@@ -772,13 +814,41 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshModelA
               <div v-if="modelModeLoading" class="model-loading"><span class="spinner-border spinner-border-sm"></span> 正在切换模型运行方式，请稍候…</div>
             </div>
 
+            <div v-if="anonymizeFile?.name?.toLowerCase().endsWith('.pdf')" class="ocr-settings">
+              <div class="uie-heading">
+                <span class="uie-icon ocr-icon"><AppIcon name="scan" :size="24" /></span>
+                <div><strong>扫描 PDF 识别方式</strong><small>仅对没有可提取文字层的页面执行 OCR</small></div>
+                <span class="ocr-speed-badge">默认极速模式</span>
+              </div>
+              <div class="ocr-mode-grid">
+                <label :class="{ active: ocrMode === 'fast' }">
+                  <input type="radio" name="ocrMode" value="fast" :checked="ocrMode === 'fast'" @change="selectOcrMode('fast')" />
+                  <AppIcon name="scan" :size="22" />
+                  <span><b>极速文字 OCR <em>推荐</em></b><small>移动版检测与识别模型；跳过版面分析，通常明显更快</small></span>
+                </label>
+                <label :class="{ active: ocrMode === 'layout' }">
+                  <input type="radio" name="ocrMode" value="layout" :checked="ocrMode === 'layout'" @change="selectOcrMode('layout')" />
+                  <AppIcon name="layout" :size="22" />
+                  <span><b>版面增强 OCR</b><small>增加版面结构分析；复杂多栏和表格更友好，但耗时更长</small></span>
+                </label>
+              </div>
+              <p class="ocr-note"><AppIcon name="info" :size="16" /> 人工校正后重新脱敏会复用首次 OCR 文本，不再重复扫描整份 PDF。</p>
+            </div>
+
             <div class="action-row">
               <div class="privacy-tip"><AppIcon name="shield-check" :size="18" /> 映射表使用独立密钥加密保存</div>
-              <button class="btn primary-btn" :disabled="loading || !anonymizeFile" @click="submitAnonymize">
-                <span v-if="loading" class="spinner-border spinner-border-sm"></span>
-                <AppIcon v-else name="file-lock" :size="18" />
-                {{ loading ? (processingProgress?.stage === 'pdf_ocr' ? '正在本地 OCR…' : '正在识别并生成…') : '开始数据匿名' }}
-              </button>
+              <div class="processing-actions">
+                <button v-if="loading" class="btn cancel-btn" :disabled="!activeProcessingTaskId || cancellingTaskId === activeProcessingTaskId" @click="cancelProcessing()">
+                  <span v-if="cancellingTaskId === activeProcessingTaskId" class="spinner-border spinner-border-sm"></span>
+                  <AppIcon v-else name="stop-circle" :size="18" />
+                  {{ cancellingTaskId === activeProcessingTaskId ? '正在中断…' : activeProcessingTaskId ? '中断脱敏' : '等待任务建立…' }}
+                </button>
+                <button class="btn primary-btn" :disabled="loading || !anonymizeFile" @click="submitAnonymize">
+                  <span v-if="loading" class="spinner-border spinner-border-sm"></span>
+                  <AppIcon v-else name="file-lock" :size="18" />
+                  {{ loading ? (processingProgress?.stage === 'pdf_ocr' ? '正在本地 OCR…' : '正在识别并生成…') : '开始数据匿名' }}
+                </button>
+              </div>
             </div>
             <div v-if="loading && processingProgress" class="task-progress">
               <div><span>{{ processingProgress.detail }}</span><strong>{{ processingProgress.percent || 0 }}%</strong></div>
@@ -859,7 +929,12 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshModelA
               <div><h3>{{ result?.status === 'review' ? '人工确认敏感信息' : '重新校正识别结果' }}</h3><p>高亮查看候选项所在原文；保留需要脱敏的数据、取消误识别、修改类型，并补录漏识别内容。</p></div>
               <button class="review-close" @click="reviewOpen = false">关闭</button>
             </div>
-            <div v-if="reviewLoading" class="review-loading"><span class="spinner-border spinner-border-sm"></span> 正在读取或重新处理文件…</div>
+            <div v-if="reviewLoading" class="review-loading">
+              <span class="spinner-border spinner-border-sm"></span> 正在读取或重新处理文件…
+              <button v-if="activeProcessingTaskId" class="btn cancel-btn compact-cancel" :disabled="cancellingTaskId === activeProcessingTaskId" @click="cancelProcessing(activeProcessingTaskId)">
+                <AppIcon name="stop-circle" :size="17" /> {{ cancellingTaskId === activeProcessingTaskId ? '正在中断…' : '中断脱敏' }}
+              </button>
+            </div>
             <template v-else>
               <div class="review-warning">{{ result?.status === 'review' ? '尚未开放脱敏文件下载。只有确认过的候选项和人工补录项会进入脱敏结果。' : '重新校正会生成新版脱敏文件，同时保留旧匿名编号的恢复能力；已有反匿名上传稿和正式输出会清除，请重新生成。' }}</div>
               <div class="review-workbench">
@@ -987,7 +1062,11 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshModelA
                       <button v-if="task.anonymized_download_url" title="下载脱敏文件" @click="openDownload(task.anonymized_download_url)"><AppIcon name="download" :size="17" /></button>
                       <button v-if="task.status === 'review' || task.anonymized_download_url" :title="task.status === 'review' ? '人工确认识别结果' : '校正识别结果'" @click="openReview(task)"><AppIcon name="info" :size="17" /></button>
                       <button v-if="task.restored_download_url" class="amber" title="下载正式文件" @click="openDownload(task.restored_download_url)"><AppIcon name="restore" :size="17" /></button>
-                      <button class="danger" title="删除记录及所有文件" :disabled="deletingTaskId === task.id" @click="deleteTask(task)">
+                      <button v-if="task.status === 'processing'" class="danger" :title="task.cancel_requested ? '正在中断任务' : '中断脱敏'" :disabled="task.cancel_requested || cancellingTaskId === task.id" @click="cancelProcessing(task.id)">
+                        <span v-if="cancellingTaskId === task.id" class="spinner-border spinner-border-sm"></span>
+                        <AppIcon v-else name="stop-circle" :size="17" />
+                      </button>
+                      <button class="danger" :title="task.status === 'processing' ? '请先中断处理，再删除记录' : '删除记录及所有文件'" :disabled="deletingTaskId === task.id || task.status === 'processing'" @click="deleteTask(task)">
                         <span v-if="deletingTaskId === task.id" class="spinner-border spinner-border-sm"></span>
                         <AppIcon v-else name="trash" :size="17" />
                       </button>

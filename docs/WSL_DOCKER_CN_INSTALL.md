@@ -114,7 +114,7 @@ UIE 分类在基础候选阈值之外还会使用独立复核阈值：人名 `0.
 
 首次执行“构建 Django、PP-StructureV3 精简 OCR 与 UIE-base 后端镜像”时，会通过选中的 PyPI 镜像安装 PaddlePaddle、PaddleOCR/PaddleX 和 PaddleNLP；PaddleX 模型源固定为中国大陆可访问的百度 BOS，并下载精简 OCR 模型与 UIE-base 推理缓存。精简 OCR 固定为 `PP-DocLayout-S`、`PP-OCRv5_mobile_det`、`PP-OCRv5_mobile_rec`，关闭表格、公式、印章、图表、文档矫正及区域检测。模型均封装进后端 Docker 镜像，业务任务执行时不需要把文件上传给外部服务，也不会为“临时调用”重新下载。该构建步骤通常比其他步骤耗时更长；8 核主机首次构建可能需要 15～40 分钟，重复安装且代码、依赖未变化时 Docker 会复用缓存。
 
-扫描 PDF 会显著占用 CPU，默认最长可处理 300 个 OCR 页面，页面渲染最长边限制为 3508 像素，单页渲染或识别超时为 180 秒，首次加载 PP-StructureV3 最长等待 600 秒。处理过程中 Web 页面会显示渲染、模型加载、当前 OCR 页与百分比。安装脚本会把对应 `PDF_OCR_*` 和 `PPSTRUCTURE_*` 参数写入新旧 `.env`，不会修改既有密码和密钥。
+扫描 PDF 会显著占用 CPU。部署默认使用 `PDF_OCR_MODE=fast`，只运行移动版文字检测和识别；Web 可对复杂版面切换 `layout`。默认最长处理 300 个 OCR 页面，页面渲染为 150 DPI、最长边限制 2480 像素，单页渲染或识别超时为 180 秒，首次加载 OCR 最长等待 600 秒。处理过程中 Web 显示渲染、模型加载、当前 OCR 页与百分比，并可中断当前脱敏任务；重新人工校正会复用首次 OCR 结果。安装脚本会把对应 `PDF_OCR_*` 和 `PPSTRUCTURE_*` 参数写入新旧 `.env`，不会修改既有密码和密钥。
 
 后端与前端构建强制使用 BuildKit 纯文本进度，因此安装窗口会在同一条总进度中显示当前 Docker 层、pip 下载包，以及精简 OCR/UIE-base 的下载和自检子步骤。完整构建明细分别保存在 `.runtime/docker-build-backend.log` 和 `.runtime/docker-build-frontend.log`；构建失败时，安装窗口会立即回显对应日志最后 100 行和完整日志路径，避免其他镜像的并行拉取信息掩盖真正错误。窗口长时间没有变化时，可把对应文件与 `install-support-latest.log` 一并提供给维护人员。模型缓存进度只显示已经写入磁盘的实际 MB，不虚构下载百分比。
 

@@ -73,12 +73,13 @@ export const api = {
     body: JSON.stringify(label)
   }),
   deleteLabel: labelId => request(`/labels/${labelId}/`, { method: 'DELETE' }),
-  anonymize(file, categories, customEntities, uieMode) {
+  anonymize(file, categories, customEntities, uieMode, ocrMode = 'fast') {
     const form = new FormData()
     form.append('file', file)
     form.append('categories', JSON.stringify(categories))
     form.append('custom_entities', customEntities)
     form.append('uie_mode', uieMode)
+    form.append('ocr_mode', ocrMode)
     form.append('review_required', 'true')
     return request('/tasks/', { method: 'POST', body: form })
   },
@@ -100,6 +101,7 @@ export const api = {
     form.append('file', file)
     return request('/training/documents/', { method: 'POST', body: form })
   },
+  cancelTask: taskId => request(`/tasks/${taskId}/cancel/`, { method: 'POST' }),
   saveTrainingAnnotations: (documentId, additions, selectedEntities, aliasGroups = []) => request(`/training/documents/${documentId}/`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

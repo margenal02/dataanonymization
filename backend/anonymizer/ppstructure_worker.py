@@ -21,9 +21,37 @@ def _layout_pipeline_class():
     return _LayoutParsingPipelineV2
 
 
-def _build_pipeline():
+def _pipeline_options():
+    return {
+        "device": os.getenv("PPSTRUCTURE_DEVICE", "cpu"),
+        "text_detection_model_name": os.getenv(
+            "PPSTRUCTURE_TEXT_DETECTION_MODEL", "PP-OCRv5_mobile_det"
+        ),
+        "text_recognition_model_name": os.getenv(
+            "PPSTRUCTURE_TEXT_RECOGNITION_MODEL", "PP-OCRv5_mobile_rec"
+        ),
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+        "enable_mkldnn": False,
+        "cpu_threads": max(1, min(16, int(os.getenv("PPSTRUCTURE_CPU_THREADS", "8")))),
+    }
+
+
+def _build_pipeline(mode=None):
     # Keep the import inside the worker so the Django process never retains the
     # PaddleOCR model after a scanned PDF has finished processing.
+    selected_mode = str(mode or os.getenv("PDF_OCR_MODE", "fast")).strip().lower()
+    if selected_mode == "fast":
+        from paddleocr import PaddleOCR
+
+        # Entity discovery only needs reading-order text. Skipping the layout
+        # detector removes the heaviest PP-Structure stage while keeping the
+        # same mobile detection and recognition models.
+        return PaddleOCR(**_pipeline_options())
+    if selected_mode != "layout":
+        raise ValueError("OCR 模式只能是 fast 或 layout。")
+
     from paddleocr import PPStructureV3
 
     # PaddleX 3.3.13 initializes PP-Chart2Table unconditionally even when
@@ -41,26 +69,15 @@ def _build_pipeline():
     layout_pipeline_class.create_model = create_lite_model
     try:
         return PPStructureV3(
-            device=os.getenv("PPSTRUCTURE_DEVICE", "cpu"),
+            **_pipeline_options(),
             layout_detection_model_name=os.getenv(
                 "PPSTRUCTURE_LAYOUT_MODEL", "PP-DocLayout-S"
             ),
-            text_detection_model_name=os.getenv(
-                "PPSTRUCTURE_TEXT_DETECTION_MODEL", "PP-OCRv5_mobile_det"
-            ),
-            text_recognition_model_name=os.getenv(
-                "PPSTRUCTURE_TEXT_RECOGNITION_MODEL", "PP-OCRv5_mobile_rec"
-            ),
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
             use_seal_recognition=False,
             use_table_recognition=False,
             use_formula_recognition=False,
             use_chart_recognition=False,
             use_region_detection=False,
-            enable_mkldnn=False,
-            cpu_threads=max(1, min(16, int(os.getenv("PPSTRUCTURE_CPU_THREADS", "8")))),
         )
     finally:
         layout_pipeline_class.create_model = original_create_model
@@ -87,7 +104,7 @@ def _extract_text(result):
             ordered_parts.append(content)
 
     ordered_text = "\n".join(ordered_parts)
-    overall = payload.get("overall_ocr_res") or {}
+    overall = payload.get("overall_ocr_res") or payload
     for recognized in overall.get("rec_texts", []) or []:
         content = str(recognized).strip()
         # Text in tables or an unclassified area may be absent from the layout
@@ -97,36 +114,42 @@ def _extract_text(result):
     return "\n".join(ordered_parts).strip()
 
 
-def _recognize(pipeline, image_path):
+def _recognize(pipeline, image_path, mode="layout"):
+    options = {
+        "input": str(image_path),
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+    }
+    if mode == "layout":
+        options.update({
+            "use_seal_recognition": False,
+            "use_table_recognition": False,
+            "use_formula_recognition": False,
+            "use_chart_recognition": False,
+            "use_region_detection": False,
+        })
     output = pipeline.predict(
-        input=str(image_path),
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        use_seal_recognition=False,
-        use_table_recognition=False,
-        use_formula_recognition=False,
-        use_chart_recognition=False,
-        use_region_detection=False,
+        **options,
     )
     result = next(iter(output), None)
     return _extract_text(result) if result is not None else ""
 
 
-def serve(image_paths):
+def serve(image_paths, mode):
     try:
-        pipeline = _build_pipeline()
+        pipeline = _build_pipeline(mode)
     except Exception as exc:
-        _emit({"event": "error", "detail": f"PP-StructureV3 精简模型加载失败：{exc}"})
+        _emit({"event": "error", "detail": f"本地 OCR 模型加载失败：{exc}"})
         return 1
 
-    _emit({"event": "ready", "mode": "lite"})
+    _emit({"event": "ready", "mode": mode})
     for index, image_path in enumerate(image_paths):
         try:
             path = Path(image_path)
             if not path.is_file():
                 raise FileNotFoundError("页面图像不存在")
-            text = _recognize(pipeline, path)
+            text = _recognize(pipeline, path, mode)
             _emit({"event": "result", "index": index, "text": text})
         except Exception as exc:
             _emit({"event": "error", "index": index, "detail": f"第 {index + 1} 个页面识别失败：{exc}"})
@@ -136,9 +159,10 @@ def serve(image_paths):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("fast", "layout"), default=os.getenv("PDF_OCR_MODE", "fast"))
     parser.add_argument("images", nargs="+")
     args = parser.parse_args()
-    raise SystemExit(serve(args.images))
+    raise SystemExit(serve(args.images, args.mode))
 
 
 if __name__ == "__main__":

@@ -224,6 +224,7 @@ textarea.form-control { resize: vertical; min-height: 95px; }
 .status-processing { color: #526d93; background: #edf2f8; }
 .status-review { color: #8a5d16; background: #fff3d8; }
 .status-failed { color: #a9483e; background: #faecea; }
+.status-cancelled { color: #6e5a51; background: #f1ece9; }
 .history-progress { max-width: 240px; margin-top: 6px !important; color: #526d93 !important; line-height: 1.5; }
 .table-actions button { width: 30px; height: 30px; display: inline-grid; place-items: center; border: 1px solid #dfe5e1; color: var(--forest); background: #fff; border-radius: 6px; margin-left: 5px; }
 .table-actions button:hover { background: var(--forest-soft); }
@@ -452,6 +453,25 @@ body { background: radial-gradient(circle at 72% -10%, #dcefe8 0, transparent 35
 .uie-mode-grid input { width: 15px; height: 15px; margin: 0; }
 .uie-mode-grid b em { margin-left: 5px; padding: 2px 5px; color: #08715b; background: #def1e9; border-radius: 7px; font-size: 7px; font-style: normal; }
 .action-row { padding-top: 18px; margin-top: 18px; }
+.ocr-settings { margin-top: 13px; padding: 15px; border: 1px solid #dbe7e2; background: linear-gradient(135deg, #f8fbfa, #f2f8f5); border-radius: 14px; }
+.ocr-settings .uie-heading { margin-bottom: 12px; }
+.ocr-icon { color: #176c7d; background: #e2f2f5; }
+.ocr-speed-badge { margin-left: auto; padding: 5px 8px; color: #176c5d; background: #e1f2eb; border-radius: 8px; font-size: 8px; font-weight: 650; }
+.ocr-mode-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.ocr-mode-grid > label { display: flex; align-items: center; gap: 9px; padding: 12px; color: #70807c; background: #fff; border: 1px solid #dce5e1; border-radius: 11px; cursor: pointer; }
+.ocr-mode-grid > label.active { color: #08715b; background: #eff8f4; border-color: #78aa9a; box-shadow: 0 0 0 2px #79a89916; }
+.ocr-mode-grid input { width: 15px; height: 15px; margin: 0; accent-color: var(--forest); }
+.ocr-mode-grid b, .ocr-mode-grid small { display: block; }
+.ocr-mode-grid b { color: #334640; font-size: 11px; }
+.ocr-mode-grid b em { margin-left: 5px; padding: 2px 5px; color: #08715b; background: #def1e9; border-radius: 7px; font-size: 7px; font-style: normal; }
+.ocr-mode-grid small { margin-top: 3px; color: #798883; font-size: 8px; line-height: 1.55; }
+.ocr-note { display: flex; align-items: center; gap: 6px; margin: 10px 1px 0; color: #60756f; font-size: 8px; }
+.processing-actions { display: flex; align-items: center; gap: 9px; }
+.cancel-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; color: #a3443b; background: #fff; border: 1px solid #dca49e; }
+.cancel-btn:hover:not(:disabled) { color: #fff; background: #a94c43; border-color: #a94c43; }
+.cancel-btn:disabled { color: #9b9f9d; background: #f5f6f5; border-color: #dfe2e0; }
+.compact-cancel { min-height: 31px; margin-left: auto; padding: 5px 10px; font-size: 9px; }
+.review-loading { display: flex; align-items: center; gap: 8px; }
 .btn { min-height: 40px; border-radius: 10px; }
 .primary-btn { background: linear-gradient(135deg, #0c7b63, #075947); box-shadow: 0 7px 18px #08715b2a; }
 .search-field { position: relative; margin: 0; }
@@ -474,7 +494,7 @@ body { background: radial-gradient(circle at 72% -10%, #dcefe8 0, transparent 35
   .side-nav button svg { width: 20px; height: 20px; }
   .sidebar-note, .sidebar-footer { display: none; }
   .main-panel { margin-left: 78px; width: calc(100% - 78px); }
-  .settings-grid, .restore-layout, .uie-mode-grid, .review-grid, .annotation-layout { grid-template-columns: 1fr; }
+  .settings-grid, .restore-layout, .uie-mode-grid, .ocr-mode-grid, .review-grid, .annotation-layout { grid-template-columns: 1fr; }
   .annotation-upload { grid-template-columns: 1fr 1fr; }
   .alias-review article { grid-template-columns: 1fr; }
   .label-add-row { grid-template-columns: 1fr 1fr; }
@@ -514,6 +534,8 @@ body { background: radial-gradient(circle at 72% -10%, #dcefe8 0, transparent 35
   .work-card { padding: 19px 15px; }
   .category-grid { grid-template-columns: 1fr; }
   .action-row { align-items: stretch; flex-direction: column; gap: 13px; }
+  .processing-actions { width: 100%; }
+  .processing-actions .btn { flex: 1; }
   .primary-btn, .restore-btn { width: 100%; }
   .result-card { align-items: flex-start; flex-wrap: wrap; }
   .result-actions, .download-btn { width: 100%; }

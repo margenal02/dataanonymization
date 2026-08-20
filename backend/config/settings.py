@@ -103,8 +103,9 @@ UIE_CATEGORY_THRESHOLDS = {
     "product": float(os.getenv("UIE_PRODUCT_PROB", "0.60")),
 }
 PDF_OCR_ENABLED = os.getenv("PDF_OCR_ENABLED", "1") == "1"
-PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "180"))
-PDF_OCR_MAX_IMAGE_DIMENSION = int(os.getenv("PDF_OCR_MAX_IMAGE_DIMENSION", "3508"))
+PDF_OCR_MODE = os.getenv("PDF_OCR_MODE", "fast")
+PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "150"))
+PDF_OCR_MAX_IMAGE_DIMENSION = int(os.getenv("PDF_OCR_MAX_IMAGE_DIMENSION", "2480"))
 PDF_OCR_MIN_TEXT_CHARS = int(os.getenv("PDF_OCR_MIN_TEXT_CHARS", "12"))
 PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "300"))
 PDF_OCR_MAX_TOTAL_CHARS = int(os.getenv("PDF_OCR_MAX_TOTAL_CHARS", "500000"))

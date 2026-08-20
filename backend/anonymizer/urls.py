@@ -17,6 +17,7 @@ urlpatterns = [
     path("training/export/", views.training_dataset_export, name="training-dataset-export"),
     path("tasks/", views.task_collection, name="task-collection"),
     path("tasks/<uuid:task_id>/", views.task_detail, name="task-detail"),
+    path("tasks/<uuid:task_id>/cancel/", views.cancel_task, name="cancel-task"),
     path("tasks/<uuid:task_id>/review/", views.task_review, name="task-review"),
     path("tasks/<uuid:task_id>/restore/", views.restore_task, name="restore-task"),
     path("tasks/<uuid:task_id>/download/<str:kind>/", views.download_task, name="download-task"),

@@ -39,6 +39,32 @@ class ProcessingError(Exception):
     pass
 
 
+class ProcessingCancelled(ProcessingError):
+    pass
+
+
+def _raise_if_cancelled(cancel_callback):
+    if cancel_callback and cancel_callback():
+        raise ProcessingCancelled("任务已由用户中断。")
+
+
+def _stop_process(process):
+    try:
+        if process.poll() is not None:
+            return
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except ProcessLookupError:
+            pass
+
+
 def _validate_archive(upload, extension):
     try:
         with zipfile.ZipFile(upload, "r") as archive:
@@ -226,7 +252,7 @@ def _notify_progress(progress_callback, **payload):
         progress_callback(payload)
 
 
-def _render_pdf_page(source, page_number, image_path):
+def _render_pdf_page(source, page_number, image_path, cancel_callback=None):
     pdftoppm = shutil.which("pdftoppm")
     if not pdftoppm:
         raise ProcessingError("扫描 PDF 需要本地页面渲染组件，请重新运行一键安装脚本更新后端镜像。")
@@ -246,46 +272,80 @@ def _render_pdf_page(source, page_number, image_path):
         str(source),
         str(image_prefix),
     ]
+    _raise_if_cancelled(cancel_callback)
+    rendered = subprocess.Popen(  # nosec B603
+        render_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + timeout_seconds
     try:
-        rendered = subprocess.run(  # nosec B603
-            render_command,
-            capture_output=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise ProcessingError(f"PDF 第 {page_number} 页渲染超过 {timeout_seconds} 秒，已停止 OCR。") from exc
+        while rendered.poll() is None:
+            _raise_if_cancelled(cancel_callback)
+            if time.monotonic() >= deadline:
+                _stop_process(rendered)
+                raise ProcessingError(f"PDF 第 {page_number} 页渲染超过 {timeout_seconds} 秒，已停止 OCR。")
+            time.sleep(0.2)
+        stdout, stderr = rendered.communicate()
+    except BaseException:
+        _stop_process(rendered)
+        raise
     if rendered.returncode != 0 or not Path(image_path).exists():
-        detail = rendered.stderr.decode("utf-8", errors="replace").strip()[-300:]
+        detail = stderr.decode("utf-8", errors="replace").strip()[-300:]
         raise ProcessingError(f"PDF 第 {page_number} 页渲染失败：{detail or '未生成页面图像'}")
 
 
-def _ocr_pdf_pages(source, page_indexes, page_count, progress_callback=None):
+def _ocr_pdf_pages(
+    source,
+    page_indexes,
+    page_count,
+    progress_callback=None,
+    ocr_mode=None,
+    cancel_callback=None,
+):
     if not page_indexes:
         return {}
     page_timeout = max(30, min(900, int(getattr(settings, "PDF_OCR_PAGE_TIMEOUT_SECONDS", 180))))
     start_timeout = max(
         60, min(1800, int(getattr(settings, "PPSTRUCTURE_START_TIMEOUT_SECONDS", 600)))
     )
+    selected_mode = str(ocr_mode or getattr(settings, "PDF_OCR_MODE", "fast")).strip().lower()
+    if selected_mode not in {"fast", "layout"}:
+        raise ProcessingError("OCR 模式只能是 fast 或 layout。")
+    mode_label = "极速文字 OCR" if selected_mode == "fast" else "版面增强 OCR"
     with tempfile.TemporaryDirectory(prefix="data-ppstructure-") as directory:
         image_paths = []
         for rendered_count, page_index in enumerate(page_indexes, start=1):
+            _raise_if_cancelled(cancel_callback)
             image_path = Path(directory) / f"page-{page_index + 1}.png"
             _notify_progress(
                 progress_callback,
                 percent=8 + int(12 * (rendered_count - 1) / max(len(page_indexes), 1)),
                 stage="pdf_ocr",
-                detail=f"PP-StructureV3 正在渲染第 {page_index + 1}/{page_count} 页（{rendered_count}/{len(page_indexes)}）",
+                detail=f"{mode_label}正在渲染第 {page_index + 1}/{page_count} 页（{rendered_count}/{len(page_indexes)}）",
                 current_page=page_index + 1,
                 pdf_page_count=page_count,
                 ocr_page_count=len(page_indexes),
             )
-            _render_pdf_page(source, page_index + 1, image_path)
+            _render_pdf_page(source, page_index + 1, image_path, cancel_callback)
             image_paths.append(image_path)
 
-        command = [sys.executable, "-m", "anonymizer.ppstructure_worker", *map(str, image_paths)]
+        command = [
+            sys.executable,
+            "-m",
+            "anonymizer.ppstructure_worker",
+            "--mode",
+            selected_mode,
+            *map(str, image_paths),
+        ]
         environment = dict(os.environ)
         environment["PYTHONIOENCODING"] = "utf-8"
+        thread_count = str(max(1, min(16, int(os.getenv("PPSTRUCTURE_CPU_THREADS", "8")))))
+        for variable in (
+            "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "PADDLE_NUM_THREADS",
+        ):
+            environment[variable] = thread_count
         process = subprocess.Popen(  # nosec B603
             command,
             stdout=subprocess.PIPE,
@@ -310,75 +370,74 @@ def _ocr_pdf_pages(source, page_indexes, page_count, progress_callback=None):
         results = {}
         recent_output = []
         deadline = time.monotonic() + start_timeout
-        while len(results) < len(image_paths):
-            try:
+        try:
+            while len(results) < len(image_paths):
+                _raise_if_cancelled(cancel_callback)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise queue.Empty
-                line = messages.get(timeout=remaining)
-            except queue.Empty as exc:
-                process.kill()
-                process.wait(timeout=10)
-                phase = "页面识别" if ready else "模型加载"
-                timeout = page_timeout if ready else start_timeout
-                raise ProcessingError(f"PP-StructureV3 {phase}超过 {timeout} 秒，已停止处理。") from exc
-            if line is None:
-                break
-            if not line.startswith(prefix):
-                if line:
-                    recent_output.append(line)
-                    recent_output = recent_output[-8:]
-                continue
-            try:
-                event = json.loads(line[len(prefix):])
-            except json.JSONDecodeError:
-                continue
-            if event.get("event") == "error":
-                process.kill()
-                process.wait(timeout=10)
-                raise ProcessingError(str(event.get("detail") or "PP-StructureV3 识别失败。"))
-            if event.get("event") == "ready":
-                ready = True
-                deadline = time.monotonic() + page_timeout
-                _notify_progress(
-                    progress_callback,
-                    percent=20,
-                    stage="pdf_ocr",
-                    detail="PP-StructureV3 精简模型加载完成，开始逐页识别",
-                    pdf_page_count=page_count,
-                    ocr_page_count=len(page_indexes),
-                )
-                continue
-            if event.get("event") == "result":
-                result_index = int(event.get("index", -1))
-                if 0 <= result_index < len(page_indexes):
-                    page_index = page_indexes[result_index]
-                    results[page_index] = str(event.get("text", "")).strip()
-                    completed = len(results)
+                    phase = "页面识别" if ready else "模型加载"
+                    timeout = page_timeout if ready else start_timeout
+                    raise ProcessingError(f"{mode_label}{phase}超过 {timeout} 秒，已停止处理。")
+                try:
+                    line = messages.get(timeout=min(0.5, remaining))
+                except queue.Empty:
+                    continue
+                if line is None:
+                    break
+                if not line.startswith(prefix):
+                    if line:
+                        recent_output.append(line)
+                        recent_output = recent_output[-8:]
+                    continue
+                try:
+                    event = json.loads(line[len(prefix):])
+                except json.JSONDecodeError:
+                    continue
+                if event.get("event") == "error":
+                    raise ProcessingError(str(event.get("detail") or f"{mode_label}识别失败。"))
+                if event.get("event") == "ready":
+                    ready = True
                     deadline = time.monotonic() + page_timeout
                     _notify_progress(
                         progress_callback,
-                        percent=20 + int(35 * completed / len(page_indexes)),
+                        percent=20,
                         stage="pdf_ocr",
-                        detail=f"PP-StructureV3 已识别第 {page_index + 1}/{page_count} 页（{completed}/{len(page_indexes)}）",
-                        current_page=page_index + 1,
+                        detail=f"{mode_label}模型加载完成，开始逐页识别",
                         pdf_page_count=page_count,
                         ocr_page_count=len(page_indexes),
                     )
-
-        try:
+                    continue
+                if event.get("event") == "result":
+                    result_index = int(event.get("index", -1))
+                    if 0 <= result_index < len(page_indexes):
+                        page_index = page_indexes[result_index]
+                        results[page_index] = str(event.get("text", "")).strip()
+                        completed = len(results)
+                        deadline = time.monotonic() + page_timeout
+                        _notify_progress(
+                            progress_callback,
+                            percent=20 + int(35 * completed / len(page_indexes)),
+                            stage="pdf_ocr",
+                            detail=f"{mode_label}已识别第 {page_index + 1}/{page_count} 页（{completed}/{len(page_indexes)}）",
+                            current_page=page_index + 1,
+                            pdf_page_count=page_count,
+                            ocr_page_count=len(page_indexes),
+                        )
             exit_code = process.wait(timeout=60)
         except subprocess.TimeoutExpired as exc:
-            process.kill()
-            process.wait(timeout=10)
-            raise ProcessingError("PP-StructureV3 页面处理完成，但模型进程未能正常退出。") from exc
+            _stop_process(process)
+            raise ProcessingError(f"{mode_label}页面处理完成，但模型进程未能正常退出。") from exc
+        except BaseException:
+            _stop_process(process)
+            raise
         if exit_code != 0 or len(results) != len(image_paths):
             detail = "；".join(recent_output)[-600:]
-            raise ProcessingError(f"PP-StructureV3 进程异常退出：{detail or '未返回全部页面'}")
+            raise ProcessingError(f"{mode_label}进程异常退出：{detail or '未返回全部页面'}")
         return results
 
 
-def extract_pdf_pages(source, progress_callback=None):
+def extract_pdf_pages(source, progress_callback=None, ocr_mode=None, cancel_callback=None):
+    _raise_if_cancelled(cancel_callback)
     try:
         reader = PdfReader(source)
     except Exception as exc:
@@ -400,7 +459,10 @@ def extract_pdf_pages(source, progress_callback=None):
         detail=f"正在检查 PDF 文本层，共 {len(reader.pages)} 页",
         pdf_page_count=len(reader.pages),
     )
-    pages = [page.extract_text() or "" for page in reader.pages]
+    pages = []
+    for page in reader.pages:
+        _raise_if_cancelled(cancel_callback)
+        pages.append(page.extract_text() or "")
     minimum_chars = int(getattr(settings, "PDF_OCR_MIN_TEXT_CHARS", 12))
     ocr_indexes = [
         index for index, page_text in enumerate(pages)
@@ -417,7 +479,12 @@ def extract_pdf_pages(source, progress_callback=None):
             )
         total_ocr_pages = len(ocr_indexes)
         recognized_pages = _ocr_pdf_pages(
-            source, ocr_indexes, len(pages), progress_callback=progress_callback,
+            source,
+            ocr_indexes,
+            len(pages),
+            progress_callback=progress_callback,
+            ocr_mode=ocr_mode,
+            cancel_callback=cancel_callback,
         )
         for page_index, recognized_text in recognized_pages.items():
             pages[page_index] = recognized_text
@@ -425,7 +492,7 @@ def extract_pdf_pages(source, progress_callback=None):
             progress_callback,
             percent=55,
             stage="pdf_ocr",
-            detail=f"PP-StructureV3 精简 OCR 完成，共识别 {total_ocr_pages} 页",
+            detail=f"本地 OCR 完成，共识别 {total_ocr_pages} 页",
             pdf_page_count=len(pages),
             ocr_page_count=total_ocr_pages,
         )
@@ -458,8 +525,21 @@ def _draw_wrapped_line(pdf, text, x, y, max_width, font_name, font_size, leading
     return y
 
 
-def process_pdf(source, destination, transform, pages=None, progress_callback=None):
-    pages = pages if pages is not None else extract_pdf_pages(source, progress_callback)
+def process_pdf(
+    source,
+    destination,
+    transform,
+    pages=None,
+    progress_callback=None,
+    ocr_mode=None,
+    cancel_callback=None,
+):
+    pages = pages if pages is not None else extract_pdf_pages(
+        source,
+        progress_callback,
+        ocr_mode=ocr_mode,
+        cancel_callback=cancel_callback,
+    )
     font_name = "STSong-Light"
     try:
         pdfmetrics.registerFont(UnicodeCIDFont(font_name))
@@ -472,6 +552,7 @@ def process_pdf(source, destination, transform, pages=None, progress_callback=No
     leading = 17
     pdf.setTitle(Path(destination).stem)
     for page_index, page_text in enumerate(pages):
+        _raise_if_cancelled(cancel_callback)
         _notify_progress(
             progress_callback,
             percent=72 + int(23 * (page_index + 1) / max(len(pages), 1)),
@@ -557,20 +638,38 @@ PROCESSORS = {
 }
 
 
-def process_file(source, destination, transform, *, pdf_pages=None, progress_callback=None):
+def process_file(
+    source,
+    destination,
+    transform,
+    *,
+    pdf_pages=None,
+    progress_callback=None,
+    ocr_mode=None,
+    cancel_callback=None,
+):
+    _raise_if_cancelled(cancel_callback)
     extension = Path(source).suffix.lower()
     if extension not in PROCESSORS:
         raise ProcessingError(f"不支持的文件格式：{extension}")
     Path(destination).parent.mkdir(parents=True, exist_ok=True)
+
+    def cancellable_transform(text):
+        _raise_if_cancelled(cancel_callback)
+        return transform(text)
+
     if extension == ".pdf":
         process_pdf(
             source,
             destination,
-            transform,
+            cancellable_transform,
             pages=pdf_pages,
             progress_callback=progress_callback,
+            ocr_mode=ocr_mode,
+            cancel_callback=cancel_callback,
         )
     else:
-        PROCESSORS[extension](source, destination, transform)
+        PROCESSORS[extension](source, destination, cancellable_transform)
+    _raise_if_cancelled(cancel_callback)
     if not Path(destination).exists() or Path(destination).stat().st_size == 0:
         raise ProcessingError("处理结果为空，请检查源文件。")
