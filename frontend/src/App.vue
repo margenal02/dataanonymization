@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from './api'
 import AppIcon from './components/AppIcon.vue'
 import AnalyticsPanel from './components/AnalyticsPanel.vue'
@@ -59,7 +59,11 @@ const modelPackageLoading = ref(false)
 const processingProgress = ref(null)
 const activeProcessingTaskId = ref('')
 const cancellingTaskId = ref('')
+const trackingExistingTask = ref(false)
 const selectedCategories = ref(['organization', 'person', 'product', 'location', 'phone', 'id_card', 'email', 'address'])
+
+let taskTrackingTimer = 0
+let taskTrackingRun = 0
 
 const categoryOptions = [
   { key: 'organization', label: '单位 / 部门', icon: 'building' },
@@ -180,6 +184,68 @@ async function refreshLabels() {
   } catch (e) {
     error.value = e.message
   }
+}
+
+function updateTaskInRecords(task) {
+  const index = tasks.value.findIndex(item => item.id === task.id)
+  if (index >= 0) tasks.value.splice(index, 1, task)
+  else tasks.value.unshift(task)
+}
+
+function stopTaskTracking(clearProgress = true) {
+  taskTrackingRun += 1
+  if (taskTrackingTimer) window.clearTimeout(taskTrackingTimer)
+  taskTrackingTimer = 0
+  trackingExistingTask.value = false
+  if (clearProgress) {
+    activeProcessingTaskId.value = ''
+    processingProgress.value = null
+  }
+}
+
+async function pollTrackedTask(taskId, runId) {
+  if (runId !== taskTrackingRun) return
+  try {
+    const task = await api.getTask(taskId)
+    if (runId !== taskTrackingRun) return
+    result.value = task
+    updateTaskInRecords(task)
+    if (task.status === 'processing') {
+      activeProcessingTaskId.value = task.id
+      processingProgress.value = task.processing_progress || processingProgress.value
+      taskTrackingTimer = window.setTimeout(() => pollTrackedTask(taskId, runId), 1500)
+      return
+    }
+
+    stopTaskTracking()
+    await refreshData()
+    if (task.status === 'review' && nav.value === 'workspace' && mode.value === 'anonymize') {
+      await openReview(task)
+    } else if (task.status === 'failed') {
+      error.value = task.error_message || '任务处理失败，请在记录中查看详情。'
+    } else if (task.status === 'cancelled') {
+      error.value = '任务已安全中断，原始文件和任务记录仍然保留。'
+    }
+  } catch (e) {
+    if (runId !== taskTrackingRun) return
+    error.value = `刷新运行中任务失败：${e.message}`
+    taskTrackingTimer = window.setTimeout(() => pollTrackedTask(taskId, runId), 2500)
+  }
+}
+
+function continueTask(task) {
+  if (!task?.id) return
+  stopTaskTracking()
+  nav.value = 'workspace'
+  mode.value = 'anonymize'
+  reviewOpen.value = false
+  error.value = ''
+  result.value = task
+  activeProcessingTaskId.value = task.id
+  processingProgress.value = task.processing_progress || { percent: 0, detail: '正在读取任务最新状态…' }
+  trackingExistingTask.value = true
+  const runId = ++taskTrackingRun
+  void pollTrackedTask(task.id, runId)
 }
 
 function selectOcrMode(nextMode) {
@@ -320,6 +386,7 @@ async function submitAnonymize() {
     return
   }
   loading.value = true
+  stopTaskTracking()
   error.value = ''
   result.value = null
   reviewOpen.value = false
@@ -358,14 +425,15 @@ async function submitAnonymize() {
     error.value = e.message
     if (e.data?.task?.id) result.value = e.data.task
     else if (e.data?.active_task?.id) {
-      result.value = e.data.active_task
-      activeProcessingTaskId.value = e.data.active_task.id
+      continueTask(e.data.active_task)
     } else if (e.data?.id) result.value = e.data
   } finally {
     window.clearInterval(progressTimer)
     loading.value = false
-    processingProgress.value = null
-    activeProcessingTaskId.value = ''
+    if (!trackingExistingTask.value) {
+      processingProgress.value = null
+      activeProcessingTaskId.value = ''
+    }
   }
 }
 
@@ -670,6 +738,7 @@ function selectMode(nextMode) {
 }
 
 onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshModelArtifacts(), refreshLabels(), refreshTrainingDocuments()]))
+onUnmounted(() => stopTaskTracking())
 </script>
 
 <template>
@@ -738,6 +807,27 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshModelA
             <div><span><AppIcon name="scan" :size="22" /></span><strong>识别</strong></div><i></i>
             <div><span><AppIcon name="check" :size="22" /></span><strong>复核</strong></div><i></i>
             <div><span><AppIcon name="download" :size="22" /></span><strong>输出</strong></div>
+          </section>
+
+          <section v-if="trackingExistingTask && result?.status === 'processing'" class="active-task-card" aria-live="polite">
+            <span class="active-task-icon"><AppIcon name="scan" :size="25" /></span>
+            <div class="active-task-copy">
+              <small>已从处理记录调回运行任务</small>
+              <strong>{{ result.task_name }}</strong>
+              <span>{{ result.code }} · {{ result.display_name || result.original_name }}</span>
+            </div>
+            <div class="active-task-progress">
+              <div><span>{{ result.cancel_requested ? '正在安全中断任务…' : (processingProgress?.detail || '正在读取最新进度…') }}</span><strong>{{ processingProgress?.percent || 0 }}%</strong></div>
+              <div class="task-progress-track"><i :style="{ width: `${processingProgress?.percent || 0}%` }"></i></div>
+            </div>
+            <div class="active-task-actions">
+              <button class="btn light-btn" @click="nav = 'history'; refreshData()"><AppIcon name="history" :size="17" /> 查看记录</button>
+              <button class="btn cancel-btn" :disabled="result.cancel_requested || cancellingTaskId === result.id" @click="cancelProcessing(result.id)">
+                <span v-if="cancellingTaskId === result.id" class="spinner-border spinner-border-sm"></span>
+                <AppIcon v-else name="stop-circle" :size="17" />
+                {{ result.cancel_requested || cancellingTaskId === result.id ? '正在中断…' : '中断任务' }}
+              </button>
+            </div>
           </section>
 
           <div class="mode-switch">
@@ -843,7 +933,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshModelA
                   <AppIcon v-else name="stop-circle" :size="18" />
                   {{ cancellingTaskId === activeProcessingTaskId ? '正在中断…' : activeProcessingTaskId ? '中断脱敏' : '等待任务建立…' }}
                 </button>
-                <button class="btn primary-btn" :disabled="loading || !anonymizeFile" @click="submitAnonymize">
+                <button class="btn primary-btn" :disabled="loading || trackingExistingTask || !anonymizeFile" @click="submitAnonymize">
                   <span v-if="loading" class="spinner-border spinner-border-sm"></span>
                   <AppIcon v-else name="file-lock" :size="18" />
                   {{ loading ? (processingProgress?.stage === 'pdf_ocr' ? '正在本地 OCR…' : '正在识别并生成…') : '开始数据匿名' }}
@@ -898,7 +988,7 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshModelA
             </div>
           </section>
 
-          <section v-if="result && !result.error_message" class="result-card">
+          <section v-if="result && !result.error_message && ['review', 'completed', 'restored'].includes(result.status)" class="result-card">
             <span class="result-check"><AppIcon :name="result.status === 'review' ? 'info' : 'check'" :size="25" /></span>
             <div class="result-main">
               <h3>{{ result.status === 'review' ? '候选识别完成，请人工确认' : result.status === 'restored' ? '正式文件已生成' : '文件脱敏完成' }}</h3>
@@ -1053,12 +1143,13 @@ onMounted(() => Promise.all([refreshData(), refreshModelRuntime(), refreshModelA
                     <td>{{ Object.values(task.entity_counts || {}).reduce((a, b) => a + b, 0) }} 项</td>
                     <td>
                       <span class="status-pill" :class="statusMeta(task.status)[1]"><i></i>{{ statusMeta(task.status)[0] }}</span>
-                      <small v-if="task.status === 'processing' && task.processing_progress?.detail" class="history-progress">
-                        {{ task.processing_progress.percent || 0 }}% · {{ task.processing_progress.detail }}
+                      <small v-if="task.status === 'processing'" class="history-progress">
+                        {{ task.processing_progress?.percent || 0 }}% · {{ task.cancel_requested ? '正在安全中断任务…' : (task.processing_progress?.detail || '正在读取处理进度…') }}
                       </small>
                     </td>
                     <td>{{ formatDate(task.created_at) }}</td>
                     <td class="text-end table-actions">
+                      <button v-if="task.status === 'processing'" class="resume-task-btn" title="调回数据处理台继续查看" @click="continueTask(task)"><AppIcon name="arrow-right" :size="16" /><span>继续处理</span></button>
                       <button v-if="task.anonymized_download_url" title="下载脱敏文件" @click="openDownload(task.anonymized_download_url)"><AppIcon name="download" :size="17" /></button>
                       <button v-if="task.status === 'review' || task.anonymized_download_url" :title="task.status === 'review' ? '人工确认识别结果' : '校正识别结果'" @click="openReview(task)"><AppIcon name="info" :size="17" /></button>
                       <button v-if="task.restored_download_url" class="amber" title="下载正式文件" @click="openDownload(task.restored_download_url)"><AppIcon name="restore" :size="17" /></button>

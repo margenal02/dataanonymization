@@ -39,6 +39,7 @@ async function request(path, options = {}) {
 
 export const api = {
   listTasks: () => request('/tasks/'),
+  getTask: taskId => request(`/tasks/${taskId}/`),
   getStats: () => request('/stats/'),
   getModelRuntime: () => request('/model/runtime/'),
   setModelRuntime: mode => request('/model/runtime/', {
